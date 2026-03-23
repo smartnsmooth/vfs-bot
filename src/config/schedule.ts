@@ -1,0 +1,46 @@
+import { config } from "./config";
+import { getEffectiveLiftLoginUser } from "../utils/liftLoginUser";
+import { getTotalAmount } from "../utils/totalAmount.store";
+
+export const SCHEDULE_URL =
+  process.env.VFS_SCHEDULE_URL ?? "https://lift-api.vfsglobal.com/appointment/schedule";
+
+/** POST /appointment/schedule — after timeslot; needs urn + allocationId. */
+export function buildScheduleBody(urn: string, allocationId: string): Record<string, unknown> {
+  const u = urn.trim();
+  const alloc = allocationId.trim();
+  if (!u) throw new Error("Schedule API requires urn");
+  if (!alloc) throw new Error("Schedule API requires allocationId");
+
+  const loginUser = getEffectiveLiftLoginUser();
+  const totalAmountRaw = getTotalAmount();
+  if (!totalAmountRaw) {
+    throw new Error("Schedule API requires totalAmount from fees response");
+  }
+  const normalizedAmount = totalAmountRaw.replace(/,/g, "").trim();
+  const totalAmountNum = Number.parseFloat(normalizedAmount);
+  if (!Number.isFinite(totalAmountNum)) {
+    throw new Error(`Schedule API requires numeric totalAmount from fees response; got: ${totalAmountRaw}`);
+  }
+
+  return {
+    CanVFSReachoutToApplicant: process.env.VFS_SCHEDULE_CAN_REACHOUT !== "false",
+    TnCConsentAndAcceptance: process.env.VFS_SCHEDULE_TNC !== "false",
+    allocationId: alloc,
+    aurn: null,
+    centerCode: config.slotPayload.vacCode,
+    countryCode: config.slotPayload.countryCode,
+    loginUser,
+    missionCode: config.slotPayload.missionCode,
+    notificationType: (process.env.VFS_SCHEDULE_NOTIFICATION_TYPE ?? "none").trim() || "none",
+    paymentdetails: {
+      paymentmode: "Online",
+      RequestRefNo: "",
+      clientId: "",
+      merchantId: "",
+      amount: totalAmountNum,
+      currency: "INR",
+    },
+    urn: u,
+  };
+}

@@ -1,0 +1,30 @@
+{
+  "name": "vfsbot",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "dev": "ts-node src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "release:pack": "npm run build && node scripts/pack-release.mjs",
+    "release:pack:portable": "npm run build && node scripts/pack-release.mjs --with-node"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "dotenv": "^17.3.1",
+    "node-telegram-bot-api": "^0.67.0",
+    "pino": "^10.3.1",
+    "playwright": "^1.58.2",
+    "proxy-chain": "^2.7.1",
+    "undici": "^7.24.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "@types/node-telegram-bot-api": "^0.64.14",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "name": "vfsbot",
+  "version": "1.0.0",
+  "private": true,
+  "main": "dist/index.js",
+  "dependencies": {
+    "dotenv": "^17.3.1",
+    "node-telegram-bot-api": "^0.67.0",
+    "pino": "^10.3.1",
+    "playwright": "^1.58.2",
+    "proxy-chain": "^2.7.1",
+    "undici": "^7.24.3"
+  }
+}
