@@ -2,6 +2,7 @@ import { config } from "./config";
 import { getApplicantDetailsOverrides } from "../utils/applicantDetails.store";
 import { getApplicantIpForPayload } from "../utils/applicantIp";
 import { getEffectiveLiftLoginUser } from "../utils/liftLoginUser";
+import { getSlotCenterOverride } from "../utils/slotCenterOverride.store";
 
 export const SAVE_APPLICANTS_URL =
   process.env.VFS_SAVE_APPLICANTS_URL ?? "https://lift-api.vfsglobal.com/appointment/applicants";
@@ -150,8 +151,11 @@ export function buildSaveApplicantsBodyFromEnv(): Record<string, unknown> {
   const loginUser = getEffectiveLiftLoginUser();
   const countryCode = config.slotPayload.countryCode;
   const missionCode = config.slotPayload.missionCode;
-  const centerCode = config.slotPayload.vacCode;
-  const visaCategoryCode = config.slotPayload.visaCategoryCode;
+  
+  // Use override if any instance found a slot, otherwise use config
+  const override = getSlotCenterOverride();
+  const centerCode = override?.centerCode ?? config.slotPayload.vacCode;
+  const visaCategoryCode = override?.visaCategoryCode ?? config.slotPayload.visaCategoryCode;
 
   const applicant: Record<string, unknown> = {
     urn: "",

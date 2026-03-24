@@ -46,13 +46,36 @@ if not exist "%NODE_EXE%" (
   const content = `@echo off
 setlocal
 cd /d "%~dp0"
-echo Starting vfsbot...
+echo Starting vfsbot (single instance)...
 ${runNode}
 echo.
 echo Process exited.
 pause
 `;
   fs.writeFileSync(path.join(outDir, "start.bat"), content, "utf8");
+}
+
+function writeStartClusterBat(usePortableNode) {
+  const runNode = usePortableNode
+    ? `set "NODE_EXE=%~dp0node\\node.exe"
+if not exist "%NODE_EXE%" (
+  echo Portable Node runtime is missing: "%NODE_EXE%"
+  pause
+  exit /b 1
+)
+"%NODE_EXE%" dist\\cluster.js`
+    : `node dist\\cluster.js`;
+
+  const content = `@echo off
+setlocal
+cd /d "%~dp0"
+echo Starting vfsbot cluster (multi-instance)...
+${runNode}
+echo.
+echo Process exited.
+pause
+`;
+  fs.writeFileSync(path.join(outDir, "start-cluster.bat"), content, "utf8");
 }
 
 function writeReadme(usePortableNode) {
@@ -65,7 +88,9 @@ How to run:
 1) Install Google Chrome.
 ${nodeLine}
 3) Put your .env in this folder (copy .env.example to .env and edit).
-4) Double click start.bat.
+4) Double click start.bat (single instance) OR start-cluster.bat (multiple instances).
+
+Note: For cluster mode, configure VFS_BOT_INSTANCES in .env (default: 3 instances).
 `;
   fs.writeFileSync(path.join(outDir, "README.txt"), content, "utf8");
 }
@@ -161,6 +186,7 @@ async function main() {
   }
 
   writeStartBat(withPortableNode);
+  writeStartClusterBat(withPortableNode);
   writeReadme(withPortableNode);
 
   console.log("Release packed at:", outDir);

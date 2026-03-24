@@ -1,5 +1,6 @@
 import { config } from "./config";
 import { getEffectiveLiftLoginUser } from "../utils/liftLoginUser";
+import { getSlotCenterOverride } from "../utils/slotCenterOverride.store";
 
 export const TIMESLOT_URL =
   process.env.VFS_TIMESLOT_URL ?? "https://lift-api.vfsglobal.com/appointment/timeslot";
@@ -22,14 +23,15 @@ export function buildTimeslotBody(urn: string, slotDateFromCalendar: string): Re
 
   const loginUser = getEffectiveLiftLoginUser();
   const slotDate = calendarDateToTimeslotSlotDate(slotDateFromCalendar);
+  const override = getSlotCenterOverride();
 
   return {
-    centerCode: config.slotPayload.vacCode,
+    centerCode: override?.centerCode ?? config.slotPayload.vacCode,
     countryCode: config.slotPayload.countryCode,
     loginUser,
     missionCode: config.slotPayload.missionCode,
     slotDate,
     urn: u,
-    visaCategoryCode: config.slotPayload.visaCategoryCode,
+    visaCategoryCode: override?.visaCategoryCode ?? config.slotPayload.visaCategoryCode,
   };
 }

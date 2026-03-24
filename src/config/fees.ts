@@ -1,5 +1,6 @@
 import { config } from "./config";
 import { getEffectiveLiftLoginUser } from "../utils/liftLoginUser";
+import { getSlotCenterOverride } from "../utils/slotCenterOverride.store";
 
 export const FEES_URL =
   process.env.VFS_FEES_URL ?? "https://lift-api.vfsglobal.com/appointment/fees";
@@ -10,8 +11,10 @@ export function buildFeesBody(urn: string): Record<string, unknown> {
   if (!u) throw new Error("Fees API requires a non-empty urn");
 
   const loginUser = getEffectiveLiftLoginUser();
+  const override = getSlotCenterOverride();
+  
   return {
-    centerCode: config.slotPayload.vacCode,
+    centerCode: override?.centerCode ?? config.slotPayload.vacCode,
     countryCode: config.slotPayload.countryCode,
     languageCode: process.env.VFS_SAVE_LANGUAGE_CODE ?? "en-US",
     loginUser,

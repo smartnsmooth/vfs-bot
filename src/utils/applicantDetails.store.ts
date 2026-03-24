@@ -1,18 +1,61 @@
 /**
  * Applicant fields collected from the post-login UI, merged into
  * {@link buildSaveApplicantsBody} `applicantList[0]` before save applicants.
+ * Per-instance storage: Map<instanceId, applicantDetails>
  */
 
-let overrides: Record<string, unknown> | null = null;
+import { loadInstancesFromDisk, saveInstancesToDisk } from "./instanceStorage";
 
-export function setApplicantDetailsOverrides(fields: Record<string, unknown>): void {
-  overrides = { ...fields };
+const instanceApplicantDetails = new Map<number, Record<string, unknown>>();
+
+// Load from disk on module import
+const diskData = loadInstancesFromDisk();
+for (const [idStr, data] of Object.entries(diskData.instances)) {
+  const id = parseInt(idStr, 10);
+  if (data.details) {
+    instanceApplicantDetails.set(id, data.details);
+  }
 }
 
-export function getApplicantDetailsOverrides(): Record<string, unknown> | null {
-  return overrides;
+function persistToDisk(): void {
+  const instances: Record<string, { credentials?: { username: string; password: string }; details?: Record<string, unknown> }> = {};
+  
+  // Get details
+  for (const [id, details] of instanceApplicantDetails.entries()) {
+    if (!instances[String(id)]) instances[String(id)] = {};
+    instances[String(id)].details = details;
+  }
+  
+  // Merge with existing credentials from disk (in case sessionLogin.store hasn't saved yet)
+  const current = loadInstancesFromDisk();
+  for (const [idStr, data] of Object.entries(current.instances)) {
+    if (!instances[idStr]) instances[idStr] = {};
+    if (data.credentials) instances[idStr].credentials = data.credentials;
+  }
+  
+  saveInstancesToDisk({ instances });
 }
 
-export function clearApplicantDetailsOverrides(): void {
-  overrides = null;
+export function setApplicantDetailsOverrides(fields: Record<string, unknown>, instanceId?: number): void {
+  const id = instanceId ?? 0; // 0 = default/single instance mode
+  instanceApplicantDetails.set(id, { ...fields });
+  persistToDisk();
+}
+
+export function getApplicantDetailsOverrides(instanceId?: number): Record<string, unknown> | null {
+  const id = instanceId ?? 0;
+  return instanceApplicantDetails.get(id) ?? null;
+}
+
+export function clearApplicantDetailsOverrides(instanceId?: number): void {
+  if (instanceId === undefined) {
+    instanceApplicantDetails.clear();
+  } else {
+    instanceApplicantDetails.delete(instanceId);
+  }
+  persistToDisk();
+}
+
+export function getAllInstanceApplicantDetails(): Map<number, Record<string, unknown>> {
+  return instanceApplicantDetails;
 }

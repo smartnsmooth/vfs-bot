@@ -1,11 +1,12 @@
 import dotenv from "dotenv";
-dotenv.config({ override: true });
+// Don't override env vars set by parent process (cluster mode)
+dotenv.config({ override: false });
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { get as httpGet } from "node:http";
 import { get as httpsGet } from "node:https";
 import path from "node:path";
-import { config } from "./config/config";
+import { config, setCurrentInstanceId } from "./config/config";
 import { classifyVfsFirstTabUrl } from "./flows/vfsTabUrl";
 import { logger } from "./utils/logger";
 import { PollingService } from "./services/polling.service";
@@ -16,6 +17,8 @@ import {
   runApplicantFormWithSubmitHandler,
 } from "./ui/applicantDetailsFormServer";
 import { getSessionLoginCredentials } from "./utils/sessionLogin.store";
+import { isSlotFoundByAnyInstance, markSlotFound, clearSlotState } from "./utils/slotState";
+import { setSlotCenterOverride, clearSlotCenterOverride } from "./utils/slotCenterOverride.store";
 
 const polling = new PollingService();
 const browser = new BrowserService();
@@ -44,14 +47,17 @@ function enqueueSubmitTask(task: () => Promise<void>): void {
   });
 }
 
-function resolveLoginUsername(): string {
-  const fromUi = getSessionLoginCredentials()?.username?.trim();
+/** Cluster mode: queues for each instance, indexed by instanceId. */
+const instanceQueues = new Map<number, Promise<void>>();
+
+function resolveLoginUsername(instanceId?: number): string {
+  const fromUi = getSessionLoginCredentials(instanceId)?.username?.trim();
   if (fromUi) return fromUi;
   return (config.vfsUsername || process.env.VFS_USERNAME || "").trim();
 }
 
-function resolveLoginPassword(): string {
-  const fromUi = getSessionLoginCredentials()?.password;
+function resolveLoginPassword(instanceId?: number): string {
+  const fromUi = getSessionLoginCredentials(instanceId)?.password;
   if (fromUi != null && fromUi !== "") return fromUi;
   return config.vfsPassword || process.env.VFS_PASSWORD || "";
 }
@@ -277,17 +283,6 @@ async function ensureChromeWithDevTools(): Promise<void> {
 
   const child = spawn(chromePath, chromeArgs, { detached: true, stdio: "ignore" });
   child.unref();
-  logger.info(
-    {
-      debugPort,
-      instanceId,
-      proxyEnabled: Boolean(resolvedProxy.launchProxy),
-      proxyPreview: resolvedProxy.launchProxy ? resolvedProxy.launchProxy.slice(0, 120) : null,
-      proxyHasAuth: resolvedProxy.proxyHasAuth,
-      viaLocalProxyTunnel: resolvedProxy.viaLocalTunnel,
-    },
-    "Launched Chrome with remote debugging"
-  );
   if (selectedProxy && !resolvedProxy.launchProxy) {
     logger.warn({ selectedProxy }, "Proxy parse failed; starting without proxy. Use format: http://user:pass@host:port");
   }
@@ -298,7 +293,6 @@ async function ensureChromeWithDevTools(): Promise<void> {
   while (Date.now() - startedAt < maxWaitMs) {
     for (const url of getChromeDevToolsCheckUrls()) {
       if (await checkDevToolsEndpoint(url)) {
-        console.log(`[Chrome] DevTools ready at ${url}`);
         return;
       }
     }
@@ -308,31 +302,67 @@ async function ensureChromeWithDevTools(): Promise<void> {
 }
 
 /** `true` if at least one slot was seen (polling stops after the first hit). */
-async function runPollLoop(): Promise<boolean> {
+async function runPollLoop(instanceId?: number): Promise<boolean> {
   const limit = config.pollLimit;
   let completed = 0;
   let slotFound = false;
+
   while (limit === 0 || completed < limit) {
+    // Check if any other instance found a slot
+    const sharedState = isSlotFoundByAnyInstance();
+    if (sharedState.found && sharedState.foundBy !== instanceId) {
+      // Another instance found a slot - use their center/category
+      if (sharedState.centerCode && sharedState.visaCategoryCode) {
+        setSlotCenterOverride(sharedState.centerCode, sharedState.visaCategoryCode);
+        logger.info(
+          { foundBy: sharedState.foundBy, thisInstance: instanceId, centerCode: sharedState.centerCode, visaCategoryCode: sharedState.visaCategoryCode, slot: sharedState.slot },
+          "Slot found by another instance — using their centerCode/visaCategoryCode and proceeding to booking"
+        );
+      } else {
+        logger.info(
+          { foundBy: sharedState.foundBy, thisInstance: instanceId, slot: sharedState.slot },
+          "Slot found by another instance — stopping poll loop and proceeding to booking"
+        );
+      }
+      await telegram.alert("slot_found", `Slot found by Instance ${sharedState.foundBy}: ${sharedState.slot?.center || "—"} ${sharedState.slot?.date} ${sharedState.slot?.time}`, { slotId: sharedState.slot?.id }).catch(() => { });
+      return true; // Proceed to booking
+    }
+
     try {
       const { slot, response } = await polling.checkSlotsInBrowser(browser);
       console.log("[Poll]", JSON.stringify(response, null, 2));
 
       if (slot) {
         slotFound = true;
+        // Get current centerCode and visaCategoryCode from config
+        const centerCode = config.slotPayload.vacCode;
+        const visaCategoryCode = config.slotPayload.visaCategoryCode;
+
+        // Mark slot as found for ALL instances with this instance's center/category
+        markSlotFound(instanceId ?? 0, centerCode, visaCategoryCode, slot);
+
+        // Set override for this instance too (in case it's used later)
+        setSlotCenterOverride(centerCode, visaCategoryCode);
+
         await telegram.alert("slot_found", `Slot: ${slot.center || "—"} ${slot.date} ${slot.time}`, { slotId: slot.id }).catch(() => { });
-        logger.info("Slot found — stopping poll loop; running booking chain next");
+        logger.info({ instanceId, centerCode, visaCategoryCode, slot }, "Slot found by this instance — broadcasting center/category to all instances");
         break;
       }
     } catch (err) {
-      logger.error({ err }, "Poll error");
+      logger.error({ err, instanceId }, "Poll error");
       await telegram.alert("error", err instanceof Error ? err.message : "Poll error").catch(() => { });
     }
     completed += 1;
     if (limit > 0 && completed >= limit) {
-      logger.info({ completed, limit }, "Polling finished (POLL_LIMIT reached)");
+      logger.info({ completed, limit, instanceId }, "Polling finished (POLL_LIMIT reached)");
       break;
     }
-    await new Promise((r) => setTimeout(r, POLL_INTERVAL_MS));
+    // Random delay between min and max
+    const min = config.pollingIntervalMinMs;
+    const max = config.pollingIntervalMaxMs;
+    const randomDelayMs = min + Math.floor(Math.random() * (max - min));
+    logger.info({ delayMs: randomDelayMs, min, max, instanceId }, "Waiting before next poll");
+    await new Promise((r) => setTimeout(r, randomDelayMs));
   }
   return slotFound;
 }
@@ -347,7 +377,7 @@ function isSaveApplicants422(err: unknown): boolean {
  * Try save-applicants; on 422 "Invalid request", retry by re-polling then re-calling save.
  * This mimics the manual re-submit flow (which consistently succeeds).
  */
-async function runBookingChainWithRetry(): Promise<void> {
+async function runBookingChainWithRetry(instanceId?: number): Promise<void> {
   for (let attempt = 1; attempt <= MAX_SAVE_APPLICANTS_RETRIES; attempt++) {
     try {
       await browser.saveApplicantsViaLiftApi();
@@ -355,15 +385,15 @@ async function runBookingChainWithRetry(): Promise<void> {
     } catch (err) {
       if (!isSaveApplicants422(err) || attempt === MAX_SAVE_APPLICANTS_RETRIES) throw err;
       logger.warn(
-        { attempt, maxRetries: MAX_SAVE_APPLICANTS_RETRIES },
+        { attempt, maxRetries: MAX_SAVE_APPLICANTS_RETRIES, instanceId },
         "Save applicants returned 422 — retrying after fresh CDP + poll (mimics manual re-submit)"
       );
       await browser.disconnectCdp();
       await browser.getFirstTabUrl();
       await browser.preparePollingAfterLogin({ skipDashboardNavigate: true });
-      const stillAvailable = await runPollLoop();
+      const stillAvailable = await runPollLoop(instanceId);
       if (!stillAvailable) {
-        logger.warn("Slot no longer available on retry poll — aborting booking chain");
+        logger.warn({ instanceId }, "Slot no longer available on retry poll — aborting booking chain");
         return;
       }
     }
@@ -374,18 +404,28 @@ async function runBookingChainWithRetry(): Promise<void> {
   await browser.postScheduleLiftApi();
 }
 
-type SubmitMeta = { firstSubmit: boolean };
+type SubmitMeta = { firstSubmit: boolean; instanceId?: number };
 
 /**
  * One full run after setup form Submit (or headless single run): CDP refresh → tab URL branch → poll → optional booking.
  */
 async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
+  const instanceId = meta.instanceId;
+  
+  // Set current instance ID for config getters (e.g., loginUser)
+  setCurrentInstanceId(instanceId);
+
+  // Clear shared slot state at the start of a new cycle
+  if (meta.firstSubmit) {
+    clearSlotState();
+    clearSlotCenterOverride();
+  }
+
   // 1) Drop old Playwright CDP attachment; 2) ensure Chrome + DevTools; 3) reconnect
   await browser.disconnectCdp();
   await ensureChromeWithDevTools();
 
   let firstUrl = await browser.getFirstTabUrl();
-  console.log("[Chrome] First tab:", firstUrl || "(blank)");
 
   let kind = classifyVfsFirstTabUrl(firstUrl);
 
@@ -398,8 +438,8 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
 
   let didLoginThisCycle = false;
   if (kind === "login") {
-    const username = resolveLoginUsername();
-    const password = resolveLoginPassword();
+    const username = resolveLoginUsername(instanceId);
+    const password = resolveLoginPassword(instanceId);
     if (!username || !password) {
       throw new Error(
         "VFS login missing: fill username/password on the setup form, or set VFS_USERNAME / VFS_PASSWORD in .env (or disable UI with VFS_APPLICANT_UI=false)."
@@ -409,11 +449,10 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
     firstUrl = await browser.getFirstTabUrl();
     kind = classifyVfsFirstTabUrl(firstUrl);
     didLoginThisCycle = true;
-    logger.info({ kind, url: firstUrl }, "After automated login");
   } else if (kind === "dashboard") {
-    logger.info("On dashboard — skipping automated login");
+    logger.info({ instanceId }, "On dashboard — skipping automated login");
   } else if (kind === "vfs_other") {
-    logger.info({ url: firstUrl }, "On post-login VFS page — skipping automated login; polling from here");
+    logger.info({ url: firstUrl, instanceId }, "On post-login VFS page — skipping automated login; polling from here");
   }
 
   /** After login: resolve IP via in-page fetch (same egress as Chrome / proxy extension) for save-applicants. */
@@ -424,28 +463,58 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
   let slotFoundDuringPoll = false;
   if (config.pollingEnabled) {
     if (didLoginThisCycle) {
-      logger.info(
-        { delayMs: POST_LOGIN_POLL_DELAY_MS },
-        "Post-login delay before polling"
-      );
       await new Promise((r) => setTimeout(r, POST_LOGIN_POLL_DELAY_MS));
+
+      // Random delay 0-30 seconds
+      const randomDelayMs = Math.floor(Math.random() * 30_000);
+      logger.info(
+        { delayMs: randomDelayMs },
+        "Post-login random delay before polling (step 2/2)"
+      );
+      await new Promise((r) => setTimeout(r, randomDelayMs));
     }
     await telegram.notify("VFS bot run: polling for slots.").catch(() => { });
-    logger.info({ skipDashboardNavigate }, "Starting slot polling");
+    logger.info({ skipDashboardNavigate, instanceId }, "Starting slot polling");
     await browser.preparePollingAfterLogin({ skipDashboardNavigate });
-    slotFoundDuringPoll = await runPollLoop();
+    slotFoundDuringPoll = await runPollLoop(instanceId);
   }
 
   const runBookingChain = !config.pollingEnabled || slotFoundDuringPoll;
 
   if (runBookingChain) {
-    await runBookingChainWithRetry();
+    await runBookingChainWithRetry(instanceId);
   } else {
-    logger.info("No slot found this run — skipping save applicants, fees, calendar, timeslot, schedule");
+    logger.info({ instanceId }, "No slot found this run — skipping save applicants, fees, calendar, timeslot, schedule");
   }
 }
 
 async function start(): Promise<void> {
+  // In cluster mode, instances don't start their own server
+  const isClusterMode = process.env.BOT_CLUSTER_MODE === "true";
+
+  if (isClusterMode) {
+    const myInstanceId = parseInt(process.env.BOT_INSTANCE_ID ?? "1", 10);
+
+    // Listen for IPC messages from parent process
+    if (process.send) {
+      process.on("message", async (msg: any) => {
+        if (msg?.type === "run-bot-cycle" && msg?.instanceId === myInstanceId) {
+          try {
+            await runOneBotCycle({ firstSubmit: true, instanceId: myInstanceId });
+            if (process.send) {
+              process.send({ type: "bot-cycle-complete", instanceId: myInstanceId });
+            }
+          } catch (err) {
+            logger.error({ err, instanceId: myInstanceId }, "Bot cycle failed");
+          }
+        }
+      });
+    }
+
+    // Keep process alive, don't launch Chrome until submit
+    return;
+  }
+
   await ensureChromeWithDevTools();
 
   if (isApplicantFormUiDisabled()) {

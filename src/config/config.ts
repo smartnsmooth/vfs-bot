@@ -1,7 +1,18 @@
 import { getSessionLoginCredentials } from "../utils/sessionLogin.store";
 
+/** Current instance ID for cluster mode (used by loginUser getter) */
+let currentInstanceId: number | undefined;
+
+export function setCurrentInstanceId(id: number | undefined): void {
+  currentInstanceId = id;
+}
+
 /** Sub-second polling (ms). */
 const POLLING_INTERVAL_MS = parseInt(process.env.POLLING_INTERVAL_MS ?? "30000", 10);
+
+/** Min/max for random polling interval (ms). */
+const POLLING_INTERVAL_MIN_MS = parseInt(process.env.POLLING_INTERVAL_MIN_MS ?? "20000", 10);
+const POLLING_INTERVAL_MAX_MS = parseInt(process.env.POLLING_INTERVAL_MAX_MS ?? "60000", 10);
 
 /** `loginUser` for slot / lift-api: setup form (session) first, then `VFS_USERNAME`. */
 function envSlotLoginUser(): string {
@@ -9,7 +20,7 @@ function envSlotLoginUser(): string {
 }
 
 function resolvedSlotPayloadLoginUser(): string {
-  const fromForm = getSessionLoginCredentials()?.username?.trim();
+  const fromForm = getSessionLoginCredentials(currentInstanceId)?.username?.trim();
   if (fromForm) return fromForm;
   return envSlotLoginUser();
 }
@@ -42,6 +53,8 @@ export const config = {
   pollingPageUrl: process.env.VFS_POLLING_PAGE_URL ?? "https://visa.vfsglobal.com/tza/en/nld/dashboard",
 
   pollingIntervalMs: Math.max(5000, Math.min(60000, POLLING_INTERVAL_MS)),
+  pollingIntervalMinMs: Math.max(5000, POLLING_INTERVAL_MIN_MS),
+  pollingIntervalMaxMs: Math.max(POLLING_INTERVAL_MIN_MS, Math.min(120000, POLLING_INTERVAL_MAX_MS)),
 
   /** `POLL_LIMIT`: 0 = infinite; else stop after this many `checkSlotsInBrowser` calls. */
   pollLimit,
@@ -53,8 +66,11 @@ export const config = {
   vfsUsername: process.env.VFS_USERNAME ?? "",
   vfsPassword: process.env.VFS_PASSWORD ?? "",
 
-  /** CDP URL. Chrome must be running with --remote-debugging-port=9222 (or we launch it). */
-  browserCdpUrl: process.env.BROWSER_CDP_URL ?? "http://localhost:9222",
+  /** CDP URL. Chrome must be running with --remote-debugging-port=9222 (or we launch it). 
+   * Uses a getter to read from process.env dynamically for cluster mode. */
+  get browserCdpUrl(): string {
+    return process.env.BROWSER_CDP_URL ?? "http://localhost:9222";
+  },
 
   capmonsterEnabled: process.env.ENABLE_CAPMONSTER === "true",
   capmonsterApiKey: process.env.CAPMONSTER_API_KEY ?? "",

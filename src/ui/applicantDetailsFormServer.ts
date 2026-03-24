@@ -3,8 +3,8 @@ import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { config } from "../config/config";
 import { getApplicantFormDefaults } from "../config/saveApplicants";
 import { logger } from "../utils/logger";
-import { getApplicantDetailsOverrides, setApplicantDetailsOverrides } from "../utils/applicantDetails.store";
-import { getSessionLoginCredentials, setSessionLoginCredentials } from "../utils/sessionLogin.store";
+import { getApplicantDetailsOverrides, setApplicantDetailsOverrides, getAllInstanceApplicantDetails } from "../utils/applicantDetails.store";
+import { getSessionLoginCredentials, setSessionLoginCredentials, getAllInstanceCredentials } from "../utils/sessionLogin.store";
 const UI_DISABLED = process.env.VFS_APPLICANT_UI === "false";
 
 export function isApplicantFormUiDisabled(): boolean {
@@ -141,6 +141,7 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
     "selectedSubvisaCategory",
     "Subclasscode",
     "salutation",
+    "vacCode",
   ] as const;
   for (const k of keys) {
     const v = str(k);
@@ -158,6 +159,20 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
 }
 
 function buildPageHtml(collectLogin: boolean): string {
+  const numInstances = parseInt(process.env.VFS_BOT_INSTANCES ?? "1", 10);
+  const isMultiInstance = numInstances > 1;
+
+  const instanceSelectBlock = isMultiInstance
+    ? `
+  <fieldset style="border:1px solid #38444d;border-radius:8px;padding:1rem 1rem 0.25rem;margin:0 0 1.25rem">
+    <legend style="color:#8b98a5;font-size:0.9rem">Bot Instance</legend>
+    <label for="instanceId">Select instance (each uses different IP)</label>
+    <select id="instanceId" name="instanceId">
+      ${Array.from({ length: numInstances }, (_, i) => `<option value="${i + 1}">Instance ${i + 1}</option>`).join("\n      ")}
+    </select>
+  </fieldset>`
+    : "";
+
   const loginBlock = collectLogin
     ? `
   <fieldset style="border:1px solid #38444d;border-radius:8px;padding:1rem 1rem 0.25rem;margin:0 0 1.25rem">
@@ -166,7 +181,7 @@ function buildPageHtml(collectLogin: boolean): string {
     <label for="vfsUsername">Email / username</label>
     <input id="vfsUsername" name="vfsUsername" type="email" autocomplete="username" />
     <label for="vfsPassword">Password</label>
-    <input id="vfsPassword" name="vfsPassword" type="password" autocomplete="current-password" />
+    <input id="vfsPassword" name="vfsPassword" type="text" autocomplete="current-password" />
   </fieldset>`
     : "";
 
@@ -176,6 +191,7 @@ function buildPageHtml(collectLogin: boolean): string {
     : "Each Submit runs the flow from your current Chrome tab (blank → login URL, login page → sign-in, else polling).";
 
   const collectLoginJs = collectLogin ? "true" : "false";
+  const isMultiInstanceJs = isMultiInstance ? "true" : "false";
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -203,6 +219,7 @@ function buildPageHtml(collectLogin: boolean): string {
   <h1>${collectLogin ? "Setup" : "Applicant details"}</h1>
   <p class="hint">${hint}</p>
   <form id="f">
+    ${instanceSelectBlock}
     ${loginBlock}
     <div class="row2">
       <div><label for="firstName">First name</label><input id="firstName" name="firstName" autocomplete="given-name" /></div>
@@ -220,24 +237,46 @@ function buildPageHtml(collectLogin: boolean): string {
       <div><label for="passportNumber">Passport number</label><input id="passportNumber" name="passportNumber" /></div>
       <div><label for="passportExpirtyDate">Passport expiry (DD/MM/YYYY)</label><input id="passportExpirtyDate" name="passportExpirtyDate" /></div>
     </div>
-    <label for="confirmPassportNumber">Confirm passport (optional)</label>
-    <input id="confirmPassportNumber" name="confirmPassportNumber" />
-    <label for="nationalityCode">Nationality code (e.g. ALB)</label>
-    <input id="nationalityCode" name="nationalityCode" />
     <label for="gender">Gender</label>
     <select id="gender" name="gender">
-      <option value="1">male</option>
-      <option value="2">female</option>
+      <option value="1">MALE</option>
+      <option value="2">FEMALE</option>
     </select>
-    <label for="selectedSubvisaCategory">Subvisa category (optional)</label>
-    <input id="selectedSubvisaCategory" name="selectedSubvisaCategory" />
-    <label for="Subclasscode">Subclass code (optional)</label>
-    <input id="Subclasscode" name="Subclasscode" />
-    <button type="submit">Submit</button>
+    <label for="vacCode">Visa Application Centre</label>
+    <select id="vacCode" name="vacCode">
+      <option value="">-- Select Centre --</option>
+      <option value="JAI">Bulgaria Visa Application Centre-Jaipur</option>
+      <option value="HYD">Bulgaria Visa Application Centre-Hyderabad</option>
+      <option value="JLD">Bulgaria Visa Application Centre-Jalandhar</option>
+      <option value="BLR">Bulgaria Visa Application Center ,Bangalore</option>
+      <option value="IXC">Bulgaria Visa Application Centre-Chandigarh</option>
+      <option value="PNQ">Bulgaria Visa Application Centre-Pune</option>
+      <option value="COK">Bulgaria Visa Application Centre-Cochin</option>
+      <option value="GOI">Bulgaria Visa Application Centre-Goa</option>
+      <option value="AMD">Bulgaria Visa Application Centre-Ahmedabad</option>
+      <option value="PUD">Bulgaria Visa Application Centre-Puducherry</option>
+      <option value="GUR">Bulgaria Visa Application Center ,Gurugram</option>
+      <option value="NDEL">Bulgaria Visa Application Center ,New Delhi</option>
+      <option value="BKC">Bulgaria Visa Application Center, Mumbai</option>
+      <option value="MAA">Bulgaria Visa Application Centre-Chennai</option>
+      <option value="CCU">Bulgarian visa application center-Kolkata-VAC</option>
+    </select>
+    <label for="selectedSubvisaCategory">Visa Category</label>
+    <select id="selectedSubvisaCategory" name="selectedSubvisaCategory">
+      <option value="">-- Select Category --</option>
+      <option value="LONGSTAY">Long Stay D visa</option>
+      <option value="SAW">Seasonal worker</option>
+      <option value="Busi">Business Visa</option>
+    </select>
+    <button type="submit" style="margin-top: 1.25rem; width: 100%;">${isMultiInstance ? "Submit & Run All Instances" : "Submit & Run Bot"}</button>
   </form>
   <p id="msg"></p>
   <script>
     const collectLogin = ${collectLoginJs};
+    const isMultiInstance = ${isMultiInstanceJs};
+    
+    let autoSaveTimeout = null;
+    
     async function loadDefaults() {
       const r = await fetch("/api/defaults");
       const d = await r.json();
@@ -252,26 +291,201 @@ function buildPageHtml(collectLogin: boolean): string {
         if (u) u.value = String(d.loginDefaults.vfsUsername);
       }
     }
+    
+    async function loadInstanceData(showAlert = false) {
+      if (!isMultiInstance) return;
+      const instanceId = parseInt(document.getElementById("instanceId").value, 10);
+      const r = await fetch("/api/instances");
+      const data = await r.json();
+      if (!data.ok) return;
+      
+      const inst = data.instances[String(instanceId)];
+      if (!inst || (!inst.credentials && !inst.details)) {
+        if (showAlert) {
+          alert("No saved data for Instance " + instanceId);
+        }
+        // Clear ALL form fields when no saved data
+        if (collectLogin) {
+          const uEl = document.getElementById("vfsUsername");
+          const pEl = document.getElementById("vfsPassword");
+          if (uEl) uEl.value = "";
+          if (pEl) pEl.value = "";
+        }
+        // Clear all applicant fields
+        const fieldsToClear = ["firstName", "lastName", "emailId", "dialCode", "contactNumber", 
+                       "dateOfBirth", "passportNumber", "passportExpirtyDate", 
+                       "vacCode", "selectedSubvisaCategory"];
+        for (const field of fieldsToClear) {
+          const el = document.getElementById(field);
+          if (el) el.value = "";
+        }
+        // Reset gender to male (default)
+        const genderEl = document.getElementById("gender");
+        if (genderEl) genderEl.value = "1";
+        return;
+      }
+      
+      // Clear all fields first, then load saved data
+      if (collectLogin) {
+        const uEl = document.getElementById("vfsUsername");
+        const pEl = document.getElementById("vfsPassword");
+        if (uEl) uEl.value = "";
+        if (pEl) pEl.value = "";
+      }
+      const allFields = ["firstName", "lastName", "emailId", "dialCode", "contactNumber", 
+                     "dateOfBirth", "passportNumber", "passportExpirtyDate", 
+                     "vacCode", "selectedSubvisaCategory"];
+      for (const field of allFields) {
+        const el = document.getElementById(field);
+        if (el) el.value = "";
+      }
+      const genderEl = document.getElementById("gender");
+      if (genderEl) genderEl.value = "1";
+      
+      // Load credentials
+      if (inst.credentials && collectLogin) {
+        const uEl = document.getElementById("vfsUsername");
+        const pEl = document.getElementById("vfsPassword");
+        if (uEl) uEl.value = inst.credentials.username || "";
+        if (pEl) pEl.value = inst.credentials.password || "";
+      }
+      
+      // Load applicant details
+      if (inst.details) {
+        for (const k of Object.keys(inst.details)) {
+          const el = document.getElementById(k);
+          if (el) el.value = inst.details[k] == null ? "" : String(inst.details[k]);
+        }
+      }
+      
+      if (showAlert) {
+        alert("Loaded saved data for Instance " + instanceId);
+      }
+    }
+    
+    async function saveFormData(showFeedback = false) {
+      const form = document.getElementById("f");
+      const fd = new FormData(form);
+      const body = {
+        firstName: String(fd.get("firstName") || "").toUpperCase(),
+        lastName: String(fd.get("lastName") || "").toUpperCase(),
+        emailId: String(fd.get("emailId") || "").toUpperCase(),
+        dialCode: fd.get("dialCode"),
+        contactNumber: fd.get("contactNumber"),
+        dateOfBirth: fd.get("dateOfBirth"),
+        passportNumber: String(fd.get("passportNumber") || "").toUpperCase(),
+        passportExpirtyDate: fd.get("passportExpirtyDate"),
+        nationalityCode: "IND",
+        vacCode: fd.get("vacCode"),
+        gender: parseInt(String(fd.get("gender") || "1"), 10),
+        selectedSubvisaCategory: fd.get("selectedSubvisaCategory"),
+      };
+      if (isMultiInstance) {
+        body.instanceId = parseInt(String(fd.get("instanceId") || "1"), 10);
+      }
+      if (collectLogin) {
+        body.vfsUsername = fd.get("vfsUsername");
+        body.vfsPassword = fd.get("vfsPassword");
+      }
+      
+      if (showFeedback) {
+        const msg = document.getElementById("msg");
+        msg.className = "";
+        msg.textContent = "Saving...";
+      }
+      
+      try {
+        const r = await fetch("/api/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+        const j = await r.json();
+        if (showFeedback) {
+          const msg = document.getElementById("msg");
+          if (j.ok) {
+            msg.className = "ok";
+            msg.textContent = isMultiInstance 
+              ? "✓ Saved for Instance " + body.instanceId
+              : "✓ Saved";
+          } else {
+            msg.className = "err";
+            msg.textContent = j.error || "Save failed";
+          }
+        }
+      } catch (err) {
+        if (showFeedback) {
+          const msg = document.getElementById("msg");
+          msg.className = "err";
+          msg.textContent = String(err);
+        }
+      }
+    }
+    
+    function scheduleAutoSave() {
+      if (!isMultiInstance) return;
+      
+      if (autoSaveTimeout) {
+        clearTimeout(autoSaveTimeout);
+      }
+      
+      autoSaveTimeout = setTimeout(() => {
+        saveFormData(false); // Silent auto-save
+      }, 1000);
+    }
+    
+    if (isMultiInstance) {
+      // Auto-load when instance selector changes
+      document.getElementById("instanceId").addEventListener("change", () => {
+        loadInstanceData(false);
+      });
+      
+      // Auto-save on any input change
+      const form = document.getElementById("f");
+      const inputs = form.querySelectorAll("input, select");
+      inputs.forEach(input => {
+        input.addEventListener("input", scheduleAutoSave);
+        input.addEventListener("change", scheduleAutoSave);
+      });
+      
+      // Load initial instance data on page load
+      loadInstanceData(false);
+    } else {
+      loadDefaults();
+    }
+    
+    // Auto-capitalize specific fields
+    const capitalizeFields = ["firstName", "lastName", "emailId", "passportNumber"];
+    capitalizeFields.forEach(fieldId => {
+      const el = document.getElementById(fieldId);
+      if (el) {
+        el.addEventListener("input", (e) => {
+          const start = e.target.selectionStart;
+          const end = e.target.selectionEnd;
+          e.target.value = e.target.value.toUpperCase();
+          e.target.setSelectionRange(start, end);
+        });
+      }
+    });
+    
     document.getElementById("f").addEventListener("submit", async (e) => {
       e.preventDefault();
       const msg = document.getElementById("msg");
       msg.textContent = "";
       const fd = new FormData(e.target);
       const body = {
-        firstName: fd.get("firstName"),
-        lastName: fd.get("lastName"),
-        emailId: fd.get("emailId"),
+        firstName: String(fd.get("firstName") || "").toUpperCase(),
+        lastName: String(fd.get("lastName") || "").toUpperCase(),
+        emailId: String(fd.get("emailId") || "").toUpperCase(),
         dialCode: fd.get("dialCode"),
         contactNumber: fd.get("contactNumber"),
         dateOfBirth: fd.get("dateOfBirth"),
-        passportNumber: fd.get("passportNumber"),
+        passportNumber: String(fd.get("passportNumber") || "").toUpperCase(),
         passportExpirtyDate: fd.get("passportExpirtyDate"),
-        confirmPassportNumber: fd.get("confirmPassportNumber"),
-        nationalityCode: fd.get("nationalityCode"),
-        gender: parseInt(String(fd.get("gender") || "2"), 10),
+        nationalityCode: "IND",
+        vacCode: fd.get("vacCode"),
+        gender: parseInt(String(fd.get("gender") || "1"), 10),
         selectedSubvisaCategory: fd.get("selectedSubvisaCategory"),
-        Subclasscode: fd.get("Subclasscode"),
       };
+      if (isMultiInstance) {
+        body.instanceId = parseInt(String(fd.get("instanceId") || "1"), 10);
+      }
       if (collectLogin) {
         body.vfsUsername = fd.get("vfsUsername");
         body.vfsPassword = fd.get("vfsPassword");
@@ -281,9 +495,13 @@ function buildPageHtml(collectLogin: boolean): string {
         const j = await r.json();
         if (j.ok) {
           msg.className = "ok";
-          msg.textContent = j.firstSubmit
-            ? "Saved — bot run started in the background. Submit again for another run or to refresh data."
-            : "Saved — another bot run was queued. Check the terminal for progress.";
+          if (isMultiInstance) {
+            msg.textContent = "✓ Started " + (j.queued || "all") + " bot instance(s). Check terminal for progress.";
+          } else {
+            msg.textContent = j.firstSubmit
+              ? "Saved — bot run started in the background. Submit again for another run or to refresh data."
+              : "Saved — another bot run was queued. Check the terminal for progress.";
+          }
         } else {
           msg.className = "err";
           msg.textContent = j.error || "Submit failed";
@@ -293,7 +511,6 @@ function buildPageHtml(collectLogin: boolean): string {
         msg.textContent = String(err);
       }
     });
-    loadDefaults();
   </script>
 </body>
 </html>`;
@@ -307,7 +524,7 @@ export type ApplicantFormOptions = {
   collectLogin?: boolean;
 };
 
-export type FormSubmitInfo = { firstSubmit: boolean };
+export type FormSubmitInfo = { firstSubmit: boolean;[key: string]: unknown };
 
 /**
  * Serves the setup form; **every** successful Submit calls `onSubmit` (HTTP returns immediately).
@@ -365,6 +582,58 @@ export function runApplicantFormWithSubmitHandler(
           return;
         }
 
+        if (req.method === "GET" && path === "/api/instances") {
+          try {
+            const credentials = getAllInstanceCredentials();
+            const details = getAllInstanceApplicantDetails();
+
+            const instances: Record<string, unknown> = {};
+            const allIds = new Set([...credentials.keys(), ...details.keys()]);
+
+            for (const id of allIds) {
+              instances[String(id)] = {
+                credentials: credentials.get(id) ?? null,
+                details: details.get(id) ?? null,
+              };
+            }
+
+            json(res, 200, { ok: true, instances });
+          } catch (e) {
+            json(res, 500, { ok: false, error: e instanceof Error ? e.message : "instances failed" });
+          }
+          return;
+        }
+
+        if (req.method === "POST" && path === "/api/save") {
+          const raw = await readBody(req);
+          let j: Record<string, unknown>;
+          try {
+            j = JSON.parse(raw) as Record<string, unknown>;
+          } catch {
+            json(res, 400, { ok: false, error: "Invalid JSON" });
+            return;
+          }
+
+          const instanceId = typeof j.instanceId === "number" ? j.instanceId : undefined;
+
+          if (collectLogin) {
+            const vu = typeof j.vfsUsername === "string" ? j.vfsUsername.trim() : "";
+            const vp = typeof j.vfsPassword === "string" ? j.vfsPassword : "";
+            if (vu && vp) {
+              // Only save credentials if both are provided
+              setSessionLoginCredentials(vu, vp, instanceId);
+            }
+          }
+
+          const { vfsUsername: _u, vfsPassword: _p, instanceId: _id, ...rest } = j;
+          const fields = parseApplicantFields(rest);
+          // Auto-save accepts partial data (no validation)
+          setApplicantDetailsOverrides(fields, instanceId);
+
+          json(res, 200, { ok: true });
+          return;
+        }
+
         if (req.method === "POST" && path === "/api/submit") {
           const raw = await readBody(req);
           let j: Record<string, unknown>;
@@ -375,6 +644,49 @@ export function runApplicantFormWithSubmitHandler(
             return;
           }
 
+          // In cluster mode, start ALL instances with saved data
+          const numInstances = parseInt(process.env.VFS_BOT_INSTANCES ?? "1", 10);
+          if (numInstances > 1) {
+            const credentials = getAllInstanceCredentials();
+            const details = getAllInstanceApplicantDetails();
+            const allIds = new Set([...credentials.keys(), ...details.keys()]);
+
+            if (allIds.size === 0) {
+              json(res, 400, { ok: false, error: "No saved instances. Use Save button first to save data for each instance." });
+              return;
+            }
+
+            let queued = 0;
+            for (const instanceId of allIds) {
+              // Only submit for instances that are actually running (1 to numInstances)
+              if (instanceId > numInstances) {
+                continue;
+              }
+
+              const creds = credentials.get(instanceId);
+              const dets = details.get(instanceId);
+
+              if (creds && dets) {
+                void Promise.resolve(onSubmit({
+                  firstSubmit: !seenSubmit,
+                  instanceId,
+                  ...creds,
+                  ...dets
+                }))
+                  .then(() => undefined)
+                  .catch((err) => logger.error({ err, instanceId }, "Form onSubmit handler failed"));
+                queued++;
+              }
+            }
+
+            seenSubmit = true;
+            json(res, 200, { ok: true, firstSubmit: !seenSubmit, queued });
+            return;
+          }
+
+          // Single instance mode (legacy)
+          const instanceId = typeof j.instanceId === "number" ? j.instanceId : undefined;
+
           if (collectLogin) {
             const vu = typeof j.vfsUsername === "string" ? j.vfsUsername.trim() : "";
             const vp = typeof j.vfsPassword === "string" ? j.vfsPassword : "";
@@ -382,23 +694,23 @@ export function runApplicantFormWithSubmitHandler(
               json(res, 400, { ok: false, error: "VFS username and password are required" });
               return;
             }
-            setSessionLoginCredentials(vu, vp);
+            setSessionLoginCredentials(vu, vp, instanceId);
           }
 
-          const { vfsUsername: _u, vfsPassword: _p, ...rest } = j;
+          const { vfsUsername: _u, vfsPassword: _p, instanceId: _id, ...rest } = j;
           const fields = parseApplicantFields(rest);
           if (!fields.firstName || !fields.lastName || !fields.passportNumber) {
             json(res, 400, { ok: false, error: "firstName, lastName, and passportNumber are required" });
             return;
           }
-          setApplicantDetailsOverrides(fields);
+          setApplicantDetailsOverrides(fields, instanceId);
           const firstSubmit = !seenSubmit;
           seenSubmit = true;
           json(res, 200, { ok: true, firstSubmit });
-          void Promise.resolve(onSubmit({ firstSubmit }))
+          void Promise.resolve(onSubmit({ firstSubmit, instanceId, ...j }))
             .then(() => undefined)
             .catch((err) => logger.error({ err }, "Form onSubmit handler failed"));
-          logger.info({ firstSubmit }, "Setup form submitted — onSubmit queued");
+          logger.info({ firstSubmit, instanceId }, "Setup form submitted — onSubmit queued");
           return;
         }
 
@@ -415,7 +727,6 @@ export function runApplicantFormWithSubmitHandler(
     });
 
     server.listen(port, host, () => {
-      logger.info({ url, collectLogin }, "Setup form — open this URL in your browser");
       console.log("\n  >>> Bot setup form: " + url + "\n");
       openUrlInBrowser(url);
       timeoutId = setTimeout(() => {

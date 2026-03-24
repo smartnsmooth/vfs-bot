@@ -1,6 +1,7 @@
 import { config } from "./config";
 import { getEffectiveLiftLoginUser } from "../utils/liftLoginUser";
 import { getTotalAmount } from "../utils/totalAmount.store";
+import { getSlotCenterOverride } from "../utils/slotCenterOverride.store";
 
 export const SCHEDULE_URL =
   process.env.VFS_SCHEDULE_URL ?? "https://lift-api.vfsglobal.com/appointment/schedule";
@@ -23,12 +24,14 @@ export function buildScheduleBody(urn: string, allocationId: string): Record<str
     throw new Error(`Schedule API requires numeric totalAmount from fees response; got: ${totalAmountRaw}`);
   }
 
+  const override = getSlotCenterOverride();
+
   return {
     CanVFSReachoutToApplicant: process.env.VFS_SCHEDULE_CAN_REACHOUT !== "false",
     TnCConsentAndAcceptance: process.env.VFS_SCHEDULE_TNC !== "false",
     allocationId: alloc,
     aurn: null,
-    centerCode: config.slotPayload.vacCode,
+    centerCode: override?.centerCode ?? config.slotPayload.vacCode,
     countryCode: config.slotPayload.countryCode,
     loginUser,
     missionCode: config.slotPayload.missionCode,

@@ -83,17 +83,6 @@ function tokenMetaForLog(token: string): { tokenLen: number; tokenPrefix: string
 export async function fetchMailTmToken(address: string, password: string): Promise<string> {
   const v = isMailTmVerbose();
   const url = `${MAIL_TM_API}/token`;
-  logger.info(
-    {
-      step: "mail.tm.1_token_request",
-      method: "POST",
-      url,
-      addressMasked: maskEmailForLog(address),
-      passwordLen: password.length,
-      bodyKeys: ["address", "password"],
-    },
-    "[mail.tm] Step 1: POST /token (password not logged)"
-  );
 
   const res = await fetch(url, {
     method: "POST",
@@ -101,18 +90,6 @@ export async function fetchMailTmToken(address: string, password: string): Promi
     body: JSON.stringify({ address: address.trim(), password }),
   });
   const bodyText = await res.text();
-
-  if (v) {
-    logger.info(
-      {
-        step: "mail.tm.1_token_response_raw",
-        httpStatus: res.status,
-        bodyLength: bodyText.length,
-        bodyPreview: bodyText.slice(0, 400),
-      },
-      "[mail.tm] Step 1: response body (preview)"
-    );
-  }
 
   if (!res.ok) {
     logger.error(
@@ -147,14 +124,6 @@ export async function fetchMailTmToken(address: string, password: string): Promi
   }
 
   const token = j.token.trim();
-  logger.info(
-    {
-      step: "mail.tm.1_token_ok",
-      ...tokenMetaForLog(token),
-      addressMasked: maskEmailForLog(address),
-    },
-    "[mail.tm] Step 1 OK: bearer token received"
-  );
   return token;
 }
 
@@ -163,47 +132,13 @@ export async function listMailTmMessages(token: string, context?: string): Promi
   const url = `${MAIL_TM_API}/messages`;
   const ctx = context ?? "list";
 
-  if (v) {
-    logger.info(
-      {
-        step: "mail.tm.2_messages_request",
-        context: ctx,
-        method: "GET",
-        url,
-        ...tokenMetaForLog(token),
-      },
-      "[mail.tm] GET /messages"
-    );
-  }
-
   const res = await fetch(url, {
     headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
   });
   const bodyText = await res.text();
 
-  if (v) {
-    logger.info(
-      {
-        step: "mail.tm.2_messages_response_raw",
-        context: ctx,
-        httpStatus: res.status,
-        bodyLength: bodyText.length,
-        bodyPreview: bodyText.slice(0, 600),
-      },
-      "[mail.tm] /messages response preview"
-    );
-  }
-
   if (!res.ok) {
-    logger.error(
-      {
-        step: "mail.tm.2_messages_failed",
-        context: ctx,
-        httpStatus: res.status,
-        bodySnippet: bodyText.slice(0, 400),
-      },
-      "[mail.tm] GET /messages failed (token expired?)"
-    );
+    logger.error("[mail.tm] GET /messages failed (token expired?)");
     throw new Error(`mail.tm messages: HTTP ${res.status}`);
   }
 
@@ -211,28 +146,10 @@ export async function listMailTmMessages(token: string, context?: string): Promi
   try {
     member = parseMailTmMessagesJson(bodyText);
   } catch (e) {
-    logger.error(
-      { step: "mail.tm.2_messages_json", context: ctx, err: e, bodyPreview: bodyText.slice(0, 250) },
-      "[mail.tm] /messages not JSON"
-    );
+    logger.error("[mail.tm] /messages not JSON");
     throw new Error("mail.tm messages: response is not JSON");
   }
 
-  logger.info(
-    {
-      step: "mail.tm.2_messages_ok",
-      context: ctx,
-      messageCount: member.length,
-      ids: member.map((m) => m.id).filter(Boolean),
-      summaries: member.map((m) => ({
-        id: m.id?.slice(0, 8),
-        subject: (m.subject ?? "").slice(0, 80),
-        intro: (m.intro ?? "").slice(0, 120),
-        createdAt: m.createdAt,
-      })),
-    },
-    "[mail.tm] Step 2 OK: message list parsed"
-  );
   return member;
 }
 
@@ -247,9 +164,6 @@ function stripHtml(html: string): string {
 
 async function fetchMailTmMessageDetail(token: string, id: string, verbose: boolean): Promise<string> {
   const url = `${MAIL_TM_API}/messages/${encodeURIComponent(id)}`;
-  if (verbose) {
-    logger.info({ step: "mail.tm.3_message_detail_request", url, messageId: id }, "[mail.tm] GET message detail");
-  }
 
   const res = await fetch(url, {
     headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
@@ -280,22 +194,6 @@ async function fetchMailTmMessageDetail(token: string, id: string, verbose: bool
   else if (typeof j.html === "string") parts.push(stripHtml(j.html));
   const joined = parts.join("\n");
 
-  if (verbose) {
-    logger.info(
-      {
-        step: "mail.tm.3_message_detail_ok",
-        messageId: id,
-        subjectLen: (j.subject ?? "").length,
-        introLen: (j.intro ?? "").length,
-        textLen: (j.text ?? "").length,
-        htmlParts: Array.isArray(j.html) ? j.html.length : typeof j.html === "string" ? 1 : 0,
-        joinedLen: joined.length,
-        joinedPreview: joined.slice(0, 800),
-      },
-      "[mail.tm] Message detail merged text preview"
-    );
-  }
-
   return joined;
 }
 
@@ -303,30 +201,20 @@ async function fetchMailTmMessageDetail(token: string, id: string, verbose: bool
 export function extractOtpFromMailText(text: string, verbose?: boolean): string | null {
   const v = verbose ?? isMailTmVerbose();
   const t = text.replace(/\s+/g, " ");
-  if (v) {
-    logger.info(
-      { step: "mail.tm.4_extract_input", textLen: t.length, textPreview: t.slice(0, 600) },
-      "[mail.tm] extractOtp: blob for regex"
-    );
-  }
 
   const labeled = t.match(/(?:otp|code|verification|one[-\s]?time|pin)[^\d]{0,32}(\d{4,8})\b/i);
   if (labeled?.[1]) {
-    if (v) logger.info({ step: "mail.tm.4_extract_match", strategy: "labeled", otpLen: labeled[1].length }, "[mail.tm] extractOtp: labeled pattern");
     return labeled[1];
   }
-  if (v) logger.info({ step: "mail.tm.4_extract_no_labeled" }, "[mail.tm] extractOtp: no labeled match");
 
   const split6 = t.match(/\b(\d{3})[\s\-–—]\s*(\d{3})\b/);
   if (split6) {
     const merged = `${split6[1]}${split6[2]}`;
-    if (v) logger.info({ step: "mail.tm.4_extract_match", strategy: "split3-3", otpLen: merged.length }, "[mail.tm] extractOtp: split 3+3");
     return merged;
   }
 
   const six = t.match(/\b(\d{6})\b/);
   if (six?.[1]) {
-    if (v) logger.info({ step: "mail.tm.4_extract_match", strategy: "sixDigits", otpLen: 6 }, "[mail.tm] extractOtp: 6-digit");
     return six[1];
   }
 
@@ -341,7 +229,6 @@ export function extractOtpFromMailText(text: string, verbose?: boolean): string 
       if (v) logger.info({ step: "mail.tm.4_extract_skip_year", raw }, "[mail.tm] extractOtp: skip year-like");
       continue;
     }
-    if (v) logger.info({ step: "mail.tm.4_extract_match", strategy: "firstNonYear", raw }, "[mail.tm] extractOtp: first non-year candidate");
     return raw;
   }
   if (v) logger.info({ step: "mail.tm.4_extract_all_year_skipped" }, "[mail.tm] extractOtp: only year-like numbers");
@@ -359,20 +246,6 @@ export async function waitForOtpFromMailTm(
   const v = isMailTmVerbose();
   const runId = `otp-${Date.now()}`;
   const started = Date.now();
-  logger.info(
-    {
-      step: "mail.tm.poll_start",
-      runId,
-      baselineSize: baselineIds.size,
-      baselineSample: [...baselineIds].slice(0, 5),
-      timeoutMs: opts.timeoutMs,
-      pollMs: opts.pollMs,
-      signInEpochMs: opts.signInEpochMs,
-      signInSkewMs: MAIL_TM_SIGN_IN_CLOCK_SKEW_MS,
-      ...tokenMetaForLog(token),
-    },
-    "[mail.tm] Step 5: start OTP poll (baseline ids + optional Sign-In time filter)"
-  );
 
   let iteration = 0;
   const deadline = Date.now() + opts.timeoutMs;
@@ -441,64 +314,21 @@ export async function waitForOtpFromMailTm(
       candidates = fresh;
     }
 
-    logger.info(
-      {
-        step: "mail.tm.poll_iteration",
-        runId,
-        iteration,
-        remainingMs,
-        totalInMailbox: list.length,
-        notInBaselineCount: notInBaseline.length,
-        freshCount: fresh.length,
-        freshIds: fresh.map((m) => m.id),
-        candidateCount: candidates.length,
-        candidateIds: candidates.map((m) => m.id),
-      },
-      "[mail.tm] Poll: baseline + time filter → OTP candidates (newest-first order)"
-    );
-
     for (let fi = 0; fi < candidates.length; fi++) {
       const m = candidates[fi]!;
       let blob = [m.subject, m.intro].filter(Boolean).join("\n");
-      logger.info(
-        {
-          step: "mail.tm.poll_fresh_message",
-          runId,
-          index: fi,
-          messageId: m.id,
-          subject: (m.subject ?? "").slice(0, 200),
-          intro: (m.intro ?? "").slice(0, 300),
-          createdAt: m.createdAt,
-        },
-        "[mail.tm] Processing new message (list fields)"
-      );
-
       const detail = await fetchMailTmMessageDetail(token, m.id, v);
       if (detail) blob = `${blob}\n${detail}`;
 
       const otp = extractOtpFromMailText(blob, v);
       if (otp) {
-        logger.info(
-          {
-            step: "mail.tm.poll_otp_found",
-            runId,
-            messageId: m.id,
-            otpLen: otp.length,
-            otpLast2: otp.slice(-2),
-            elapsedMs: Date.now() - started,
-          },
-          "[mail.tm] OTP extracted from mail (full OTP omitted from logs; check len/last2)"
-        );
+        logger.info({ OTP: otp });
         return otp;
       }
       logger.info(
         { step: "mail.tm.poll_message_no_otp", runId, messageId: m.id },
         "[mail.tm] This message did not yield an OTP pattern — trying next"
       );
-    }
-
-    if (v && notInBaseline.length === 0) {
-      logger.info({ step: "mail.tm.poll_no_fresh", runId, iteration }, "[mail.tm] No messages outside baseline this iteration");
     }
 
     await new Promise((r) => setTimeout(r, opts.pollMs));
