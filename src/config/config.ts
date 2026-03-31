@@ -7,6 +7,10 @@ export function setCurrentInstanceId(id: number | undefined): void {
   currentInstanceId = id;
 }
 
+export function getCurrentInstanceId(): number | undefined {
+  return currentInstanceId;
+}
+
 /** Sub-second polling (ms). */
 const POLLING_INTERVAL_MS = parseInt(process.env.POLLING_INTERVAL_MS ?? "30000", 10);
 
@@ -35,22 +39,29 @@ const MAIL_TM_POLL_MS = parseInt(process.env.MAIL_TM_POLL_MS ?? "4000", 10);
 const MAIL_TM_POST_SIGNIN_DELAY_MS = parseInt(process.env.MAIL_TM_POST_SIGNIN_DELAY_MS ?? "2500", 10);
 
 export const config = {
-  loginPageUrl: process.env.VFS_LOGIN_PAGE_URL ?? process.env.VFS_LOGIN_ENDPOINT ?? "https://visa.vfsglobal.com/tza/en/nld/login",
+  /** If true, UI Submit opens Turnstile demo page and runs CapMonster injection (no VFS flow). */
+  get turnstileDemoMode(): boolean {
+    return process.env.TURNSTILE_DEMO_MODE === "true";
+  },
+  get turnstileDemoUrl(): string {
+    return process.env.TURNSTILE_DEMO_URL ?? "https://2captcha.com/demo/cloudflare-turnstile";
+  },
+  loginPageUrl: process.env.VFS_LOGIN_PAGE_URL ?? process.env.VFS_LOGIN_ENDPOINT ?? "https://visa.vfsglobal.com/ind/en/bgr/login",
   slotEndpoint: process.env.VFS_SLOT_ENDPOINT ?? "https://lift-api.vfsglobal.com/appointment/CheckIsSlotAvailable",
   /** Slot check + save applicants / calendar / timeslot / fees / schedule (same center & category). */
   slotPayload: {
-    countryCode: process.env.VFS_SLOT_COUNTRY_CODE ?? process.env.VFS_SLOT_COUNTRY ?? "tza",
+    countryCode: process.env.VFS_SLOT_COUNTRY_CODE ?? process.env.VFS_SLOT_COUNTRY ?? "ind",
     /** From setup form session when UI was used; otherwise `VFS_USERNAME`. */
     get loginUser() {
       return resolvedSlotPayloadLoginUser();
     },
-    missionCode: process.env.VFS_SLOT_MISSION_CODE ?? process.env.VFS_SLOT_MISSION ?? "nld",
+    missionCode: process.env.VFS_SLOT_MISSION_CODE ?? process.env.VFS_SLOT_MISSION ?? "bgr",
     payCode: process.env.VFS_SLOT_PAY_CODE ?? "",
     roleName: process.env.VFS_SLOT_ROLE_NAME ?? "Individual",
     vacCode: process.env.VFS_SLOT_VAC_CODE ?? "NTDS",
     visaCategoryCode: process.env.VFS_SLOT_VISA_CATEGORY_CODE ?? process.env.VFS_SLOT_VISA_CATEGORY ?? "CARLT",
   },
-  pollingPageUrl: process.env.VFS_POLLING_PAGE_URL ?? "https://visa.vfsglobal.com/tza/en/nld/dashboard",
+  pollingPageUrl: process.env.VFS_POLLING_PAGE_URL ?? "https://visa.vfsglobal.com/ind/en/bgr/application-detail",
 
   pollingIntervalMs: Math.max(5000, Math.min(60000, POLLING_INTERVAL_MS)),
   pollingIntervalMinMs: Math.max(5000, POLLING_INTERVAL_MIN_MS),

@@ -53,6 +53,8 @@ async function startFormServer(): Promise<void> {
       // Send IPC message to the child process to trigger bot cycle
       const inst = instances.find((i) => i.id === instanceId);
       if (inst?.process && !inst.process.killed) {
+        // Abort polling immediately so the next run uses updated config.
+        inst.process.send({ type: "config-updated", instanceId });
         inst.process.send({ type: "run-bot-cycle", instanceId });
       } else {
         logger.warn({ instanceId }, "Cannot send message to instance process");

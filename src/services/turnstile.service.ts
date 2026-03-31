@@ -5,7 +5,10 @@ import { logger } from "../utils/logger";
 const CREATE_TASK = "/createTask";
 const GET_RESULT = "/getTaskResult";
 const POLL_INTERVAL_MS = 2000;
-const MAX_WAIT_MS = 60000;
+const MAX_WAIT_MS = Math.max(
+  10_000,
+  parseInt(process.env.CAPMONSTER_MAX_WAIT_MS ?? "", 10) || 120_000
+);
 
 export interface TurnstileSolveOptions {
   pageAction?: string;
@@ -56,6 +59,10 @@ export class TurnstileService {
     });
 
     const data = (await body.json()) as { errorId: number; errorCode?: string; taskId?: number };
+    logger.debug(
+      { statusCode, errorId: data.errorId, errorCode: data.errorCode, taskId: data.taskId, hasPageAction: !!options.pageAction, hasData: !!options.data },
+      "CapMonster createTask response"
+    );
     if (data.errorId !== 0) {
       throw new Error(`CapMonster createTask failed: ${data.errorCode ?? data.errorId}`);
     }
@@ -66,7 +73,9 @@ export class TurnstileService {
 
   private async pollResult(taskId: number): Promise<string> {
     const deadline = Date.now() + MAX_WAIT_MS;
+    let polls = 0;
     while (Date.now() < deadline) {
+      polls += 1;
       const { body } = await request(`${this.baseUrl}${GET_RESULT}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -78,6 +87,10 @@ export class TurnstileService {
         status: string;
         solution?: { token: string };
       };
+      logger.debug(
+        { taskId, polls, status: data.status, errorId: data.errorId, errorCode: data.errorCode },
+        "CapMonster getTaskResult poll"
+      );
       if (data.errorId !== 0) {
         throw new Error(`CapMonster getTaskResult failed: ${data.errorCode ?? data.errorId}`);
       }

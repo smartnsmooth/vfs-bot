@@ -11,3 +11,7 @@ export function setSlotDate(date: string): void {
   if (!d) return;
   slotDate = d;
 }
+
+export function clearSlotDate(): void {
+  slotDate = null;
+}

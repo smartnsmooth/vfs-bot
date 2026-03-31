@@ -250,7 +250,7 @@ export async function waitForOtpFromMailTm(
   let iteration = 0;
   const deadline = Date.now() + opts.timeoutMs;
 
-  while (Date.now() < deadline) {
+  while (true) {
     iteration += 1;
     const remainingMs = deadline - Date.now();
 

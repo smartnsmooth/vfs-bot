@@ -14,6 +14,18 @@ for (const [idStr, data] of Object.entries(diskData.instances)) {
   }
 }
 
+/** Re-read `instances-data.json` into this process (cluster workers need this after the parent updates disk). */
+export function reloadSessionCredentialsFromDisk(): void {
+  instanceCredentials.clear();
+  const data = loadInstancesFromDisk();
+  for (const [idStr, row] of Object.entries(data.instances)) {
+    const id = parseInt(idStr, 10);
+    if (row.credentials) {
+      instanceCredentials.set(id, row.credentials);
+    }
+  }
+}
+
 function persistToDisk(): void {
   const instances: Record<string, { credentials?: { username: string; password: string }; details?: Record<string, unknown> }> = {};
   

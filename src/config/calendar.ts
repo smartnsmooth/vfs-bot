@@ -5,9 +5,10 @@ import { getSlotCenterOverride } from "../utils/slotCenterOverride.store";
 export const CALENDAR_URL =
   process.env.VFS_CALENDAR_URL ?? "https://lift-api.vfsglobal.com/appointment/calendar";
 
-/** DD/MM/YYYY — today's date in local timezone. */
+/** DD/MM/YYYY — two days after today in local timezone. */
 function calendarFromDate(): string {
   const d = new Date();
+  d.setDate(d.getDate() + 2);
   const dd = String(d.getDate()).padStart(2, "0");
   const mm = String(d.getMonth() + 1).padStart(2, "0");
   const yyyy = d.getFullYear();
@@ -21,7 +22,7 @@ export function buildCalendarBody(urn: string): Record<string, unknown> {
 
   const loginUser = getEffectiveLiftLoginUser();
   const override = getSlotCenterOverride();
-  
+
   return {
     centerCode: override?.centerCode ?? config.slotPayload.vacCode,
     countryCode: config.slotPayload.countryCode,

@@ -1,4 +1,4 @@
-import { config } from "./config";
+import { config, getCurrentInstanceId } from "./config";
 import { getApplicantDetailsOverrides } from "../utils/applicantDetails.store";
 import { getApplicantIpForPayload } from "../utils/applicantIp";
 import { getEffectiveLiftLoginUser } from "../utils/liftLoginUser";
@@ -93,6 +93,7 @@ const SAVE_APPLICANTS_APPLICANT_KEY_ORDER: readonly string[] = [
   "canDeleteVAF",
   "canDownloadVAF",
   "Retryleft",
+  "visaSubClass",
   "ipAddress",
 ];
 
@@ -129,6 +130,36 @@ function mergeOverridesIntoBody(body: Record<string, unknown>, overrides: Record
   const list = body.applicantList;
   if (!Array.isArray(list) || !list[0] || typeof list[0] !== "object") return;
   Object.assign(list[0] as object, overrides);
+}
+
+/**
+ * After `VFS_APPLICANTS_JSON` / env template + UI merge: force only `applicantList[0].selectedSubvisaCategory`
+ * to JSON `null` when `VFS_APPLICANT_SELECTED_SUBVISA_NULL=true` (or `1` / `yes`). Root fields unchanged.
+ */
+function applyForcedApplicantNullFieldsFromEnv(body: Record<string, unknown>): void {
+  const raw = (process.env.VFS_APPLICANT_SELECTED_SUBVISA_NULL ?? "").trim().toLowerCase();
+  if (!/^true|1|yes$/.test(raw)) return;
+  const list = body.applicantList;
+  if (!Array.isArray(list) || list.length === 0 || typeof list[0] !== "object" || list[0] === null) return;
+  (list[0] as Record<string, unknown>).selectedSubvisaCategory = null;
+}
+
+/** Setup-form / bot-only fields merged into `applicantList[0]` — not part of lift-api save-applicants body. */
+const APPLICANT_UI_ONLY_KEYS = ["scheduleAllowedDates", "vacCode", "vacCode2"] as const;
+
+/**
+ * Match browser-captured lift-api shape: drop UI-only keys; ensure `visaSubClass` (often null) before `ipAddress`.
+ */
+function finalizeApplicantForLiftApiPost(body: Record<string, unknown>): void {
+  const list = body.applicantList;
+  if (!Array.isArray(list) || list.length === 0 || typeof list[0] !== "object" || list[0] === null) return;
+  const a = list[0] as Record<string, unknown>;
+  for (const k of APPLICANT_UI_ONLY_KEYS) {
+    delete a[k];
+  }
+  if (!Object.prototype.hasOwnProperty.call(a, "visaSubClass")) {
+    a.visaSubClass = null;
+  }
 }
 
 /** Empty optional string from env → `null` (lift-api ind/bgr expects null, not ""). */
@@ -222,6 +253,7 @@ export function buildSaveApplicantsBodyFromEnv(): Record<string, unknown> {
     canDeleteVAF: false,
     canDownloadVAF: false,
     Retryleft: "",
+    visaSubClass: null,
     ipAddress: getApplicantIpForPayload(),
   };
 
@@ -280,18 +312,26 @@ export function getApplicantFormDefaults(): Record<string, string> {
  */
 export function buildSaveApplicantsBody(): Record<string, unknown> {
   const body = buildSaveApplicantsBodyFromEnv();
-  const o = getApplicantDetailsOverrides();
+  const instanceId = getCurrentInstanceId();
+  const o = getApplicantDetailsOverrides(instanceId);
   const needApplicantMerge = o && Object.keys(o).length > 0;
   const lu = getEffectiveLiftLoginUser();
 
-  if (!needApplicantMerge && !lu) return body;
-
-  const clone = JSON.parse(JSON.stringify(body)) as Record<string, unknown>;
-  if (needApplicantMerge) mergeOverridesIntoBody(clone, o);
-  if (lu) {
-    clone.loginUser = lu;
-    const list = clone.applicantList as Record<string, unknown>[] | undefined;
-    if (list?.[0]) list[0].loginUser = lu;
+  let merged: Record<string, unknown>;
+  if (!needApplicantMerge && !lu) {
+    merged = body;
+  } else {
+    const clone = JSON.parse(JSON.stringify(body)) as Record<string, unknown>;
+    if (needApplicantMerge) mergeOverridesIntoBody(clone, o);
+    if (lu) {
+      clone.loginUser = lu;
+      const list = clone.applicantList as Record<string, unknown>[] | undefined;
+      if (list?.[0]) list[0].loginUser = lu;
+    }
+    merged = clone;
   }
-  return normalizeSaveApplicantsBody(clone);
+
+  applyForcedApplicantNullFieldsFromEnv(merged);
+  finalizeApplicantForLiftApiPost(merged);
+  return normalizeSaveApplicantsBody(merged);
 }

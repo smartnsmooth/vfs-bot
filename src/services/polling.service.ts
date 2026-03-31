@@ -7,15 +7,30 @@ import type { BrowserService } from "./browser.service";
 export interface PollResult {
   slot: Slot | null;
   response: CheckIsSlotAvailableResponse;
+  centerNumber?: 1 | 2;  // Which center found the slot
+  centerCode?: string;
+  visaCategoryCode?: string;
 }
 
 /**
  * Run slot check inside the browser (avoids Cloudflare 403). Requires a VFS tab open and logged in.
+ * Can optionally override center and visa category for multi-center polling.
  */
 export class PollingService {
-  async checkSlotsInBrowser(browserService: BrowserService): Promise<PollResult> {
+  async checkSlotsInBrowser(
+    browserService: BrowserService,
+    options?: { centerCode?: string; visaCategoryCode?: string; centerNumber?: 1 | 2 }
+  ): Promise<PollResult> {
     const url = config.slotEndpoint;
-    const payload = config.slotPayload;
+    
+    // Build payload with optional overrides
+    const payload = options?.centerCode && options?.visaCategoryCode
+      ? {
+          ...config.slotPayload,
+          vacCode: options.centerCode,
+          visaCategoryCode: options.visaCategoryCode,
+        }
+      : config.slotPayload;
     try {
       const { status, body } = await browserService.runSlotCheckInBrowser(url, payload);
       let data: CheckIsSlotAvailableResponse;
@@ -63,7 +78,13 @@ export class PollingService {
         };
       }
       const slot = parseSlotFromResponse(data);
-      return { slot, response: data };
+      return {
+        slot,
+        response: data,
+        centerNumber: options?.centerNumber,
+        centerCode: options?.centerCode,
+        visaCategoryCode: options?.visaCategoryCode,
+      };
     } catch (err) {
       logger.debug({ err, url }, "Browser slot check failed");
       return {
@@ -97,7 +118,7 @@ function parseSlotFromResponse(data: CheckIsSlotAvailableResponse): Slot | null 
   const rawDate = first.date;
   const { date, time } = parseEarliestDate(rawDate);
   const id = `${rawDate}_${first.applicant}`.replace(/\s+/g, "_");
-  return { id, center: "", date, time };
+  return { id, center: "", date, time, rawDate };
 }
 
 function parseEarliestDate(raw: string): { date: string; time: string } {

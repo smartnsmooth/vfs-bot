@@ -2,3 +2,4 @@ node_modules/
 dist/
 instances-data.json
 slot-state.json
+bookings/

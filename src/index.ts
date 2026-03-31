@@ -16,16 +16,34 @@ import {
   isApplicantFormUiDisabled,
   runApplicantFormWithSubmitHandler,
 } from "./ui/applicantDetailsFormServer";
-import { getSessionLoginCredentials } from "./utils/sessionLogin.store";
-import { isSlotFoundByAnyInstance, markSlotFound, clearSlotState } from "./utils/slotState";
+import { getSessionLoginCredentials, reloadSessionCredentialsFromDisk } from "./utils/sessionLogin.store";
+import { reloadApplicantDetailsFromDisk } from "./utils/applicantDetails.store";
+import {
+  createSlotFoundWatcher,
+  isSlotFoundByAnyInstance,
+  markSlotFound,
+  clearSlotState,
+} from "./utils/slotState";
 import { setSlotCenterOverride, clearSlotCenterOverride } from "./utils/slotCenterOverride.store";
+import { setSlotDate, clearSlotDate } from "./utils/slotDate.store";
+import {
+  getScheduleAllowedDates,
+  isPollingSlotInAllowedSet,
+  NoDatesInScheduleRangeError,
+} from "./utils/scheduleAllowedDates.js";
 
 const polling = new PollingService();
 const browser = new BrowserService();
 const telegram = new TelegramService();
 
 const POLL_INTERVAL_MS = config.pollingIntervalMs;
-const POST_LOGIN_POLL_DELAY_MS = 30_000;
+const POST_LOGIN_POLL_DELAY_MS = 20_000;
+const FAST_SKIP_CALENDAR_UP_TO_INSTANCE = Math.max(
+  0,
+  parseInt(process.env.FAST_SKIP_CALENDAR_UP_TO_INSTANCE ?? "5", 10) || 5
+);
+const FIXED_TIMING_UP_TO_INSTANCE = 6;
+const FIXED_POLL_INTERVAL_MS = 6_000;
 type ProxyChainModule = {
   anonymizeProxy(proxyUrl: string): Promise<string>;
   closeAnonymizedProxy(url: string, closeConnections?: boolean): Promise<void>;
@@ -44,6 +62,35 @@ let submitChain: Promise<void> = Promise.resolve();
 function enqueueSubmitTask(task: () => Promise<void>): void {
   submitChain = submitChain.then(task).catch((err) => {
     logger.error({ err }, "Submit-driven run failed");
+  });
+}
+
+/**
+ * Cluster-mode: allow UI Submit to abort polling immediately.
+ * We can't cancel an in-flight network request, but we can:
+ * - stop sleeping between polls immediately
+ * - stop the poll loop ASAP
+ * - let the queued next cycle start with updated config
+ */
+let pollingAbortSeq = 0;
+let pollingAbortWaiters: Array<() => void> = [];
+function requestPollingAbort(reason: string, instanceId?: number): void {
+  pollingAbortSeq += 1;
+  const waiters = pollingAbortWaiters;
+  pollingAbortWaiters = [];
+  for (const w of waiters) {
+    try {
+      w();
+    } catch {
+      /* ignore */
+    }
+  }
+  logger.info({ instanceId, reason, pollingAbortSeq }, "[poll] Abort requested");
+}
+function waitForPollingAbort(currentSeq: number): Promise<void> {
+  if (pollingAbortSeq !== currentSeq) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    pollingAbortWaiters.push(resolve);
   });
 }
 
@@ -249,17 +296,17 @@ async function ensureChromeWithDevTools(): Promise<void> {
   const instanceId = getBotInstanceId(userDataDir);
   const selectedProxy = resolveProxyForInstance(instanceId);
 
-  for (const url of getChromeDevToolsCheckUrls()) {
-    if (await checkDevToolsEndpoint(url)) {
-      if (selectedProxy) {
-        throw new Error(
-          "Chrome DevTools is already running. Proxy is enabled, so a fresh Chrome launch is required to apply proxy settings. Close all Chrome windows, then start the bot again."
-        );
-      }
-      console.log(`[Chrome] DevTools already at ${url}`);
-      return;
-    }
-  }
+  // for (const url of getChromeDevToolsCheckUrls()) {
+  //   if (await checkDevToolsEndpoint(url)) {
+  //     if (selectedProxy) {
+  //       throw new Error(
+  //         "Chrome DevTools is already running. Proxy is enabled, so a fresh Chrome launch is required to apply proxy settings. Close all Chrome windows, then start the bot again."
+  //       );
+  //     }
+  //     console.log(`[Chrome] DevTools already at ${url}`);
+  //     return;
+  //   }
+  // }
 
   const chromePath = resolveChromeExecutablePath();
   const resolvedProxy = await resolveLaunchProxyServer(selectedProxy);
@@ -301,76 +348,191 @@ async function ensureChromeWithDevTools(): Promise<void> {
   throw new Error("Chrome DevTools did not become ready. Start Chrome manually with --remote-debugging-port=9222");
 }
 
+/**
+ * If another instance wrote `slot-state.json`, adopt their center/category and treat polling as a hit.
+ * Must run after each slot check (and between centers): peers can mark the file while this instance is in-flight.
+ */
+async function checkPeerFoundSlotAndJoinBooking(instanceId?: number): Promise<boolean> {
+  const sharedState = isSlotFoundByAnyInstance();
+  if (!sharedState.found || sharedState.foundBy === instanceId) {
+    return false;
+  }
+  if (sharedState.centerCode && sharedState.visaCategoryCode) {
+    setSlotCenterOverride(sharedState.centerCode, sharedState.visaCategoryCode);
+    logger.info(
+      {
+        foundBy: sharedState.foundBy,
+        thisInstance: instanceId,
+        centerCode: sharedState.centerCode,
+        visaCategoryCode: sharedState.visaCategoryCode,
+        slot: sharedState.slot,
+      },
+      "Slot found by another instance — using their centerCode/visaCategoryCode and proceeding to booking"
+    );
+  } else {
+    logger.info(
+      { foundBy: sharedState.foundBy, thisInstance: instanceId, slot: sharedState.slot },
+      "Slot found by another instance — stopping poll loop and proceeding to booking"
+    );
+  }
+  return true;
+}
+
 /** `true` if at least one slot was seen (polling stops after the first hit). */
 async function runPollLoop(instanceId?: number): Promise<boolean> {
   const limit = config.pollLimit;
   let completed = 0;
   let slotFound = false;
+  const slotWatcher = createSlotFoundWatcher(instanceId);
+  const myAbortSeq = pollingAbortSeq;
 
-  while (limit === 0 || completed < limit) {
-    // Check if any other instance found a slot
-    const sharedState = isSlotFoundByAnyInstance();
-    if (sharedState.found && sharedState.foundBy !== instanceId) {
-      // Another instance found a slot - use their center/category
-      if (sharedState.centerCode && sharedState.visaCategoryCode) {
-        setSlotCenterOverride(sharedState.centerCode, sharedState.visaCategoryCode);
-        logger.info(
-          { foundBy: sharedState.foundBy, thisInstance: instanceId, centerCode: sharedState.centerCode, visaCategoryCode: sharedState.visaCategoryCode, slot: sharedState.slot },
-          "Slot found by another instance — using their centerCode/visaCategoryCode and proceeding to booking"
-        );
-      } else {
-        logger.info(
-          { foundBy: sharedState.foundBy, thisInstance: instanceId, slot: sharedState.slot },
-          "Slot found by another instance — stopping poll loop and proceeding to booking"
-        );
+  try {
+    while (limit === 0 || completed < limit) {
+      if (pollingAbortSeq !== myAbortSeq) {
+        logger.info({ instanceId }, "[poll] Aborting poll loop (config updated)");
+        return false;
       }
-      await telegram.alert("slot_found", `Slot found by Instance ${sharedState.foundBy}: ${sharedState.slot?.center || "—"} ${sharedState.slot?.date} ${sharedState.slot?.time}`, { slotId: sharedState.slot?.id }).catch(() => { });
-      return true; // Proceed to booking
-    }
 
-    try {
-      const { slot, response } = await polling.checkSlotsInBrowser(browser);
-      console.log("[Poll]", JSON.stringify(response, null, 2));
+      // Instant wake: if any other instance already marked slot found, stop immediately.
+      if (await checkPeerFoundSlotAndJoinBooking(instanceId)) {
+        return true;
+      }
 
-      if (slot) {
-        slotFound = true;
-        // Get current centerCode and visaCategoryCode from config
-        const centerCode = config.slotPayload.vacCode;
-        const visaCategoryCode = config.slotPayload.visaCategoryCode;
+      try {
+        // Get all configured centers for this instance
+        const { getConfiguredCenters } = await import("./utils/centerConfig.js");
+        const centers = getConfiguredCenters(instanceId);
 
-        // Mark slot as found for ALL instances with this instance's center/category
-        markSlotFound(instanceId ?? 0, centerCode, visaCategoryCode, slot);
+        if (centers.length === 0) {
+          logger.warn({ instanceId }, "No centers configured for this instance - check form setup");
+          break;
+        }
 
-        // Set override for this instance too (in case it's used later)
-        setSlotCenterOverride(centerCode, visaCategoryCode);
+        let foundInThisPoll = false;
 
-        await telegram.alert("slot_found", `Slot: ${slot.center || "—"} ${slot.date} ${slot.time}`, { slotId: slot.id }).catch(() => { });
-        logger.info({ instanceId, centerCode, visaCategoryCode, slot }, "Slot found by this instance — broadcasting center/category to all instances");
+        // Check each center sequentially
+        for (const center of centers) {
+          if (await checkPeerFoundSlotAndJoinBooking(instanceId)) {
+            return true;
+          }
+
+          logger.info(
+            { instanceId, centerNumber: center.centerNumber, vacCode: center.vacCode, visaCategoryCode: center.visaCategoryCode },
+            `Checking Center ${center.centerNumber}`
+          );
+
+          const { slot, response, centerNumber, centerCode, visaCategoryCode } = await polling.checkSlotsInBrowser(browser, {
+            centerCode: center.vacCode,
+            visaCategoryCode: center.visaCategoryCode,
+            centerNumber: center.centerNumber,
+          });
+
+          console.log(`[Poll Center ${center.centerNumber}]`, JSON.stringify(response, null, 2));
+
+          if (slot) {
+            slotFound = true;
+            foundInThisPoll = true;
+
+            // Mark slot as found for ALL instances with this instance's center/category
+            markSlotFound(instanceId ?? 0, centerCode!, visaCategoryCode!, slot);
+
+            // Set override for this instance too (in case it's used later)
+            setSlotCenterOverride(centerCode!, visaCategoryCode!);
+
+            await telegram.alert("slot_found", `Slot (Center ${centerNumber}): ${slot.center || "—"} ${slot.date} ${slot.time}`, { slotId: slot.id, centerNumber }).catch(() => { });
+            logger.info(
+              { instanceId, centerNumber, centerCode, visaCategoryCode, slot },
+              `Slot found by this instance in Center ${centerNumber} — broadcasting center/category to all instances`
+            );
+            break; // Stop checking other centers once a slot is found
+          }
+
+          if (await checkPeerFoundSlotAndJoinBooking(instanceId)) {
+            return true;
+          }
+        }
+
+        if (foundInThisPoll) {
+          break; // Exit poll loop if slot found
+        } else {
+          await telegram.alert("no_slot_found", `No slot found in ${centers.map((c) => c.vacCode).join("+")}`, { instanceId }).catch(() => { });
+          logger.info({ instanceId }, `No slot found in ${centers.map((c) => c.vacCode).join("+")}`);
+        }
+      } catch (err) {
+        logger.error({ err, instanceId }, "Poll error");
+        await telegram.alert("error", err instanceof Error ? err.message : "Poll error").catch(() => { });
+      }
+      completed += 1;
+      if (limit > 0 && completed >= limit) {
+        logger.info({ completed, limit, instanceId }, "Polling finished (POLL_LIMIT reached)");
         break;
       }
-    } catch (err) {
-      logger.error({ err, instanceId }, "Poll error");
-      await telegram.alert("error", err instanceof Error ? err.message : "Poll error").catch(() => { });
+
+      // Instances 1..6 use fixed 6s interval; others keep random min..max.
+      const fixedTiming = getFixedTimingForInstance(instanceId);
+      const min = config.pollingIntervalMinMs;
+      const max = config.pollingIntervalMaxMs;
+      const randomDelayMs = fixedTiming
+        ? fixedTiming.pollIntervalMs
+        : min + Math.floor(Math.random() * (max - min));
+      logger.info(
+        { delayMs: randomDelayMs, min, max, instanceId, mode: fixedTiming ? "fixed_6s" : "random_range" },
+        "Waiting before next poll"
+      );
+
+      const woke = await Promise.race([
+        new Promise<"timer">((r) => setTimeout(() => r("timer"), randomDelayMs)),
+        slotWatcher.wait().then(() => "slot" as const),
+        waitForPollingAbort(myAbortSeq).then(() => "abort" as const),
+      ]);
+
+      if (woke === "abort") {
+        logger.info({ instanceId }, "[poll] Aborted during sleep (config updated)");
+        return false;
+      }
+
+      if (woke === "slot" && (await checkPeerFoundSlotAndJoinBooking(instanceId))) {
+        logger.info({ instanceId }, "Woken by slot-state file change — stopping poll loop immediately");
+        return true;
+      }
     }
-    completed += 1;
-    if (limit > 0 && completed >= limit) {
-      logger.info({ completed, limit, instanceId }, "Polling finished (POLL_LIMIT reached)");
-      break;
-    }
-    // Random delay between min and max
-    const min = config.pollingIntervalMinMs;
-    const max = config.pollingIntervalMaxMs;
-    const randomDelayMs = min + Math.floor(Math.random() * (max - min));
-    logger.info({ delayMs: randomDelayMs, min, max, instanceId }, "Waiting before next poll");
-    await new Promise((r) => setTimeout(r, randomDelayMs));
+    return slotFound;
+  } finally {
+    slotWatcher.dispose();
   }
-  return slotFound;
 }
 
 const MAX_SAVE_APPLICANTS_RETRIES = 3;
 
 function isSaveApplicants422(err: unknown): boolean {
   return err instanceof Error && err.message.includes("Save applicants API error:") && err.message.includes("422");
+}
+
+function getFixedTimingForInstance(instanceId?: number): { postLoginOffsetMs: number; pollIntervalMs: number } | null {
+  if (!instanceId || instanceId < 1 || instanceId > FIXED_TIMING_UP_TO_INSTANCE) return null;
+  return {
+    postLoginOffsetMs: (instanceId - 1) * 1000, // instance1=0s ... instance6=5s
+    pollIntervalMs: FIXED_POLL_INTERVAL_MS,      // all fixed group use 6s interval
+  };
+}
+
+function deriveCalendarDateFromPollingRaw(raw?: string): string | null {
+  if (!raw) return null;
+  const t = raw.trim();
+  if (!t) return null;
+  // Expected from polling: MM/DD/YYYY [time...]
+  const m = t.match(/^(\d{2})\/(\d{2})\/(\d{4})/);
+  if (m) {
+    const [, mm, dd, yyyy] = m;
+    return `${mm}/${dd}/${yyyy}`;
+  }
+  // Fallback: YYYY-MM-DD -> MM/DD/YYYY
+  const iso = t.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (iso) {
+    const [, yyyy, mm, dd] = iso;
+    return `${mm}/${dd}/${yyyy}`;
+  }
+  return null;
 }
 
 /**
@@ -398,8 +560,77 @@ async function runBookingChainWithRetry(instanceId?: number): Promise<void> {
       }
     }
   }
-  await browser.postCalendarLiftApi();
-  await browser.postTimeslotLiftApi();
+  const fastSkipCalendar = (instanceId ?? 1) <= FAST_SKIP_CALENDAR_UP_TO_INSTANCE;
+  const allowed = getScheduleAllowedDates();
+  const calendarOpts =
+    allowed && allowed.size > 0 ? { allowedDates: allowed } : undefined;
+  const shared = isSlotFoundByAnyInstance();
+  const pollingHitAllowed =
+    allowed && allowed.size > 0 ? isPollingSlotInAllowedSet(shared.slot, allowed) : false;
+
+  let usedCalendarForTimeslot = false;
+
+  if (!allowed || allowed.size === 0) {
+    if (fastSkipCalendar) {
+      const derived = deriveCalendarDateFromPollingRaw(shared.slot?.rawDate ?? shared.slot?.date);
+      if (derived) {
+        setSlotDate(derived);
+        logger.info(
+          { instanceId, derivedSlotDate: derived, source: "polling.earliestSlotLists" },
+          "Fast mode: skipping calendar API and using polling date for timeslot"
+        );
+      } else {
+        logger.warn(
+          { instanceId, raw: shared.slot?.rawDate, date: shared.slot?.date },
+          "Fast mode: could not derive slotDate from polling; falling back to calendar API"
+        );
+        await browser.postCalendarLiftApi();
+        usedCalendarForTimeslot = true;
+      }
+    } else {
+      await browser.postCalendarLiftApi();
+      usedCalendarForTimeslot = true;
+    }
+  } else if (pollingHitAllowed && fastSkipCalendar) {
+    const derived = deriveCalendarDateFromPollingRaw(shared.slot?.rawDate ?? shared.slot?.date);
+    if (derived) {
+      setSlotDate(derived);
+      logger.info(
+        {
+          instanceId,
+          derivedSlotDate: derived,
+          source: "polling.earliestSlotLists",
+          allowedDates: [...allowed],
+        },
+        "Fast mode (date on allow-list): skipping calendar API and using polling date for timeslot"
+      );
+    } else {
+      logger.warn(
+        { instanceId, raw: shared.slot?.rawDate, date: shared.slot?.date, allowedDates: [...allowed] },
+        "Fast mode: could not derive slotDate from polling; falling back to filtered calendar API"
+      );
+      await browser.postCalendarLiftApi(calendarOpts);
+      usedCalendarForTimeslot = true;
+    }
+  } else {
+    await browser.postCalendarLiftApi(calendarOpts);
+    usedCalendarForTimeslot = true;
+  }
+
+  try {
+    await browser.postTimeslotLiftApi();
+  } catch (err) {
+    // Requested fallback: if fast mode skipped calendar and timeslot fails, call calendar then retry once.
+    if (fastSkipCalendar && !usedCalendarForTimeslot) {
+      logger.warn({ err, instanceId }, "Timeslot failed in fast mode - calling calendar and retrying timeslot once");
+      await browser.postCalendarLiftApi(calendarOpts);
+      usedCalendarForTimeslot = true;
+      await browser.postTimeslotLiftApi();
+    } else {
+      throw err;
+    }
+  }
+
   await browser.postFeesLiftApi();
   await browser.postScheduleLiftApi();
 }
@@ -410,8 +641,12 @@ type SubmitMeta = { firstSubmit: boolean; instanceId?: number };
  * One full run after setup form Submit (or headless single run): CDP refresh → tab URL branch → poll → optional booking.
  */
 async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
+  // Reload .env changes for submit-driven runs (so toggles like TURNSTILE_DEMO_MODE take effect
+  // without restarting the whole cluster). Safe because .env is the source of truth in this app.
+  dotenv.config({ override: true });
+
   const instanceId = meta.instanceId;
-  
+
   // Set current instance ID for config getters (e.g., loginUser)
   setCurrentInstanceId(instanceId);
 
@@ -424,6 +659,13 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
   // 1) Drop old Playwright CDP attachment; 2) ensure Chrome + DevTools; 3) reconnect
   await browser.disconnectCdp();
   await ensureChromeWithDevTools();
+
+  if (config.turnstileDemoMode) {
+    await browser.openUrlInFirstTab(config.turnstileDemoUrl);
+    await browser.solveTurnstileOnFirstTabDemoPage();
+    logger.info("[Demo] Done (TURNSTILE_DEMO_MODE=true).");
+    return;
+  }
 
   let firstUrl = await browser.getFirstTabUrl();
 
@@ -463,15 +705,24 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
   let slotFoundDuringPoll = false;
   if (config.pollingEnabled) {
     if (didLoginThisCycle) {
+      // Dashboard: no auto "Start new booking" / center / category (handle in browser yourself).
       await new Promise((r) => setTimeout(r, POST_LOGIN_POLL_DELAY_MS));
-
-      // Random delay 0-30 seconds
-      const randomDelayMs = Math.floor(Math.random() * 30_000);
-      logger.info(
-        { delayMs: randomDelayMs },
-        "Post-login random delay before polling (step 2/2)"
-      );
-      await new Promise((r) => setTimeout(r, randomDelayMs));
+      const fixedTiming = getFixedTimingForInstance(instanceId);
+      if (fixedTiming) {
+        logger.info(
+          { instanceId, delayMs: fixedTiming.postLoginOffsetMs, mode: "fixed_by_instance" },
+          "Post-login fixed delay before polling (after base 30s)"
+        );
+        await new Promise((r) => setTimeout(r, fixedTiming.postLoginOffsetMs));
+      } else {
+        // Random delay 0-30 seconds
+        const randomDelayMs = Math.floor(Math.random() * 30_000);
+        logger.info(
+          { delayMs: randomDelayMs, mode: "random_0_30s" },
+          "Post-login random delay before polling (step 2/2)"
+        );
+        await new Promise((r) => setTimeout(r, randomDelayMs));
+      }
     }
     await telegram.notify("VFS bot run: polling for slots.").catch(() => { });
     logger.info({ skipDashboardNavigate, instanceId }, "Starting slot polling");
@@ -482,10 +733,42 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
   const runBookingChain = !config.pollingEnabled || slotFoundDuringPoll;
 
   if (runBookingChain) {
-    await runBookingChainWithRetry(instanceId);
+    let pollHits = slotFoundDuringPoll;
+    while (true) {
+      try {
+        await runBookingChainWithRetry(instanceId);
+        break;
+      } catch (err) {
+        const noDates =
+          err instanceof NoDatesInScheduleRangeError ||
+          (err instanceof Error && (err as Error & { code?: string }).code === "NO_DATES_IN_RANGE");
+        if (!noDates) throw err;
+        logger.warn(
+          { instanceId },
+          "No calendar dates match allowed schedule dates — clearing slot state and restarting polling"
+        );
+        clearSlotState();
+        clearSlotCenterOverride();
+        clearSlotDate();
+        if (!config.pollingEnabled) {
+          throw err;
+        }
+        await browser.preparePollingAfterLogin({ skipDashboardNavigate });
+        pollHits = await runPollLoop(instanceId);
+        if (!pollHits) {
+          logger.info({ instanceId }, "No slot after allowed-dates restart poll — stopping booking chain");
+          break;
+        }
+      }
+    }
   } else {
     logger.info({ instanceId }, "No slot found this run — skipping save applicants, fees, calendar, timeslot, schedule");
   }
+}
+
+function syncInstanceStoresFromDisk(): void {
+  reloadSessionCredentialsFromDisk();
+  reloadApplicantDetailsFromDisk();
 }
 
 async function start(): Promise<void> {
@@ -497,17 +780,27 @@ async function start(): Promise<void> {
 
     // Listen for IPC messages from parent process
     if (process.send) {
-      process.on("message", async (msg: any) => {
-        if (msg?.type === "run-bot-cycle" && msg?.instanceId === myInstanceId) {
-          try {
-            await runOneBotCycle({ firstSubmit: true, instanceId: myInstanceId });
-            if (process.send) {
-              process.send({ type: "bot-cycle-complete", instanceId: myInstanceId });
-            }
-          } catch (err) {
-            logger.error({ err, instanceId: myInstanceId }, "Bot cycle failed");
+      let ipcChain: Promise<void> = Promise.resolve();
+      process.on("message", (msg: any) => {
+        ipcChain = ipcChain.then(async () => {
+          if (msg?.instanceId !== myInstanceId) return;
+
+          if (msg?.type === "config-updated") {
+            syncInstanceStoresFromDisk();
+            requestPollingAbort("config-updated", myInstanceId);
+            return;
           }
-        }
+
+          if (msg?.type === "run-bot-cycle") {
+            syncInstanceStoresFromDisk();
+            try {
+              await runOneBotCycle({ firstSubmit: true, instanceId: myInstanceId });
+              process.send?.({ type: "bot-cycle-complete", instanceId: myInstanceId });
+            } catch (err) {
+              logger.error({ err, instanceId: myInstanceId }, "Bot cycle failed");
+            }
+          }
+        });
       });
     }
 
@@ -524,7 +817,8 @@ async function start(): Promise<void> {
   }
 
   await runApplicantFormWithSubmitHandler((info) => {
-    enqueueSubmitTask(() => runOneBotCycle({ firstSubmit: info.firstSubmit }));
+    const instanceId = typeof info.instanceId === "number" ? info.instanceId : undefined;
+    enqueueSubmitTask(() => runOneBotCycle({ firstSubmit: info.firstSubmit, instanceId }));
   });
 }
 

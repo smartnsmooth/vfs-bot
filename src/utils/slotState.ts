@@ -1,8 +1,8 @@
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, unlinkSync, watch } from "node:fs";
 import { join } from "node:path";
 import { logger } from "./logger";
 
-interface SlotFoundState {
+export interface SlotFoundState {
   found: boolean;
   foundBy?: number; // instance ID
   timestamp?: number;
@@ -11,6 +11,7 @@ interface SlotFoundState {
     center?: string;
     date?: string;
     time?: string;
+    rawDate?: string;
   };
   centerCode?: string;
   visaCategoryCode?: string;
@@ -35,7 +36,7 @@ export function markSlotFound(
   instanceId: number,
   centerCode: string,
   visaCategoryCode: string,
-  slot?: { id?: string; center?: string; date?: string; time?: string }
+  slot?: { id?: string; center?: string; date?: string; time?: string; rawDate?: string }
 ): void {
   const state: SlotFoundState = {
     found: true,
@@ -63,4 +64,66 @@ export function clearSlotState(): void {
   } catch (err) {
     logger.warn({ err }, "Failed to clear slot state");
   }
+}
+
+/**
+ * Resolve as soon as another instance marks slot found (fs.watch based).
+ * Used to wake sleeping poll loops immediately (no need to wait for interval).
+ */
+export function createSlotFoundWatcher(myInstanceId?: number): {
+  wait: () => Promise<SlotFoundState>;
+  dispose: () => void;
+} {
+  let disposed = false;
+  let resolved = false;
+  let pending: ((s: SlotFoundState) => void) | null = null;
+
+  const wait = (): Promise<SlotFoundState> => {
+    if (disposed) return Promise.resolve({ found: false });
+    if (resolved) return Promise.resolve(isSlotFoundByAnyInstance());
+    return new Promise<SlotFoundState>((resolve) => {
+      pending = resolve;
+    });
+  };
+
+  const maybeResolve = (): void => {
+    if (disposed || resolved) return;
+    const state = isSlotFoundByAnyInstance();
+    if (!state.found) return;
+    if (myInstanceId != null && state.foundBy === myInstanceId) return;
+    resolved = true;
+    if (pending) {
+      pending(state);
+      pending = null;
+    }
+  };
+
+  // Edge: slot may already be marked before watcher starts.
+  maybeResolve();
+
+  let unwatch: (() => void) | null = null;
+  try {
+    const w = watch(process.cwd(), { persistent: false }, (_event, filename) => {
+      if (!filename) return;
+      if (String(filename).toLowerCase() !== "slot-state.json") return;
+      // File write may be in progress; attempt read in next tick.
+      setTimeout(maybeResolve, 0);
+    });
+    unwatch = () => w.close();
+  } catch (err) {
+    // If watch fails (rare), we still allow polling loop to detect via periodic top-of-loop checks.
+    logger.debug({ err }, "slot-state watcher unavailable; relying on loop checks");
+  }
+
+  const dispose = (): void => {
+    disposed = true;
+    pending = null;
+    try {
+      unwatch?.();
+    } catch {
+      /* ignore */
+    }
+  };
+
+  return { wait, dispose };
 }

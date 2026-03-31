@@ -3,8 +3,15 @@ import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { config } from "../config/config";
 import { getApplicantFormDefaults } from "../config/saveApplicants";
 import { logger } from "../utils/logger";
-import { getApplicantDetailsOverrides, setApplicantDetailsOverrides, getAllInstanceApplicantDetails } from "../utils/applicantDetails.store";
+import {
+  getApplicantDetailsOverrides,
+  setApplicantDetailsOverrides,
+  getAllInstanceApplicantDetails,
+  mergeGlobalScheduleAllowedDatesFromPayload,
+  omitGlobalScheduleFields,
+} from "../utils/applicantDetails.store";
 import { getSessionLoginCredentials, setSessionLoginCredentials, getAllInstanceCredentials } from "../utils/sessionLogin.store";
+import { buildApplicantFormPageScript } from "./applicantDetailsFormClientScript";
 const UI_DISABLED = process.env.VFS_APPLICANT_UI === "false";
 
 export function isApplicantFormUiDisabled(): boolean {
@@ -142,10 +149,17 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
     "Subclasscode",
     "salutation",
     "vacCode",
+    "vacCode2",
+    "selectedSubvisaCategory2",
   ] as const;
   for (const k of keys) {
     const v = str(k);
     if (v !== undefined && v !== null && String(v) !== "") out[k] = v;
+  }
+  if ("scheduleAllowedDates" in j) {
+    const v = j.scheduleAllowedDates;
+    out.scheduleAllowedDates =
+      typeof v === "string" ? v : Array.isArray(v) ? v.map((x) => String(x)).join("\n") : "";
   }
   if (typeof j.gender === "number" && Number.isFinite(j.gender)) {
     out.gender = j.gender;
@@ -161,6 +175,24 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
 function buildPageHtml(collectLogin: boolean): string {
   const numInstances = parseInt(process.env.VFS_BOT_INSTANCES ?? "1", 10);
   const isMultiInstance = numInstances > 1;
+  const fastSkipCalendarUpTo =
+    parseInt(process.env.FAST_SKIP_CALENDAR_UP_TO_INSTANCE ?? "5", 10) || 5;
+
+  /** Placed above instance selection so it reads as global, not per-instance. */
+  const scheduleAllowedDatesBlock = `
+  <fieldset style="border:1px solid #38444d;border-radius:8px;padding:1rem 1rem 0.25rem;margin:0 0 1.25rem">
+    <legend style="color:#8b98a5;font-size:0.9rem">Allowed appointment dates (optional)</legend>
+    <p class="hint" style="margin-top:0">Shared by every instance. Pick a date (it stays in the box after it is added); use another day or <strong>Add date</strong> for more. Remove chips with ×. If polling hits one of these dates, instances 1–${fastSkipCalendarUpTo} skip the calendar and book that date; others still call the calendar but only keep allow-listed dates. Leave the list empty to disable.</p>
+    <label for="scheduleDatePicker">Pick a date</label>
+    <div class="picker-row">
+      <input type="date" id="scheduleDatePicker" />
+      <button type="button" class="btn-inline" id="scheduleDateAddBtn">Add date</button>
+    </div>
+    <p class="hint" style="margin-top:0.75rem;margin-bottom:0.35rem">Selected dates</p>
+    <div id="scheduleAllowedDatesChips" class="date-chips" aria-live="polite"></div>
+    <button type="button" class="btn-secondary btn-inline" id="scheduleDatesClearBtn">Clear all</button>
+    <textarea name="scheduleAllowedDates" id="scheduleAllowedDatesHidden" class="sr-only" autocomplete="off" tabindex="-1" aria-hidden="true"></textarea>
+  </fieldset>`;
 
   const instanceSelectBlock = isMultiInstance
     ? `
@@ -205,11 +237,22 @@ function buildPageHtml(collectLogin: boolean): string {
     h1 { font-size: 1.25rem; margin-bottom: 0.5rem; }
     p.hint { color: #8b98a5; font-size: 0.9rem; margin-top: 0; }
     label { display: block; margin-top: 0.75rem; font-size: 0.85rem; color: #8b98a5; }
-    input, select { width: 100%; box-sizing: border-box; margin-top: 0.25rem; padding: 0.5rem 0.6rem;
-      border-radius: 8px; border: 1px solid #38444d; background: #15202b; color: #e7e9ea; }
+    input, select, textarea { width: 100%; box-sizing: border-box; margin-top: 0.25rem; padding: 0.5rem 0.6rem;
+      border-radius: 8px; border: 1px solid #38444d; background: #15202b; color: #e7e9ea; font: inherit; }
+    textarea { min-height: 6rem; resize: vertical; }
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+    .picker-row { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; margin-top: 0.25rem; }
+    .picker-row input[type="date"] { margin-top: 0; max-width: 11rem; flex: 1 1 auto; min-width: 0; }
     button { margin-top: 1.25rem; width: 100%; padding: 0.65rem; border: none; border-radius: 8px;
       background: #1d9bf0; color: #fff; font-weight: 600; cursor: pointer; font-size: 1rem; }
     button:hover { filter: brightness(1.08); }
+    button.btn-inline { margin-top: 0; width: auto; padding: 0.5rem 0.9rem; font-size: 0.9rem; }
+    button.btn-secondary { margin-top: 0.6rem; width: auto; background: #38444d; color: #e7e9ea; font-size: 0.85rem; padding: 0.45rem 0.75rem; }
+    button.btn-secondary:hover { filter: brightness(1.12); }
+    .date-chips { display: flex; flex-wrap: wrap; gap: 0.45rem; margin-top: 0.25rem; min-height: 2rem; }
+    .date-chip { display: inline-flex; align-items: center; gap: 0.25rem; padding: 0.3rem 0.55rem; background: #253341; border-radius: 999px; font-size: 0.88rem; border: 1px solid #38444d; }
+    .date-chip-remove { margin: 0; padding: 0 0.2rem; width: auto; min-width: 0; background: transparent; color: #8b98a5; font-size: 1.15rem; line-height: 1; font-weight: 400; }
+    .date-chip-remove:hover { color: #f4212e; filter: none; }
     .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
     .ok { color: #00ba7c; margin-top: 1rem; }
     .err { color: #f4212e; margin-top: 1rem; }
@@ -219,6 +262,7 @@ function buildPageHtml(collectLogin: boolean): string {
   <h1>${collectLogin ? "Setup" : "Applicant details"}</h1>
   <p class="hint">${hint}</p>
   <form id="f">
+    ${scheduleAllowedDatesBlock}
     ${instanceSelectBlock}
     ${loginBlock}
     <div class="row2">
@@ -261,8 +305,39 @@ function buildPageHtml(collectLogin: boolean): string {
       <option value="MAA">Bulgaria Visa Application Centre-Chennai</option>
       <option value="CCU">Bulgarian visa application center-Kolkata-VAC</option>
     </select>
-    <label for="selectedSubvisaCategory">Visa Category</label>
+    <label for="selectedSubvisaCategory">Visa Category (Center 1)</label>
     <select id="selectedSubvisaCategory" name="selectedSubvisaCategory">
+      <option value="">-- Select Category --</option>
+      <option value="LONGSTAY">Long Stay D visa</option>
+      <option value="SAW">Seasonal worker</option>
+      <option value="Busi">Business Visa</option>
+    </select>
+    
+    <hr style="margin: 1.5rem 0; border: none; border-top: 2px solid #ddd;" />
+    <h3 style="margin-bottom: 0.75rem; color: #555;">Center 2 (Optional)</h3>
+    <p style="margin-top: 0; margin-bottom: 1rem; font-size: 0.9rem; color: #666;">Leave empty to poll only Center 1</p>
+    
+    <label for="vacCode2">Visa Application Centre 2 (Optional)</label>
+    <select id="vacCode2" name="vacCode2">
+      <option value="">-- No Second Centre --</option>
+      <option value="JAI">Bulgaria Visa Application Centre-Jaipur</option>
+      <option value="HYD">Bulgaria Visa Application Centre-Hyderabad</option>
+      <option value="JLD">Bulgaria Visa Application Centre-Jalandhar</option>
+      <option value="BLR">Bulgaria Visa Application Center ,Bangalore</option>
+      <option value="IXC">Bulgaria Visa Application Centre-Chandigarh</option>
+      <option value="PNQ">Bulgaria Visa Application Centre-Pune</option>
+      <option value="COK">Bulgaria Visa Application Centre-Cochin</option>
+      <option value="GOI">Bulgaria Visa Application Centre-Goa</option>
+      <option value="AMD">Bulgaria Visa Application Centre-Ahmedabad</option>
+      <option value="PUD">Bulgaria Visa Application Centre-Puducherry</option>
+      <option value="GUR">Bulgaria Visa Application Center ,Gurugram</option>
+      <option value="NDEL">Bulgaria Visa Application Center ,New Delhi</option>
+      <option value="BKC">Bulgaria Visa Application Center, Mumbai</option>
+      <option value="MAA">Bulgaria Visa Application Centre-Chennai</option>
+      <option value="CCU">Bulgarian visa application center-Kolkata-VAC</option>
+    </select>
+    <label for="selectedSubvisaCategory2">Visa Category 2 (Optional)</label>
+    <select id="selectedSubvisaCategory2" name="selectedSubvisaCategory2">
       <option value="">-- Select Category --</option>
       <option value="LONGSTAY">Long Stay D visa</option>
       <option value="SAW">Seasonal worker</option>
@@ -271,247 +346,7 @@ function buildPageHtml(collectLogin: boolean): string {
     <button type="submit" style="margin-top: 1.25rem; width: 100%;">${isMultiInstance ? "Submit & Run All Instances" : "Submit & Run Bot"}</button>
   </form>
   <p id="msg"></p>
-  <script>
-    const collectLogin = ${collectLoginJs};
-    const isMultiInstance = ${isMultiInstanceJs};
-    
-    let autoSaveTimeout = null;
-    
-    async function loadDefaults() {
-      const r = await fetch("/api/defaults");
-      const d = await r.json();
-      if (!d.ok) return;
-      const a = d.defaults || {};
-      for (const k of Object.keys(a)) {
-        const el = document.getElementById(k);
-        if (el) el.value = a[k] == null ? "" : String(a[k]);
-      }
-      if (collectLogin && d.loginDefaults && d.loginDefaults.vfsUsername) {
-        const u = document.getElementById("vfsUsername");
-        if (u) u.value = String(d.loginDefaults.vfsUsername);
-      }
-    }
-    
-    async function loadInstanceData(showAlert = false) {
-      if (!isMultiInstance) return;
-      const instanceId = parseInt(document.getElementById("instanceId").value, 10);
-      const r = await fetch("/api/instances");
-      const data = await r.json();
-      if (!data.ok) return;
-      
-      const inst = data.instances[String(instanceId)];
-      if (!inst || (!inst.credentials && !inst.details)) {
-        if (showAlert) {
-          alert("No saved data for Instance " + instanceId);
-        }
-        // Clear ALL form fields when no saved data
-        if (collectLogin) {
-          const uEl = document.getElementById("vfsUsername");
-          const pEl = document.getElementById("vfsPassword");
-          if (uEl) uEl.value = "";
-          if (pEl) pEl.value = "";
-        }
-        // Clear all applicant fields
-        const fieldsToClear = ["firstName", "lastName", "emailId", "dialCode", "contactNumber", 
-                       "dateOfBirth", "passportNumber", "passportExpirtyDate", 
-                       "vacCode", "selectedSubvisaCategory"];
-        for (const field of fieldsToClear) {
-          const el = document.getElementById(field);
-          if (el) el.value = "";
-        }
-        // Reset gender to male (default)
-        const genderEl = document.getElementById("gender");
-        if (genderEl) genderEl.value = "1";
-        return;
-      }
-      
-      // Clear all fields first, then load saved data
-      if (collectLogin) {
-        const uEl = document.getElementById("vfsUsername");
-        const pEl = document.getElementById("vfsPassword");
-        if (uEl) uEl.value = "";
-        if (pEl) pEl.value = "";
-      }
-      const allFields = ["firstName", "lastName", "emailId", "dialCode", "contactNumber", 
-                     "dateOfBirth", "passportNumber", "passportExpirtyDate", 
-                     "vacCode", "selectedSubvisaCategory"];
-      for (const field of allFields) {
-        const el = document.getElementById(field);
-        if (el) el.value = "";
-      }
-      const genderEl = document.getElementById("gender");
-      if (genderEl) genderEl.value = "1";
-      
-      // Load credentials
-      if (inst.credentials && collectLogin) {
-        const uEl = document.getElementById("vfsUsername");
-        const pEl = document.getElementById("vfsPassword");
-        if (uEl) uEl.value = inst.credentials.username || "";
-        if (pEl) pEl.value = inst.credentials.password || "";
-      }
-      
-      // Load applicant details
-      if (inst.details) {
-        for (const k of Object.keys(inst.details)) {
-          const el = document.getElementById(k);
-          if (el) el.value = inst.details[k] == null ? "" : String(inst.details[k]);
-        }
-      }
-      
-      if (showAlert) {
-        alert("Loaded saved data for Instance " + instanceId);
-      }
-    }
-    
-    async function saveFormData(showFeedback = false) {
-      const form = document.getElementById("f");
-      const fd = new FormData(form);
-      const body = {
-        firstName: String(fd.get("firstName") || "").toUpperCase(),
-        lastName: String(fd.get("lastName") || "").toUpperCase(),
-        emailId: String(fd.get("emailId") || "").toUpperCase(),
-        dialCode: fd.get("dialCode"),
-        contactNumber: fd.get("contactNumber"),
-        dateOfBirth: fd.get("dateOfBirth"),
-        passportNumber: String(fd.get("passportNumber") || "").toUpperCase(),
-        passportExpirtyDate: fd.get("passportExpirtyDate"),
-        nationalityCode: "IND",
-        vacCode: fd.get("vacCode"),
-        gender: parseInt(String(fd.get("gender") || "1"), 10),
-        selectedSubvisaCategory: fd.get("selectedSubvisaCategory"),
-      };
-      if (isMultiInstance) {
-        body.instanceId = parseInt(String(fd.get("instanceId") || "1"), 10);
-      }
-      if (collectLogin) {
-        body.vfsUsername = fd.get("vfsUsername");
-        body.vfsPassword = fd.get("vfsPassword");
-      }
-      
-      if (showFeedback) {
-        const msg = document.getElementById("msg");
-        msg.className = "";
-        msg.textContent = "Saving...";
-      }
-      
-      try {
-        const r = await fetch("/api/save", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-        const j = await r.json();
-        if (showFeedback) {
-          const msg = document.getElementById("msg");
-          if (j.ok) {
-            msg.className = "ok";
-            msg.textContent = isMultiInstance 
-              ? "✓ Saved for Instance " + body.instanceId
-              : "✓ Saved";
-          } else {
-            msg.className = "err";
-            msg.textContent = j.error || "Save failed";
-          }
-        }
-      } catch (err) {
-        if (showFeedback) {
-          const msg = document.getElementById("msg");
-          msg.className = "err";
-          msg.textContent = String(err);
-        }
-      }
-    }
-    
-    function scheduleAutoSave() {
-      if (!isMultiInstance) return;
-      
-      if (autoSaveTimeout) {
-        clearTimeout(autoSaveTimeout);
-      }
-      
-      autoSaveTimeout = setTimeout(() => {
-        saveFormData(false); // Silent auto-save
-      }, 1000);
-    }
-    
-    if (isMultiInstance) {
-      // Auto-load when instance selector changes
-      document.getElementById("instanceId").addEventListener("change", () => {
-        loadInstanceData(false);
-      });
-      
-      // Auto-save on any input change
-      const form = document.getElementById("f");
-      const inputs = form.querySelectorAll("input, select");
-      inputs.forEach(input => {
-        input.addEventListener("input", scheduleAutoSave);
-        input.addEventListener("change", scheduleAutoSave);
-      });
-      
-      // Load initial instance data on page load
-      loadInstanceData(false);
-    } else {
-      loadDefaults();
-    }
-    
-    // Auto-capitalize specific fields
-    const capitalizeFields = ["firstName", "lastName", "emailId", "passportNumber"];
-    capitalizeFields.forEach(fieldId => {
-      const el = document.getElementById(fieldId);
-      if (el) {
-        el.addEventListener("input", (e) => {
-          const start = e.target.selectionStart;
-          const end = e.target.selectionEnd;
-          e.target.value = e.target.value.toUpperCase();
-          e.target.setSelectionRange(start, end);
-        });
-      }
-    });
-    
-    document.getElementById("f").addEventListener("submit", async (e) => {
-      e.preventDefault();
-      const msg = document.getElementById("msg");
-      msg.textContent = "";
-      const fd = new FormData(e.target);
-      const body = {
-        firstName: String(fd.get("firstName") || "").toUpperCase(),
-        lastName: String(fd.get("lastName") || "").toUpperCase(),
-        emailId: String(fd.get("emailId") || "").toUpperCase(),
-        dialCode: fd.get("dialCode"),
-        contactNumber: fd.get("contactNumber"),
-        dateOfBirth: fd.get("dateOfBirth"),
-        passportNumber: String(fd.get("passportNumber") || "").toUpperCase(),
-        passportExpirtyDate: fd.get("passportExpirtyDate"),
-        nationalityCode: "IND",
-        vacCode: fd.get("vacCode"),
-        gender: parseInt(String(fd.get("gender") || "1"), 10),
-        selectedSubvisaCategory: fd.get("selectedSubvisaCategory"),
-      };
-      if (isMultiInstance) {
-        body.instanceId = parseInt(String(fd.get("instanceId") || "1"), 10);
-      }
-      if (collectLogin) {
-        body.vfsUsername = fd.get("vfsUsername");
-        body.vfsPassword = fd.get("vfsPassword");
-      }
-      try {
-        const r = await fetch("/api/submit", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-        const j = await r.json();
-        if (j.ok) {
-          msg.className = "ok";
-          if (isMultiInstance) {
-            msg.textContent = "✓ Started " + (j.queued || "all") + " bot instance(s). Check terminal for progress.";
-          } else {
-            msg.textContent = j.firstSubmit
-              ? "Saved — bot run started in the background. Submit again for another run or to refresh data."
-              : "Saved — another bot run was queued. Check the terminal for progress.";
-          }
-        } else {
-          msg.className = "err";
-          msg.textContent = j.error || "Submit failed";
-        }
-      } catch (err) {
-        msg.className = "err";
-        msg.textContent = String(err);
-      }
-    });
-  </script>
+  ${buildApplicantFormPageScript(collectLoginJs, isMultiInstanceJs)}
 </body>
 </html>`;
 }
@@ -572,9 +407,35 @@ export function runApplicantFormWithSubmitHandler(
 
         if (req.method === "GET" && path === "/api/defaults") {
           try {
-            const defaults = getApplicantFormDefaults();
+            const numInstances = parseInt(process.env.VFS_BOT_INSTANCES ?? "1", 10) || 1;
+            const defaults: Record<string, unknown> = { ...getApplicantFormDefaults() };
+
+            // Single-instance UX: the form has no instance selector, but data is still saved per instance ID.
+            // Prefer instance 1 (cluster) and fall back to instance 0.
+            if (numInstances <= 1) {
+              const det1 = getApplicantDetailsOverrides(1);
+              const det0 = getApplicantDetailsOverrides(0);
+              const det = det1 ?? det0;
+              if (det) Object.assign(defaults, omitGlobalScheduleFields(det));
+            }
+
+            const shared0 = getApplicantDetailsOverrides(0);
+            const sad = shared0?.scheduleAllowedDates;
+            if (sad != null && String(sad).trim()) {
+              defaults.scheduleAllowedDates = Array.isArray(sad) ? sad.join("\n") : String(sad);
+            }
             const payload: Record<string, unknown> = { ok: true, defaults };
-            if (collectLogin) payload.loginDefaults = getLoginFormDefaults();
+            if (collectLogin) {
+              const base = getLoginFormDefaults();
+              const creds1 = getSessionLoginCredentials(1);
+              const creds0 = getSessionLoginCredentials(0);
+              const creds = creds1 ?? creds0;
+              payload.loginDefaults = {
+                ...base,
+                vfsUsername: (creds?.username ?? base.vfsUsername ?? "").trim(),
+                vfsPassword: creds?.password ?? "",
+              };
+            }
             json(res, 200, payload);
           } catch (e) {
             json(res, 500, { ok: false, error: e instanceof Error ? e.message : "defaults failed" });
@@ -627,8 +488,13 @@ export function runApplicantFormWithSubmitHandler(
 
           const { vfsUsername: _u, vfsPassword: _p, instanceId: _id, ...rest } = j;
           const fields = parseApplicantFields(rest);
-          // Auto-save accepts partial data (no validation)
-          setApplicantDetailsOverrides(fields, instanceId);
+          const id = instanceId;
+          if (id !== undefined && id !== 0) {
+            setApplicantDetailsOverrides(omitGlobalScheduleFields(fields), id);
+          } else {
+            setApplicantDetailsOverrides(fields, id);
+          }
+          mergeGlobalScheduleAllowedDatesFromPayload(j);
 
           json(res, 200, { ok: true });
           return;
@@ -647,6 +513,7 @@ export function runApplicantFormWithSubmitHandler(
           // In cluster mode, start ALL instances with saved data
           const numInstances = parseInt(process.env.VFS_BOT_INSTANCES ?? "1", 10);
           if (numInstances > 1) {
+            mergeGlobalScheduleAllowedDatesFromPayload(j);
             const credentials = getAllInstanceCredentials();
             const details = getAllInstanceApplicantDetails();
             const allIds = new Set([...credentials.keys(), ...details.keys()]);
@@ -704,6 +571,7 @@ export function runApplicantFormWithSubmitHandler(
             return;
           }
           setApplicantDetailsOverrides(fields, instanceId);
+          mergeGlobalScheduleAllowedDatesFromPayload(j);
           const firstSubmit = !seenSubmit;
           seenSubmit = true;
           json(res, 200, { ok: true, firstSubmit });
