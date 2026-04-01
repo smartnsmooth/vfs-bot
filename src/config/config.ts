@@ -90,6 +90,9 @@ export const config = {
   // Default to on; set ENABLE_POLLING=false to disable slot polling.
   pollingEnabled: process.env.ENABLE_POLLING !== "false",
 
+  // When true: log in then stop immediately — no polling, no booking.  Useful for testing login / Turnstile.
+  loginOnly: process.env.VFS_LOGIN_ONLY === "true" || process.env.VFS_LOGIN_ONLY === "1",
+
   /**
    * Optional: manual `clientsource` header for lift-api.
    * When set, overrides captured value and page storage.
@@ -97,6 +100,12 @@ export const config = {
    * `clientsource` (see BrowserService sniffer), then storage in fetch.
    */
   liftApiClientSource: (process.env.VFS_CLIENTSOURCE ?? "").trim(),
+
+  /**
+   * When true, a fresh 256-byte random base64 token is generated for every lift-api request
+   * instead of reusing the captured/static clientsource.  Keeps each request fingerprint unique.
+   */
+  randomClientSource: process.env.VFS_RANDOM_CLIENTSOURCE === "true" || process.env.VFS_RANDOM_CLIENTSOURCE === "1",
 
   /**
    * When true, OTP is read via https://api.mail.tm (see /domains for hostnames — not limited to “@mail.tm”).

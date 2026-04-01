@@ -525,6 +525,8 @@ export function runApplicantFormWithSubmitHandler(
 
             let queued = 0;
             for (const instanceId of allIds) {
+              // Instance 0 is a global/shared store slot, not a real bot instance
+              if (instanceId === 0) continue;
               // Only submit for instances that are actually running (1 to numInstances)
               if (instanceId > numInstances) {
                 continue;

@@ -1,4 +1,16 @@
+import { randomBytes } from "node:crypto";
 import { chromium, Browser, BrowserContext, Page } from "playwright";
+
+/** Returns true when the error is Playwright's "Target closed" family of errors. */
+function isTargetClosedError(e: unknown): boolean {
+  if (!(e instanceof Error)) return false;
+  return (
+    e.message.includes("Target page, context or browser has been closed") ||
+    e.message.includes("Target closed") ||
+    e.message.includes("has been closed") ||
+    e.name === "TargetClosedError"
+  );
+}
 import { config, getCurrentInstanceId } from "../config/config";
 import { calendarApiDateInAllowedSet, NoDatesInScheduleRangeError } from "../utils/scheduleAllowedDates.js";
 import { buildCalendarBody, CALENDAR_URL } from "../config/calendar";
@@ -42,6 +54,15 @@ function readClientSourceHeader(headers: Record<string, string>): string | undef
     headers["ClientSource"] ??
     headers["CLIENTSOURCE"];
   return raw?.trim() || undefined;
+}
+
+/**
+ * Generates a fresh random clientsource token matching the VFS format:
+ * 256 random bytes encoded as standard base64 (≈ 344 character string ending with "==").
+ * Called per-request when VFS_RANDOM_CLIENTSOURCE=true.
+ */
+function generateRandomClientSource(): string {
+  return randomBytes(256).toString("base64");
 }
 
 export class BrowserService {
@@ -419,7 +440,7 @@ export class BrowserService {
     // Quick check for consent (3 seconds max) since email input is already visible
     await this.dismissCookieConsent(page, true);
 
-    const passwordSelectors = `input[name="password"]${visibleOnly}, input[type="password"]${visibleOnly}`;
+    const passwordSelectors = `input[formcontrolname="password"]${visibleOnly}, input[name="password"]${visibleOnly}, input[type="password"]:not([formcontrolname="otp"])${visibleOnly}`;
 
     await this.fillLoginCredentials(page, username, password, {
       usernameSelectors,
@@ -1151,8 +1172,9 @@ export class BrowserService {
   ): Promise<{ status: number; body: string }> {
     this.assertVfsPageLoggedInForLiftApi(page);
     const { origin, referer, route } = this.getLiftApiPageContextFromSource(page);
-    const clientSourceOverride =
-      config.liftApiClientSource?.trim() || getCapturedClientSource()?.trim() || null;
+    const clientSourceOverride: string | null = config.randomClientSource
+      ? generateRandomClientSource()
+      : config.liftApiClientSource?.trim() || getCapturedClientSource()?.trim() || null;
     return page.evaluate(
       async (args: {
         url: string;
@@ -1274,21 +1296,51 @@ export class BrowserService {
     opts: { usernameSelectors: string; passwordSelectors: string; timeoutMs: number }
   ): Promise<void> {
     const deadline = Date.now() + opts.timeoutMs;
-    const emailByLabel = page.getByLabel(/email/i).first();
-    const passwordByLabel = page.getByLabel(/password/i).first();
+    // Use explicit locators only — getByLabel can resolve to a different element than the
+    // querySelector-based verification, causing a perpetual "field empty" false negative.
+    const emailLocator = page.locator(opts.usernameSelectors).first();
+    const passwordLocator = page.locator(opts.passwordSelectors).first();
 
     while (Date.now() < deadline) {
       try {
-        if (await emailByLabel.isVisible().catch(() => false)) {
-          await emailByLabel.fill(username, { timeout: 5000 });
-        } else {
-          await page.locator(opts.usernameSelectors).first().waitFor({ state: "visible", timeout: 5000 });
-          await page.locator(opts.usernameSelectors).first().fill(username, { timeout: 5000 });
-        }
-        if (await passwordByLabel.isVisible().catch(() => false)) {
-          await passwordByLabel.fill(password, { timeout: 5000 });
-        } else {
-          await page.locator(opts.passwordSelectors).first().fill(password, { timeout: 5000 });
+        // Fill email — fill() already focuses the element; a preceding click() can place the
+        // cursor at the end of existing text which causes fill() to append instead of replace.
+        await emailLocator.waitFor({ state: "visible", timeout: 5000 });
+        await emailLocator.fill(username, { timeout: 5000 });
+
+        // Brief pause so Angular change-detection runs between fields
+        await page.waitForTimeout(150);
+
+        // Fill password
+        await passwordLocator.waitFor({ state: "visible", timeout: 5000 });
+        await passwordLocator.fill(password, { timeout: 5000 });
+
+        // Verify both fields still have values — Angular may clear email during password fill.
+        // Selector order: Angular formControlName first (most specific for VFS), then fallbacks.
+        // input[type="email"] is intentionally last — other Angular SPA routes can leave hidden
+        // type="email" inputs in the DOM that would give a false-empty read if checked first.
+        const [actualEmail, actualPw] = await page
+          .evaluate((selectors) => {
+            const emailEl =
+              document.querySelector<HTMLInputElement>('input[formControlName="username"]') ??
+              document.querySelector<HTMLInputElement>('input[formControlName="email"]') ??
+              document.querySelector<HTMLInputElement>('#email') ??
+              document.querySelector<HTMLInputElement>('input[type="email"]') ??
+              document.querySelector<HTMLInputElement>(selectors.username);
+            // Exclude the OTP step field (formcontrolname="otp") when looking for the password field
+            const pwEl =
+              document.querySelector<HTMLInputElement>('input[formControlName="password"]') ??
+              document.querySelector<HTMLInputElement>('input[name="password"]') ??
+              document.querySelector<HTMLInputElement>('input[type="password"]:not([formcontrolname="otp"])') ??
+              document.querySelector<HTMLInputElement>(selectors.password);
+            return [emailEl?.value?.trim() ?? "", pwEl?.value?.trim() ?? ""] as [string, string];
+          }, { username: opts.usernameSelectors, password: opts.passwordSelectors })
+          .catch(() => ["", ""] as [string, string]);
+
+        if (!actualEmail || !actualPw) {
+          // Angular cleared one of the fields — retry
+          await page.waitForTimeout(300);
+          continue;
         }
         return;
       } catch (err) {
@@ -1457,6 +1509,51 @@ export class BrowserService {
         logger.info("[Login] Turnstile token dropped after credential refill — re-injecting");
         await page.evaluate(injectTurnstileTokenInPage, turnstileTokenBeforeRefill);
       }
+    }
+
+    // Guard: verify fields are non-empty before submitting — Angular may have reset them.
+    // If empty, retry the fill up to 3 more times before giving up.
+    const readLoginFields = (): Promise<[string, string]> =>
+      page
+        .evaluate(() => {
+          // formControlName selectors first — the VFS email input is type="text" not type="email",
+          // and other SPA routes can leave hidden type="email" inputs in the DOM.
+          const emailEl =
+            document.querySelector<HTMLInputElement>('input[formControlName="username"]') ??
+            document.querySelector<HTMLInputElement>('input[formControlName="email"]') ??
+            document.querySelector<HTMLInputElement>('#email') ??
+            document.querySelector<HTMLInputElement>('input[type="email"]');
+          const pwEl =
+            document.querySelector<HTMLInputElement>('input[formControlName="password"]') ??
+            document.querySelector<HTMLInputElement>('input[name="password"]') ??
+            document.querySelector<HTMLInputElement>('input[type="password"]:not([formcontrolname="otp"])');
+          return [emailEl?.value?.trim() ?? "", pwEl?.value?.trim() ?? ""] as [string, string];
+        })
+        .catch(() => ["", ""] as [string, string]);
+
+    let [preSubmitEmail, preSubmitPw] = await readLoginFields();
+
+    if ((!preSubmitEmail || !preSubmitPw) && opts.loginRefill) {
+      logger.warn(
+        { hasEmail: !!preSubmitEmail, hasPw: !!preSubmitPw },
+        "[Login] Fields empty after refill — Angular still clearing; retrying fill up to 3 more times"
+      );
+      for (let guardRetry = 0; guardRetry < 3; guardRetry++) {
+        await this.fillLoginCredentials(page, opts.loginRefill.username, opts.loginRefill.password, {
+          usernameSelectors: opts.loginRefill.usernameSelectors,
+          passwordSelectors: opts.loginRefill.passwordSelectors,
+          timeoutMs: 10_000,
+        });
+        [preSubmitEmail, preSubmitPw] = await readLoginFields();
+        if (preSubmitEmail && preSubmitPw) break;
+        await page.waitForTimeout(500);
+      }
+    }
+
+    if (!preSubmitEmail || !preSubmitPw) {
+      throw new Error(
+        `Login fields empty before submit (email=${!!preSubmitEmail}, pw=${!!preSubmitPw}) — Angular cleared them; will retry login`
+      );
     }
 
     // Token exists - try to trigger the SPA's click handler even if the button remains disabled.
@@ -1716,18 +1813,36 @@ export class BrowserService {
         if (dash.test(url)) {
           return "dashboard";
         }
-      } catch {
-        /* ignore */
+      } catch (e) {
+        if (isTargetClosedError(e)) {
+          logger.warn({ step: "login.wait_dash_or_otp" }, "[login] Page/browser closed while waiting — returning 'neither'");
+          return "neither";
+        }
       }
-      const otpVis = await this.isLoginOtpFieldVisible(page);
-      if (otpVis) {
-        return "otp";
+      try {
+        const otpVis = await this.isLoginOtpFieldVisible(page);
+        if (otpVis) {
+          return "otp";
+        }
+      } catch (e) {
+        if (isTargetClosedError(e)) {
+          logger.warn({ step: "login.wait_dash_or_otp" }, "[login] Page/browser closed while checking OTP — returning 'neither'");
+          return "neither";
+        }
       }
       const now = Date.now();
       if (isMailTmVerbose() && now - lastProgressLog >= 10_000) {
         lastProgressLog = now;
       }
-      await page.waitForTimeout(350);
+      try {
+        await page.waitForTimeout(350);
+      } catch (e) {
+        if (isTargetClosedError(e)) {
+          logger.warn({ step: "login.wait_dash_or_otp" }, "[login] Page/browser closed during wait — returning 'neither'");
+          return "neither";
+        }
+        throw e;
+      }
     }
     let finalUrl = "";
     try {
@@ -1736,7 +1851,11 @@ export class BrowserService {
     } catch {
       /* ignore */
     }
-    if (await this.isLoginOtpFieldVisible(page)) return "otp";
+    try {
+      if (await this.isLoginOtpFieldVisible(page)) return "otp";
+    } catch {
+      /* ignore */
+    }
     logger.info(
       { step: "login.wait_dash_or_otp", result: "neither", finalUrl, maxMs },
       "[login] Window ended: neither dashboard nor OTP field detected"
@@ -1779,7 +1898,15 @@ export class BrowserService {
           "[login] still waiting for OTP UI…"
         );
       }
-      await page.waitForTimeout(350);
+      try {
+        await page.waitForTimeout(350);
+      } catch (e) {
+        if (isTargetClosedError(e)) {
+          logger.warn({ step: "login.otp_field_wait" }, "[login] Page/browser closed while waiting for OTP field");
+          throw new Error("Page closed while waiting for OTP field");
+        }
+        throw e;
+      }
     }
     let finalUrl = "";
     try {

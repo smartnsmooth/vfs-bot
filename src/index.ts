@@ -23,6 +23,7 @@ import {
   isSlotFoundByAnyInstance,
   markSlotFound,
   clearSlotState,
+  type SlotFoundState,
 } from "./utils/slotState";
 import { setSlotCenterOverride, clearSlotCenterOverride } from "./utils/slotCenterOverride.store";
 import { setSlotDate, clearSlotDate } from "./utils/slotDate.store";
@@ -42,8 +43,8 @@ const FAST_SKIP_CALENDAR_UP_TO_INSTANCE = Math.max(
   0,
   parseInt(process.env.FAST_SKIP_CALENDAR_UP_TO_INSTANCE ?? "5", 10) || 5
 );
-const FIXED_TIMING_UP_TO_INSTANCE = 6;
-const FIXED_POLL_INTERVAL_MS = 6_000;
+const FIXED_TIMING_UP_TO_INSTANCE = 11;
+const FIXED_POLL_INTERVAL_MS = 61_000;
 type ProxyChainModule = {
   anonymizeProxy(proxyUrl: string): Promise<string>;
   closeAnonymizedProxy(url: string, closeConnections?: boolean): Promise<void>;
@@ -96,6 +97,16 @@ function waitForPollingAbort(currentSeq: number): Promise<void> {
 
 /** Cluster mode: queues for each instance, indexed by instanceId. */
 const instanceQueues = new Map<number, Promise<void>>();
+
+/**
+ * Per-process booking state flags.
+ * `instanceBookingActive` — set just before saveApplicants; cleared on booking failure.
+ *   Prevents this instance from abandoning an in-progress booking to chase a new slot.
+ * `instanceOnPaymentPage` — set after postSchedule succeeds; never cleared.
+ *   Causes runOneBotCycle to return immediately so Chrome stays on the payment page.
+ */
+let instanceBookingActive = false;
+let instanceOnPaymentPage = false;
 
 function resolveLoginUsername(instanceId?: number): string {
   const fromUi = getSessionLoginCredentials(instanceId)?.username?.trim();
@@ -296,17 +307,15 @@ async function ensureChromeWithDevTools(): Promise<void> {
   const instanceId = getBotInstanceId(userDataDir);
   const selectedProxy = resolveProxyForInstance(instanceId);
 
-  // for (const url of getChromeDevToolsCheckUrls()) {
-  //   if (await checkDevToolsEndpoint(url)) {
-  //     if (selectedProxy) {
-  //       throw new Error(
-  //         "Chrome DevTools is already running. Proxy is enabled, so a fresh Chrome launch is required to apply proxy settings. Close all Chrome windows, then start the bot again."
-  //       );
-  //     }
-  //     console.log(`[Chrome] DevTools already at ${url}`);
-  //     return;
-  //   }
-  // }
+  // If Chrome DevTools is already reachable on the target port, skip spawning entirely.
+  // On Windows, Chrome is a single-instance app per profile: re-launching it when it is
+  // already running opens a NEW TAB in the existing window rather than reusing the first tab.
+  for (const url of getChromeDevToolsCheckUrls()) {
+    if (await checkDevToolsEndpoint(url)) {
+      logger.info({ url, instanceId }, "[Chrome] DevTools already running — reusing existing Chrome");
+      return;
+    }
+  }
 
   const chromePath = resolveChromeExecutablePath();
   const resolvedProxy = await resolveLaunchProxyServer(selectedProxy);
@@ -353,6 +362,10 @@ async function ensureChromeWithDevTools(): Promise<void> {
  * Must run after each slot check (and between centers): peers can mark the file while this instance is in-flight.
  */
 async function checkPeerFoundSlotAndJoinBooking(instanceId?: number): Promise<boolean> {
+  // Never interrupt this instance if it is already booking or has reached the payment page.
+  if (instanceBookingActive || instanceOnPaymentPage) {
+    return false;
+  }
   const sharedState = isSlotFoundByAnyInstance();
   if (!sharedState.found || sharedState.foundBy === instanceId) {
     return false;
@@ -480,8 +493,13 @@ async function runPollLoop(instanceId?: number): Promise<boolean> {
         "Waiting before next poll"
       );
 
+      // Keep a handle to the timer so we can still honour the full delay even if the
+      // slot-watcher fires first (prevents busy-spinning when slot-state.json is already
+      // present at watcher-creation time because another instance is actively booking).
+      const timerPromise = new Promise<void>((r) => setTimeout(r, randomDelayMs));
+
       const woke = await Promise.race([
-        new Promise<"timer">((r) => setTimeout(() => r("timer"), randomDelayMs)),
+        timerPromise.then(() => "timer" as const),
         slotWatcher.wait().then(() => "slot" as const),
         waitForPollingAbort(myAbortSeq).then(() => "abort" as const),
       ]);
@@ -494,6 +512,14 @@ async function runPollLoop(instanceId?: number): Promise<boolean> {
       if (woke === "slot" && (await checkPeerFoundSlotAndJoinBooking(instanceId))) {
         logger.info({ instanceId }, "Woken by slot-state file change — stopping poll loop immediately");
         return true;
+      }
+
+      // Slot-watcher fired but this instance cannot join right now (already booking /
+      // already on payment page).  Wait for the full timer so the loop doesn't spin at
+      // full speed — without this guard, slotWatcher.wait() resolves immediately on
+      // every iteration (resolved=true stays set) and the 6-second delay is never honoured.
+      if (woke === "slot") {
+        await timerPromise;
       }
     }
     return slotFound;
@@ -539,7 +565,7 @@ function deriveCalendarDateFromPollingRaw(raw?: string): string | null {
  * Try save-applicants; on 422 "Invalid request", retry by re-polling then re-calling save.
  * This mimics the manual re-submit flow (which consistently succeeds).
  */
-async function runBookingChainWithRetry(instanceId?: number): Promise<void> {
+async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: SlotFoundState): Promise<void> {
   for (let attempt = 1; attempt <= MAX_SAVE_APPLICANTS_RETRIES; attempt++) {
     try {
       await browser.saveApplicantsViaLiftApi();
@@ -564,7 +590,10 @@ async function runBookingChainWithRetry(instanceId?: number): Promise<void> {
   const allowed = getScheduleAllowedDates();
   const calendarOpts =
     allowed && allowed.size > 0 ? { allowedDates: allowed } : undefined;
-  const shared = isSlotFoundByAnyInstance();
+  // Use the live slot state; fall back to the snapshot taken when booking started in case
+  // a failing sibling instance deleted slot-state.json while this booking is in progress.
+  const liveState = isSlotFoundByAnyInstance();
+  const shared = liveState.found ? liveState : (slotStateCache ?? liveState);
   const pollingHitAllowed =
     allowed && allowed.size > 0 ? isPollingSlotInAllowedSet(shared.slot, allowed) : false;
 
@@ -642,10 +671,22 @@ type SubmitMeta = { firstSubmit: boolean; instanceId?: number };
  */
 async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
   // Reload .env changes for submit-driven runs (so toggles like TURNSTILE_DEMO_MODE take effect
-  // without restarting the whole cluster). Safe because .env is the source of truth in this app.
-  dotenv.config({ override: true });
+  // without restarting). In cluster mode the parent sets instance-specific env vars
+  // (BROWSER_CDP_URL, CHROME_USER_DATA_DIR, BOT_INSTANCE_ID) via spawn — never let dotenv
+  // override those or every instance would connect to the same Chrome (port 9222).
+  const isClusterChild = process.env.BOT_CLUSTER_MODE === "true";
+  if (!isClusterChild) {
+    dotenv.config({ override: true });
+  }
 
   const instanceId = meta.instanceId;
+
+  // If this instance already completed booking and reached the payment page, do not restart it.
+  // The Chrome tab stays on the payment page indefinitely.
+  if (instanceOnPaymentPage) {
+    logger.info({ instanceId }, "[Booking] Instance on payment page — not restarting cycle, staying on payment page");
+    return;
+  }
 
   // Set current instance ID for config getters (e.g., loginUser)
   setCurrentInstanceId(instanceId);
@@ -702,6 +743,11 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
 
   const skipDashboardNavigate = !meta.firstSubmit || kind === "vfs_other";
 
+  if (config.loginOnly) {
+    logger.info({ instanceId }, "[LoginOnly] VFS_LOGIN_ONLY=true — stopping after login, no polling or booking");
+    return;
+  }
+
   let slotFoundDuringPoll = false;
   if (config.pollingEnabled) {
     if (didLoginThisCycle) {
@@ -735,30 +781,48 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
   if (runBookingChain) {
     let pollHits = slotFoundDuringPoll;
     while (true) {
+      // Snapshot slot state before booking starts so sibling failures that delete
+      // slot-state.json do not break this instance's calendar / timeslot lookup.
+      const slotStateSnapshot = isSlotFoundByAnyInstance();
+      instanceBookingActive = true;
+      logger.info({ instanceId }, "[Booking] Started — this instance will not be interrupted by new slot finds");
       try {
-        await runBookingChainWithRetry(instanceId);
-        break;
+        await runBookingChainWithRetry(instanceId, slotStateSnapshot);
+        // Booking chain completed (schedule API called) — payment page is now open.
+        instanceBookingActive = false;
+        instanceOnPaymentPage = true;
+        logger.info({ instanceId }, "[Booking] Complete — Chrome is on the payment page and will stay there permanently");
+        return; // Leave Chrome on the payment page; do not fall through to cycle end.
       } catch (err) {
+        instanceBookingActive = false; // Release booking lock so new slot finds can reach this instance again.
         const noDates =
           err instanceof NoDatesInScheduleRangeError ||
           (err instanceof Error && (err as Error & { code?: string }).code === "NO_DATES_IN_RANGE");
-        if (!noDates) throw err;
-        logger.warn(
-          { instanceId },
-          "No calendar dates match allowed schedule dates — clearing slot state and restarting polling"
-        );
+        if (noDates) {
+          logger.warn(
+            { instanceId },
+            "No calendar dates match allowed schedule dates — clearing slot state and restarting polling"
+          );
+        } else {
+          // Any other booking error: log, notify, clear state, restart polling instead of stopping.
+          logger.error({ err, instanceId }, "Booking chain error — clearing slot state and restarting poll");
+          await telegram
+            .alert("error", `Booking error (instance ${instanceId ?? 1}), restarting poll: ${err instanceof Error ? err.message : String(err)}`)
+            .catch(() => { });
+        }
         clearSlotState();
         clearSlotCenterOverride();
         clearSlotDate();
         if (!config.pollingEnabled) {
           throw err;
         }
-        await browser.preparePollingAfterLogin({ skipDashboardNavigate });
+        await browser.preparePollingAfterLogin({ skipDashboardNavigate: true });
         pollHits = await runPollLoop(instanceId);
         if (!pollHits) {
-          logger.info({ instanceId }, "No slot after allowed-dates restart poll — stopping booking chain");
+          logger.info({ instanceId }, "No slot after booking error restart poll — stopping booking chain");
           break;
         }
+        // Found a new slot — loop back; instanceBookingActive will be set to true at the top.
       }
     }
   } else {
@@ -793,11 +857,21 @@ async function start(): Promise<void> {
 
           if (msg?.type === "run-bot-cycle") {
             syncInstanceStoresFromDisk();
-            try {
-              await runOneBotCycle({ firstSubmit: true, instanceId: myInstanceId });
-              process.send?.({ type: "bot-cycle-complete", instanceId: myInstanceId });
-            } catch (err) {
-              logger.error({ err, instanceId: myInstanceId }, "Bot cycle failed");
+            let cycleAttempt = 0;
+            while (true) {
+              cycleAttempt++;
+              try {
+                await runOneBotCycle({ firstSubmit: cycleAttempt === 1, instanceId: myInstanceId });
+                process.send?.({ type: "bot-cycle-complete", instanceId: myInstanceId });
+                break;
+              } catch (err) {
+                logger.error({ err, instanceId: myInstanceId, cycleAttempt }, "Bot cycle failed — restarting after 15s");
+                await telegram
+                  .alert("error", `Cycle error (instance ${myInstanceId}), restarting: ${err instanceof Error ? err.message : String(err)}`)
+                  .catch(() => { });
+                await new Promise((r) => setTimeout(r, 15_000));
+                syncInstanceStoresFromDisk();
+              }
             }
           }
         });

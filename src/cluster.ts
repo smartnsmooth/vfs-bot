@@ -41,19 +41,30 @@ async function startFormServer(): Promise<void> {
   await runApplicantFormWithSubmitHandler((formData) => {
     const instanceId = typeof formData.instanceId === "number" ? formData.instanceId : 1;
 
-    // Store form data and trigger task on the instance
-    const { vfsUsername, vfsPassword, instanceId: _, firstSubmit, ...applicantData } = formData as Record<string, unknown> & { instanceId?: number; firstSubmit?: boolean };
+    // Accept credentials under either key name:
+    //   multi-instance submit spreads store entries as {username, password}
+    //   single-instance submit sends form fields as {vfsUsername, vfsPassword}
+    const raw = formData as Record<string, unknown> & { instanceId?: number; firstSubmit?: boolean };
+    const resolvedUsername =
+      (typeof raw.vfsUsername === "string" ? raw.vfsUsername : undefined) ??
+      (typeof raw.username === "string" ? raw.username : undefined);
+    const resolvedPassword =
+      (typeof raw.vfsPassword === "string" ? raw.vfsPassword : undefined) ??
+      (typeof raw.password === "string" ? raw.password : undefined);
+    const { vfsUsername: _vu, vfsPassword: _vp, username: _u, password: _p, instanceId: _, firstSubmit: _fs, ...applicantData } = raw;
 
+    // Write credentials/details SYNCHRONOUSLY here, not inside the async task.
+    // The submit handler calls onSubmit in a loop without await, so these writes
+    // are naturally serialised — no concurrent file access, no JSON corruption.
+    if (resolvedUsername && resolvedPassword) {
+      setSessionLoginCredentials(resolvedUsername, resolvedPassword, instanceId);
+    }
+    setApplicantDetailsOverrides(applicantData, instanceId);
+
+    // The async task only sends IPC — no disk writes, eliminating the race.
     enqueueTaskForInstance(instanceId, async () => {
-      if (typeof vfsUsername === "string" && typeof vfsPassword === "string") {
-        setSessionLoginCredentials(vfsUsername, vfsPassword, instanceId);
-      }
-      setApplicantDetailsOverrides(applicantData, instanceId);
-
-      // Send IPC message to the child process to trigger bot cycle
       const inst = instances.find((i) => i.id === instanceId);
       if (inst?.process && !inst.process.killed) {
-        // Abort polling immediately so the next run uses updated config.
         inst.process.send({ type: "config-updated", instanceId });
         inst.process.send({ type: "run-bot-cycle", instanceId });
       } else {
