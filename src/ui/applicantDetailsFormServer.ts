@@ -81,9 +81,15 @@ export async function postApplicantFormSubmitToLocalServer(body: Record<string, 
   }
 }
 
+/**
+ * Returns the UI timeout in ms.  0 means "no timeout" (server stays up forever).
+ * Default is 0 so the form server never auto-closes while the bot is running.
+ */
 function applicantUiTimeoutMs(): number {
-  const t = parseInt(process.env.VFS_APPLICANT_UI_TIMEOUT_MS ?? "1800000", 10);
-  return Number.isFinite(t) && t > 0 ? t : 1_800_000;
+  const raw = process.env.VFS_APPLICANT_UI_TIMEOUT_MS;
+  if (!raw) return 0; // no env var → run forever
+  const t = parseInt(raw, 10);
+  return Number.isFinite(t) && t > 0 ? t : 0;
 }
 
 function getLoginFormDefaults(): { vfsUsername: string } {
@@ -599,14 +605,17 @@ export function runApplicantFormWithSubmitHandler(
     server.listen(port, host, () => {
       console.log("\n  >>> Bot setup form: " + url + "\n");
       openUrlInBrowser(url);
-      timeoutId = setTimeout(() => {
-        server.close(() => { });
-        safeReject(
-          new Error(
-            `Applicant UI timed out after ${applicantUiTimeoutMs()}ms. Submit the form or set VFS_APPLICANT_UI=false to skip.`
-          )
-        );
-      }, applicantUiTimeoutMs());
+      const uiTimeoutMs = applicantUiTimeoutMs();
+      if (uiTimeoutMs > 0) {
+        timeoutId = setTimeout(() => {
+          server.close(() => { });
+          safeReject(
+            new Error(
+              `Applicant UI timed out after ${uiTimeoutMs}ms. Submit the form or set VFS_APPLICANT_UI=false to skip.`
+            )
+          );
+        }, uiTimeoutMs);
+      }
     });
 
     server.on("error", (err) => {

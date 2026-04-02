@@ -44,7 +44,7 @@ const FAST_SKIP_CALENDAR_UP_TO_INSTANCE = Math.max(
   parseInt(process.env.FAST_SKIP_CALENDAR_UP_TO_INSTANCE ?? "5", 10) || 5
 );
 const FIXED_TIMING_UP_TO_INSTANCE = 11;
-const FIXED_POLL_INTERVAL_MS = 61_000;
+const FIXED_POLL_INTERVAL_MS = 60_000;
 type ProxyChainModule = {
   anonymizeProxy(proxyUrl: string): Promise<string>;
   closeAnonymizedProxy(url: string, closeConnections?: boolean): Promise<void>;
@@ -392,7 +392,15 @@ async function checkPeerFoundSlotAndJoinBooking(instanceId?: number): Promise<bo
 }
 
 /** `true` if at least one slot was seen (polling stops after the first hit). */
-async function runPollLoop(instanceId?: number): Promise<boolean> {
+async function runPollLoop(
+  instanceId?: number,
+  opts?: {
+    /** After every N completed poll rounds, call onRelogin() to refresh the VFS session. */
+    reloginAfter?: number;
+    /** Async callback that performs logout → login → preparePolling. */
+    onRelogin?: () => Promise<void>;
+  }
+): Promise<boolean> {
   const limit = config.pollLimit;
   let completed = 0;
   let slotFound = false;
@@ -479,6 +487,22 @@ async function runPollLoop(instanceId?: number): Promise<boolean> {
       if (limit > 0 && completed >= limit) {
         logger.info({ completed, limit, instanceId }, "Polling finished (POLL_LIMIT reached)");
         break;
+      }
+
+      // Periodic session refresh: every N polls call the relogin callback so a fresh
+      // VFS session is obtained, resetting the server-side 429 rate-limit counter.
+      const reloginAfter = opts?.reloginAfter;
+      if (reloginAfter && reloginAfter > 0 && completed % reloginAfter === 0 && opts?.onRelogin) {
+        logger.info(
+          { instanceId, completed, reloginAfter },
+          "[Relogin] Poll relogin interval reached — refreshing VFS session"
+        );
+        try {
+          await opts.onRelogin();
+          logger.info({ instanceId }, "[Relogin] Session refreshed — resuming polling");
+        } catch (err) {
+          logger.error({ err, instanceId }, "[Relogin] Re-login failed — continuing poll without session refresh");
+        }
       }
 
       // Instances 1..6 use fixed 6s interval; others keep random min..max.
@@ -719,16 +743,18 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
     kind = classifyVfsFirstTabUrl(firstUrl);
   }
 
+  // Resolve credentials once here so the relogin callback (below) can reuse them.
+  const loginUsername = resolveLoginUsername(instanceId);
+  const loginPassword = resolveLoginPassword(instanceId);
+
   let didLoginThisCycle = false;
   if (kind === "login") {
-    const username = resolveLoginUsername(instanceId);
-    const password = resolveLoginPassword(instanceId);
-    if (!username || !password) {
+    if (!loginUsername || !loginPassword) {
       throw new Error(
         "VFS login missing: fill username/password on the setup form, or set VFS_USERNAME / VFS_PASSWORD in .env (or disable UI with VFS_APPLICANT_UI=false)."
       );
     }
-    await browser.loginOnFirstTab(username, password);
+    await browser.loginOnFirstTab(loginUsername, loginPassword);
     firstUrl = await browser.getFirstTabUrl();
     kind = classifyVfsFirstTabUrl(firstUrl);
     didLoginThisCycle = true;
@@ -773,7 +799,22 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
     await telegram.notify("VFS bot run: polling for slots.").catch(() => { });
     logger.info({ skipDashboardNavigate, instanceId }, "Starting slot polling");
     await browser.preparePollingAfterLogin({ skipDashboardNavigate });
-    slotFoundDuringPoll = await runPollLoop(instanceId);
+
+    // Build the periodic relogin callback when the interval is enabled.
+    const pollReloginInterval = config.pollReloginInterval;
+    const onPollRelogin = pollReloginInterval > 0
+      ? async () => {
+        logger.info({ instanceId, pollReloginInterval }, "[Relogin] Navigating to login page for fresh VFS session...");
+        await browser.openLoginInFirstTab();
+        await browser.loginOnFirstTab(loginUsername, loginPassword);
+        await browser.preparePollingAfterLogin({ skipDashboardNavigate: true });
+      }
+      : undefined;
+
+    slotFoundDuringPoll = await runPollLoop(instanceId, {
+      reloginAfter: pollReloginInterval > 0 ? pollReloginInterval : undefined,
+      onRelogin: onPollRelogin,
+    });
   }
 
   const runBookingChain = !config.pollingEnabled || slotFoundDuringPoll;

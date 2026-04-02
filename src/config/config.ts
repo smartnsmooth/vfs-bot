@@ -108,6 +108,16 @@ export const config = {
   randomClientSource: process.env.VFS_RANDOM_CLIENTSOURCE === "true" || process.env.VFS_RANDOM_CLIENTSOURCE === "1",
 
   /**
+   * After this many poll rounds, log out and re-login so the VFS session is refreshed.
+   * A fresh session resets the server-side 429 rate-limit counter.
+   * 0 = disabled (never relogin mid-poll).
+   */
+  pollReloginInterval: (() => {
+    const raw = parseInt(process.env.VFS_POLL_RELOGIN_INTERVAL ?? "0", 10);
+    return Number.isFinite(raw) && raw > 0 ? raw : 0;
+  })(),
+
+  /**
    * When true, OTP is read via https://api.mail.tm (see /domains for hostnames — not limited to “@mail.tm”).
    * `VFS_USERNAME` / `VFS_PASSWORD` must match that mail.tm-created mailbox.
    */
