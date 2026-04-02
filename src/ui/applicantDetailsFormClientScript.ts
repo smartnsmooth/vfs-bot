@@ -2,11 +2,40 @@
  * Inline page script for the applicant setup form. Kept in its own module so regex and
  * string escapes are not broken by nesting inside buildPageHtml's template literal.
  */
-export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInstanceJs: string): string {
+export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInstanceJs: string, defaultNumInstancesJs: string): string {
   return `<script>
 (function () {
   const collectLogin = ${collectLoginJs};
-  const isMultiInstance = ${isMultiInstanceJs};
+  let isMultiInstance = ${isMultiInstanceJs};
+
+  function getNumInstances() {
+    const el = document.getElementById("numInstances");
+    return el ? Math.max(1, parseInt(el.value, 10) || 1) : ${defaultNumInstancesJs};
+  }
+
+  function updateInstanceSelector() {
+    const numInstances = getNumInstances();
+    isMultiInstance = numInstances > 1;
+
+    const wrapper = document.getElementById("instanceSelectWrapper");
+    if (wrapper) wrapper.style.display = isMultiInstance ? "block" : "none";
+
+    const select = document.getElementById("instanceId");
+    if (select) {
+      const currentVal = parseInt(select.value, 10) || 1;
+      select.innerHTML = "";
+      for (let i = 1; i <= numInstances; i++) {
+        const opt = document.createElement("option");
+        opt.value = String(i);
+        opt.textContent = "Instance " + i;
+        if (i === Math.min(currentVal, numInstances)) opt.selected = true;
+        select.appendChild(opt);
+      }
+    }
+
+    const btn = document.getElementById("submitBtn");
+    if (btn) btn.textContent = isMultiInstance ? "Submit & Run All Instances" : "Submit & Run Bot";
+  }
 
   let autoSaveTimeout = null;
   let scheduleDatesUserEdited = false;
@@ -235,6 +264,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
       vacCode2: fd.get("vacCode2") || undefined,
       selectedSubvisaCategory2: fd.get("selectedSubvisaCategory2") || undefined,
       scheduleAllowedDates: String(fd.get("scheduleAllowedDates") ?? ""),
+      numInstances: getNumInstances(),
     };
     if (isMultiInstance) {
       body.instanceId = parseInt(String(fd.get("instanceId") || "1"), 10);
@@ -307,16 +337,43 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
 
   async function initApplicantForm() {
     try {
-      if (isMultiInstance) {
-        document.getElementById("instanceId").addEventListener("change", function () {
+      // Wire the numInstances input to update the instance selector in real-time.
+      const numInstancesInput = document.getElementById("numInstances");
+      if (numInstancesInput) {
+        numInstancesInput.addEventListener("input", function () {
+          updateInstanceSelector();
+          if (isMultiInstance) scheduleAutoSave();
+        });
+        numInstancesInput.addEventListener("change", function () {
+          updateInstanceSelector();
+          // After rebuilding the selector, load data for the now-selected instance.
+          if (isMultiInstance) {
+            scheduleDatesUserEdited = false;
+            loadInstanceData(false);
+          } else {
+            loadDefaults();
+          }
+        });
+      }
+
+      // Always wire the instanceId change listener — the element is always in the DOM.
+      // loadInstanceData() and scheduleAutoSave() both guard themselves with isMultiInstance.
+      const instanceIdSelect = document.getElementById("instanceId");
+      if (instanceIdSelect) {
+        instanceIdSelect.addEventListener("change", function () {
           scheduleDatesUserEdited = false;
           loadInstanceData(false);
         });
-        const form = document.getElementById("f");
-        form.querySelectorAll("input, select, textarea").forEach(function (input) {
-          input.addEventListener("input", scheduleAutoSave);
-          input.addEventListener("change", scheduleAutoSave);
-        });
+      }
+
+      // Always wire auto-save so it kicks in as soon as the user switches to multi-instance.
+      const form = document.getElementById("f");
+      form.querySelectorAll("input, select, textarea").forEach(function (input) {
+        input.addEventListener("input", scheduleAutoSave);
+        input.addEventListener("change", scheduleAutoSave);
+      });
+
+      if (isMultiInstance) {
         await loadInstanceData(false);
       } else {
         await loadDefaults();
@@ -364,6 +421,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
       vacCode2: fd.get("vacCode2") || undefined,
       selectedSubvisaCategory2: fd.get("selectedSubvisaCategory2") || undefined,
       scheduleAllowedDates: String(fd.get("scheduleAllowedDates") ?? ""),
+      numInstances: getNumInstances(),
     };
     if (isMultiInstance) {
       body.instanceId = parseInt(String(fd.get("instanceId") || "1"), 10);

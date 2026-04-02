@@ -179,8 +179,8 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
 }
 
 function buildPageHtml(collectLogin: boolean): string {
-  const numInstances = parseInt(process.env.VFS_BOT_INSTANCES ?? "1", 10);
-  const isMultiInstance = numInstances > 1;
+  const defaultNumInstances = Math.max(1, parseInt(process.env.VFS_BOT_INSTANCES ?? "1", 10) || 1);
+  const isMultiInstance = defaultNumInstances > 1;
   const fastSkipCalendarUpTo =
     parseInt(process.env.FAST_SKIP_CALENDAR_UP_TO_INSTANCE ?? "5", 10) || 5;
 
@@ -200,16 +200,18 @@ function buildPageHtml(collectLogin: boolean): string {
     <textarea name="scheduleAllowedDates" id="scheduleAllowedDatesHidden" class="sr-only" autocomplete="off" tabindex="-1" aria-hidden="true"></textarea>
   </fieldset>`;
 
-  const instanceSelectBlock = isMultiInstance
-    ? `
+  const instanceSelectBlock = `
   <fieldset style="border:1px solid #38444d;border-radius:8px;padding:1rem 1rem 0.25rem;margin:0 0 1.25rem">
-    <legend style="color:#8b98a5;font-size:0.9rem">Bot Instance</legend>
-    <label for="instanceId">Select instance (each uses different IP)</label>
-    <select id="instanceId" name="instanceId">
-      ${Array.from({ length: numInstances }, (_, i) => `<option value="${i + 1}">Instance ${i + 1}</option>`).join("\n      ")}
-    </select>
-  </fieldset>`
-    : "";
+    <legend style="color:#8b98a5;font-size:0.9rem">Bot configuration</legend>
+    <label for="numInstances">Number of instances</label>
+    <input type="number" id="numInstances" name="numInstances" min="1" max="50" value="${defaultNumInstances}" />
+    <div id="instanceSelectWrapper" style="display:${isMultiInstance ? "block" : "none"}">
+      <label for="instanceId" style="margin-top:0.75rem">Select instance to configure (each uses a different Chrome profile / IP)</label>
+      <select id="instanceId" name="instanceId">
+        ${Array.from({ length: defaultNumInstances }, (_, i) => `<option value="${i + 1}">Instance ${i + 1}</option>`).join("\n        ")}
+      </select>
+    </div>
+  </fieldset>`;
 
   const loginBlock = collectLogin
     ? `
@@ -230,6 +232,7 @@ function buildPageHtml(collectLogin: boolean): string {
 
   const collectLoginJs = collectLogin ? "true" : "false";
   const isMultiInstanceJs = isMultiInstance ? "true" : "false";
+  const defaultNumInstancesJs = String(defaultNumInstances);
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -349,10 +352,10 @@ function buildPageHtml(collectLogin: boolean): string {
       <option value="SAW">Seasonal worker</option>
       <option value="Busi">Business Visa</option>
     </select>
-    <button type="submit" style="margin-top: 1.25rem; width: 100%;">${isMultiInstance ? "Submit & Run All Instances" : "Submit & Run Bot"}</button>
+    <button type="submit" id="submitBtn" style="margin-top: 1.25rem; width: 100%;">${isMultiInstance ? "Submit & Run All Instances" : "Submit & Run Bot"}</button>
   </form>
   <p id="msg"></p>
-  ${buildApplicantFormPageScript(collectLoginJs, isMultiInstanceJs)}
+  ${buildApplicantFormPageScript(collectLoginJs, isMultiInstanceJs, defaultNumInstancesJs)}
 </body>
 </html>`;
 }
@@ -516,9 +519,14 @@ export function runApplicantFormWithSubmitHandler(
             return;
           }
 
-          // In cluster mode, start ALL instances with saved data
-          const numInstances = parseInt(process.env.VFS_BOT_INSTANCES ?? "1", 10);
-          if (numInstances > 1) {
+          // Prefer the numInstances value the user set in the form; fall back to env.
+          const submittedNumInstances =
+            typeof j.numInstances === "number" && j.numInstances > 0
+              ? Math.floor(j.numInstances)
+              : parseInt(process.env.VFS_BOT_INSTANCES ?? "1", 10) || 1;
+
+          // In cluster / multi-instance mode, start ALL saved instances up to the chosen count.
+          if (submittedNumInstances > 1) {
             mergeGlobalScheduleAllowedDatesFromPayload(j);
             const credentials = getAllInstanceCredentials();
             const details = getAllInstanceApplicantDetails();
@@ -533,8 +541,8 @@ export function runApplicantFormWithSubmitHandler(
             for (const instanceId of allIds) {
               // Instance 0 is a global/shared store slot, not a real bot instance
               if (instanceId === 0) continue;
-              // Only submit for instances that are actually running (1 to numInstances)
-              if (instanceId > numInstances) {
+              // Only submit for instances within the chosen count
+              if (instanceId > submittedNumInstances) {
                 continue;
               }
 
@@ -545,6 +553,7 @@ export function runApplicantFormWithSubmitHandler(
                 void Promise.resolve(onSubmit({
                   firstSubmit: !seenSubmit,
                   instanceId,
+                  numInstances: submittedNumInstances,
                   ...creds,
                   ...dets
                 }))

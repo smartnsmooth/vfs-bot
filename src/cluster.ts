@@ -6,7 +6,8 @@ import { runApplicantFormWithSubmitHandler, applicantUiPort } from "./ui/applica
 import { setSessionLoginCredentials } from "./utils/sessionLogin.store";
 import { setApplicantDetailsOverrides } from "./utils/applicantDetails.store";
 
-const NUM_INSTANCES = parseInt(process.env.VFS_BOT_INSTANCES ?? "5", 10);
+/** How many bot instances are currently running. Set by ensureInstances(). */
+let currentNumInstances = 0;
 const BASE_DEBUGGING_PORT = 9222;
 const BASE_PROFILE_DIR = process.env.CHROME_USER_DATA_DIR ?? "C:/vfs-bot-profile";
 
@@ -37,8 +38,49 @@ function enqueueTaskForInstance(instanceId: number, task: () => Promise<void>): 
   });
 }
 
+/**
+ * Spawn or kill bot instances to reach `targetCount`.
+ * Safe to call multiple times — only creates/kills the delta.
+ */
+function ensureInstances(targetCount: number): void {
+  const count = Math.max(1, Math.min(50, targetCount));
+
+  // Spawn new instances as needed
+  for (let i = currentNumInstances + 1; i <= count; i++) {
+    const child = spawnBotInstance(i, count);
+    instances.push({
+      id: i,
+      process: child,
+      debugPort: BASE_DEBUGGING_PORT + i - 1,
+      profileDir: `${BASE_PROFILE_DIR}-${i}`,
+      queue: Promise.resolve(),
+    });
+    logger.info({ instanceId: i }, "Spawned bot instance");
+  }
+
+  // Kill excess instances if count decreased
+  for (let i = count + 1; i <= currentNumInstances; i++) {
+    const inst = instances.find((ii) => ii.id === i);
+    if (inst?.process) {
+      inst.process.kill("SIGTERM");
+    }
+  }
+  if (count < currentNumInstances) {
+    instances.splice(count);
+  }
+
+  currentNumInstances = count;
+  logger.info({ currentNumInstances }, "Instance count updated");
+}
+
 async function startFormServer(): Promise<void> {
   await runApplicantFormWithSubmitHandler((formData) => {
+    // Spawn/adjust instances to the count chosen in the form UI.
+    const submittedCount = typeof formData.numInstances === "number" && formData.numInstances > 0
+      ? Math.floor(formData.numInstances)
+      : currentNumInstances || 1;
+    ensureInstances(submittedCount);
+
     const instanceId = typeof formData.instanceId === "number" ? formData.instanceId : 1;
 
     // Accept credentials under either key name:
@@ -74,13 +116,16 @@ async function startFormServer(): Promise<void> {
   }, { collectLogin: true });
 }
 
-function spawnBotInstance(instanceId: number): ChildProcess {
+function spawnBotInstance(instanceId: number, totalInstances: number): ChildProcess {
   const debugPort = BASE_DEBUGGING_PORT + instanceId - 1;
   const profileDir = `${BASE_PROFILE_DIR}-${instanceId}`;
 
   const env = {
     ...process.env,
     BOT_INSTANCE_ID: String(instanceId),
+    // Propagate the UI-chosen instance count into child processes so index.ts can derive
+    // fixed polling + stagger settings from the runtime value (not just .env).
+    VFS_BOT_INSTANCES: String(totalInstances),
     BROWSER_CDP_URL: `http://127.0.0.1:${debugPort}`,
     CHROME_USER_DATA_DIR: profileDir,
     VFS_APPLICANT_UI: "false",
@@ -108,28 +153,14 @@ function spawnBotInstance(instanceId: number): ChildProcess {
 }
 
 async function main(): Promise<void> {
-  logger.info({ instances: NUM_INSTANCES }, "Starting VFS Bot Cluster");
+  logger.info("Starting VFS Bot Cluster — open the setup form, set the number of instances, and click Submit to start");
 
-  // Start shared form server (don't await - it runs indefinitely)
+  // Start the shared form server. Instances are spawned lazily on first Submit,
+  // not at startup — so the user can choose the count from the UI.
   startFormServer().catch((err) => {
     logger.error({ err }, "Form server failed");
     process.exit(1);
   });
-
-  // Give the server a moment to start
-  await new Promise(resolve => setTimeout(resolve, 100));
-
-  // Spawn bot instances
-  for (let i = 1; i <= NUM_INSTANCES; i++) {
-    const child = spawnBotInstance(i);
-    instances.push({
-      id: i,
-      process: child,
-      debugPort: BASE_DEBUGGING_PORT + i - 1,
-      profileDir: `${BASE_PROFILE_DIR}-${i}`,
-      queue: Promise.resolve(),
-    });
-  }
 }
 
 function shutdown(): void {

@@ -43,8 +43,10 @@ const FAST_SKIP_CALENDAR_UP_TO_INSTANCE = Math.max(
   0,
   parseInt(process.env.FAST_SKIP_CALENDAR_UP_TO_INSTANCE ?? "5", 10) || 5
 );
-const FIXED_TIMING_UP_TO_INSTANCE = 11;
-const FIXED_POLL_INTERVAL_MS = 60_000;
+const FIXED_POLL_INTERVAL_MS = Math.max(
+  1000,
+  parseInt(process.env.FIXED_POLL_INTERVAL_MS ?? "60000", 10) || 60_000
+);
 type ProxyChainModule = {
   anonymizeProxy(proxyUrl: string): Promise<string>;
   closeAnonymizedProxy(url: string, closeConnections?: boolean): Promise<void>;
@@ -505,22 +507,18 @@ async function runPollLoop(
         }
       }
 
-      // Instances 1..6 use fixed 6s interval; others keep random min..max.
+      // Fixed polling interval for all instances (no random MIN/MAX).
       const fixedTiming = getFixedTimingForInstance(instanceId);
-      const min = config.pollingIntervalMinMs;
-      const max = config.pollingIntervalMaxMs;
-      const randomDelayMs = fixedTiming
-        ? fixedTiming.pollIntervalMs
-        : min + Math.floor(Math.random() * (max - min));
+      const delayMs = fixedTiming.pollIntervalMs;
       logger.info(
-        { delayMs: randomDelayMs, min, max, instanceId, mode: fixedTiming ? "fixed_6s" : "random_range" },
+        { delayMs, instanceId, mode: "fixed_interval" },
         "Waiting before next poll"
       );
 
       // Keep a handle to the timer so we can still honour the full delay even if the
       // slot-watcher fires first (prevents busy-spinning when slot-state.json is already
       // present at watcher-creation time because another instance is actively booking).
-      const timerPromise = new Promise<void>((r) => setTimeout(r, randomDelayMs));
+      const timerPromise = new Promise<void>((r) => setTimeout(r, delayMs));
 
       const woke = await Promise.race([
         timerPromise.then(() => "timer" as const),
@@ -558,11 +556,20 @@ function isSaveApplicants422(err: unknown): boolean {
   return err instanceof Error && err.message.includes("Save applicants API error:") && err.message.includes("422");
 }
 
-function getFixedTimingForInstance(instanceId?: number): { postLoginOffsetMs: number; pollIntervalMs: number } | null {
-  if (!instanceId || instanceId < 1 || instanceId > FIXED_TIMING_UP_TO_INSTANCE) return null;
+function getFixedTimingForInstance(instanceId?: number): { postLoginOffsetMs: number; pollIntervalMs: number } {
+  const id = typeof instanceId === "number" && Number.isFinite(instanceId) && instanceId >= 1 ? Math.floor(instanceId) : 1;
+  const numInstancesRaw = parseInt(process.env.VFS_BOT_INSTANCES ?? "1", 10);
+  const numInstances = Number.isFinite(numInstancesRaw) && numInstancesRaw > 0 ? numInstancesRaw : 1;
+
+  // Spread instance start times evenly across one poll interval:
+  // stepMs = pollInterval / numInstances
+  // offsetMs(instance i) = (i-1) * stepMs
+  const stepMsUnclamped = Math.floor(FIXED_POLL_INTERVAL_MS / numInstances);
+  const stepMs = Math.max(250, Math.min(FIXED_POLL_INTERVAL_MS, stepMsUnclamped));
+
   return {
-    postLoginOffsetMs: (instanceId - 1) * 1000, // instance1=0s ... instance6=5s
-    pollIntervalMs: FIXED_POLL_INTERVAL_MS,      // all fixed group use 6s interval
+    postLoginOffsetMs: (id - 1) * stepMs,
+    pollIntervalMs: FIXED_POLL_INTERVAL_MS,
   };
 }
 
@@ -780,21 +787,11 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
       // Dashboard: no auto "Start new booking" / center / category (handle in browser yourself).
       await new Promise((r) => setTimeout(r, POST_LOGIN_POLL_DELAY_MS));
       const fixedTiming = getFixedTimingForInstance(instanceId);
-      if (fixedTiming) {
-        logger.info(
-          { instanceId, delayMs: fixedTiming.postLoginOffsetMs, mode: "fixed_by_instance" },
-          "Post-login fixed delay before polling (after base 30s)"
-        );
-        await new Promise((r) => setTimeout(r, fixedTiming.postLoginOffsetMs));
-      } else {
-        // Random delay 0-30 seconds
-        const randomDelayMs = Math.floor(Math.random() * 30_000);
-        logger.info(
-          { delayMs: randomDelayMs, mode: "random_0_30s" },
-          "Post-login random delay before polling (step 2/2)"
-        );
-        await new Promise((r) => setTimeout(r, randomDelayMs));
-      }
+      logger.info(
+        { instanceId, delayMs: fixedTiming.postLoginOffsetMs, mode: "fixed_by_instance" },
+        "Post-login fixed delay before polling (after base delay)"
+      );
+      await new Promise((r) => setTimeout(r, fixedTiming.postLoginOffsetMs));
     }
     await telegram.notify("VFS bot run: polling for slots.").catch(() => { });
     logger.info({ skipDashboardNavigate, instanceId }, "Starting slot polling");
