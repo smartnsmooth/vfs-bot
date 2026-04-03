@@ -93,13 +93,41 @@ async function startFormServer(): Promise<void> {
     const resolvedPassword =
       (typeof raw.vfsPassword === "string" ? raw.vfsPassword : undefined) ??
       (typeof raw.password === "string" ? raw.password : undefined);
-    const { vfsUsername: _vu, vfsPassword: _vp, username: _u, password: _p, instanceId: _, firstSubmit: _fs, ...applicantData } = raw;
+    const resolvedUsername2 =
+      typeof raw.vfsUsername2 === "string" ? raw.vfsUsername2.trim() : typeof raw.username2 === "string" ? raw.username2.trim() : "";
+    const resolvedPassword2 =
+      typeof raw.vfsPassword2 === "string" ? raw.vfsPassword2 : typeof raw.password2 === "string" ? raw.password2 : "";
+    const {
+      vfsUsername: _vu,
+      vfsPassword: _vp,
+      vfsUsername2: _vu2f,
+      vfsPassword2: _vp2f,
+      username: _u,
+      password: _p,
+      username2: _u2,
+      password2: _p2,
+      numInstances: _ni,
+      instanceId: _,
+      firstSubmit: _fs,
+      ...applicantData
+    } = raw;
 
     // Write credentials/details SYNCHRONOUSLY here, not inside the async task.
     // The submit handler calls onSubmit in a loop without await, so these writes
     // are naturally serialised — no concurrent file access, no JSON corruption.
     if (resolvedUsername && resolvedPassword) {
-      setSessionLoginCredentials(resolvedUsername, resolvedPassword, instanceId);
+      const hasSecondKeys =
+        "vfsUsername2" in raw ||
+        "vfsPassword2" in raw ||
+        "username2" in raw ||
+        "password2" in raw;
+      const second =
+        resolvedUsername2 && resolvedPassword2 !== ""
+          ? { username2: resolvedUsername2, password2: resolvedPassword2 }
+          : hasSecondKeys
+            ? "clear"
+            : "preserve";
+      setSessionLoginCredentials(resolvedUsername, resolvedPassword, instanceId, second);
     }
     setApplicantDetailsOverrides(applicantData, instanceId);
 

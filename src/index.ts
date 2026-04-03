@@ -1,7 +1,8 @@
 import dotenv from "dotenv";
 // Don't override env vars set by parent process (cluster mode)
 dotenv.config({ override: false });
-import { spawn } from "node:child_process";
+import { exec, spawn } from "node:child_process";
+import { promisify } from "node:util";
 import { existsSync } from "node:fs";
 import { get as httpGet } from "node:http";
 import { get as httpsGet } from "node:https";
@@ -32,6 +33,7 @@ import {
   isPollingSlotInAllowedSet,
   NoDatesInScheduleRangeError,
 } from "./utils/scheduleAllowedDates.js";
+import { clearApplicantIpCache } from "./utils/applicantIp";
 
 const polling = new PollingService();
 const browser = new BrowserService();
@@ -53,6 +55,85 @@ type ProxyChainModule = {
 };
 let proxyChainModule: ProxyChainModule | null = null;
 let activeAnonymizedProxyUrl: string | null = null;
+
+/** Shifts `PROXY_URLS` index for this Chrome profile on each credential-swap browser restart. */
+const proxyRotationOffsetByProfileId = new Map<string, number>();
+
+function bumpProxyRotationForProfile(profileId: string): void {
+  proxyRotationOffsetByProfileId.set(profileId, (proxyRotationOffsetByProfileId.get(profileId) ?? 0) + 1);
+}
+
+async function closeActiveAnonymizedProxyTunnel(): Promise<void> {
+  if (!activeAnonymizedProxyUrl) return;
+  try {
+    const proxyChain = await getProxyChainModule();
+    await proxyChain.closeAnonymizedProxy(activeAnonymizedProxyUrl, true);
+  } catch {
+    /* ignore */
+  }
+  activeAnonymizedProxyUrl = null;
+}
+
+async function killChromeOnPort(port: number): Promise<void> {
+  const execAsync = promisify(exec);
+  try {
+    if (process.platform === "win32") {
+      const { stdout } = await execAsync("netstat -ano", { timeout: 8_000 });
+      const pids = new Set<string>();
+      for (const line of stdout.split(/\r?\n/)) {
+        if (!line.includes("LISTENING")) continue;
+        if (!new RegExp(`\\.${port}\\s|:${port}\\s`).test(line)) continue;
+        const parts = line.trim().split(/\s+/);
+        const pid = parts[parts.length - 1];
+        if (pid && /^\d+$/.test(pid) && pid !== "0") pids.add(pid);
+      }
+      for (const pid of pids) {
+        logger.info({ pid, port }, "[Chrome] Killing process listening on CDP port (credential swap)");
+        await execAsync(`taskkill /F /PID ${pid}`, { timeout: 6_000 }).catch(() => {
+          /* already gone */
+        });
+      }
+    } else {
+      try {
+        const { stdout } = await execAsync(`lsof -ti :${port}`, { timeout: 6_000 });
+        const pids = stdout
+          .trim()
+          .split(/\n/)
+          .map((s) => s.trim())
+          .filter(Boolean);
+        for (const pid of pids) {
+          await execAsync(`kill -9 ${pid}`, { timeout: 4_000 }).catch(() => {
+            /* ignore */
+          });
+        }
+      } catch {
+        /* no listener */
+      }
+    }
+    await new Promise((r) => setTimeout(r, 1_500));
+  } catch (err) {
+    logger.warn({ err, port }, "[Chrome] killChromeOnPort failed — continuing");
+  }
+}
+
+/**
+ * After logout when alternating two accounts: bump `PROXY_URLS` rotation, kill Chrome, respawn with new proxy.
+ */
+async function relaunchChromeAfterCredentialSwapLogout(): Promise<void> {
+  const profileId = getBotInstanceId(resolveChromeUserDataDir());
+  const rawList = (process.env.PROXY_URLS ?? "").trim();
+  const slots = rawList.split(/[\r\n,]+/).map((s) => s.trim()).filter(Boolean).length;
+  bumpProxyRotationForProfile(profileId);
+  const step = proxyRotationOffsetByProfileId.get(profileId) ?? 0;
+  logger.info(
+    { profileId, proxyRotationStep: step, proxyUrlSlots: Math.max(1, slots) },
+    "[Relogin] Credential swap: closing proxy tunnel + Chrome; next launch uses next PROXY_URLS entry (cyclic)"
+  );
+  await closeActiveAnonymizedProxyTunnel();
+  await browser.disconnectCdp();
+  await killChromeOnPort(getRemoteDebuggingPort());
+  await ensureChromeWithDevTools();
+}
 
 async function getProxyChainModule(): Promise<ProxyChainModule> {
   if (proxyChainModule) return proxyChainModule;
@@ -110,15 +191,44 @@ const instanceQueues = new Map<number, Promise<void>>();
 let instanceBookingActive = false;
 let instanceOnPaymentPage = false;
 
+/** Which credential slot (0 = primary, 1 = secondary) to use for the *next* login. Rotates after each successful login when a second pair is configured. */
+const pendingCredentialSlotByInstance = new Map<number, 0 | 1>();
+
+function hasSecondCredentials(instanceId?: number): boolean {
+  const c = getSessionLoginCredentials(instanceId);
+  return !!(c?.username2?.trim() && c.password2 != null && String(c.password2) !== "");
+}
+
+function getPendingCredentialSlot(instanceId?: number): 0 | 1 {
+  const id = instanceId ?? 0;
+  return pendingCredentialSlotByInstance.get(id) ?? 0;
+}
+
+function advanceCredentialSlotAfterSuccessfulLogin(instanceId?: number): void {
+  const id = instanceId ?? 0;
+  if (!hasSecondCredentials(id)) return;
+  const cur = pendingCredentialSlotByInstance.get(id) ?? 0;
+  pendingCredentialSlotByInstance.set(id, cur === 0 ? 1 : 0);
+}
+
 function resolveLoginUsername(instanceId?: number): string {
-  const fromUi = getSessionLoginCredentials(instanceId)?.username?.trim();
-  if (fromUi) return fromUi;
+  const slot = getPendingCredentialSlot(instanceId);
+  const creds = getSessionLoginCredentials(instanceId);
+  if (creds) {
+    if (slot === 1 && creds.username2?.trim()) return creds.username2.trim();
+    const u = creds.username?.trim();
+    if (u) return u;
+  }
   return (config.vfsUsername || process.env.VFS_USERNAME || "").trim();
 }
 
 function resolveLoginPassword(instanceId?: number): string {
-  const fromUi = getSessionLoginCredentials(instanceId)?.password;
-  if (fromUi != null && fromUi !== "") return fromUi;
+  const slot = getPendingCredentialSlot(instanceId);
+  const creds = getSessionLoginCredentials(instanceId);
+  if (creds) {
+    if (slot === 1 && creds.password2 != null && String(creds.password2) !== "") return creds.password2;
+    if (creds.password != null && creds.password !== "") return creds.password;
+  }
   return config.vfsPassword || process.env.VFS_PASSWORD || "";
 }
 
@@ -207,7 +317,9 @@ function resolveProxyForInstance(instanceId: string): string | null {
     .map((s) => s.trim())
     .filter(Boolean);
   if (list.length === 0) return null;
-  const idx = hashString(instanceId) % list.length;
+  const base = hashString(instanceId) % list.length;
+  const rot = proxyRotationOffsetByProfileId.get(instanceId) ?? 0;
+  const idx = (base + rot) % list.length;
   const selected = list[idx];
   const session = stableSessionToken(instanceId);
   return selected.replace(/\{session\}/gi, session).replace(/\{instance\}/gi, instanceId);
@@ -697,6 +809,24 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
 
 type SubmitMeta = { firstSubmit: boolean; instanceId?: number };
 
+async function performVfsLoginFromStore(instanceId?: number): Promise<void> {
+  const u = resolveLoginUsername(instanceId);
+  const p = resolveLoginPassword(instanceId);
+  if (!u || !p) {
+    throw new Error(
+      "VFS login missing: fill username/password on the setup form, or set VFS_USERNAME / VFS_PASSWORD in .env (or disable UI with VFS_APPLICANT_UI=false)."
+    );
+  }
+  if (hasSecondCredentials(instanceId)) {
+    logger.info(
+      { instanceId, credentialSlot: getPendingCredentialSlot(instanceId) },
+      "[Login] Credential pair for this login (0=primary, 1=secondary)"
+    );
+  }
+  await browser.loginOnFirstTab(u, p);
+  advanceCredentialSlotAfterSuccessfulLogin(instanceId);
+}
+
 /**
  * One full run after setup form Submit (or headless single run): CDP refresh → tab URL branch → poll → optional booking.
  */
@@ -750,18 +880,9 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
     kind = classifyVfsFirstTabUrl(firstUrl);
   }
 
-  // Resolve credentials once here so the relogin callback (below) can reuse them.
-  const loginUsername = resolveLoginUsername(instanceId);
-  const loginPassword = resolveLoginPassword(instanceId);
-
   let didLoginThisCycle = false;
   if (kind === "login") {
-    if (!loginUsername || !loginPassword) {
-      throw new Error(
-        "VFS login missing: fill username/password on the setup form, or set VFS_USERNAME / VFS_PASSWORD in .env (or disable UI with VFS_APPLICANT_UI=false)."
-      );
-    }
-    await browser.loginOnFirstTab(loginUsername, loginPassword);
+    await performVfsLoginFromStore(instanceId);
     firstUrl = await browser.getFirstTabUrl();
     kind = classifyVfsFirstTabUrl(firstUrl);
     didLoginThisCycle = true;
@@ -801,9 +922,27 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
     const pollReloginInterval = config.pollReloginInterval;
     const onPollRelogin = pollReloginInterval > 0
       ? async () => {
-        logger.info({ instanceId, pollReloginInterval }, "[Relogin] Navigating to login page for fresh VFS session...");
-        await browser.openLoginInFirstTab();
-        await browser.loginOnFirstTab(loginUsername, loginPassword);
+        const hardSwap = config.credentialSwapBrowserRestart && hasSecondCredentials(instanceId);
+        if (hardSwap) {
+          logger.info(
+            { instanceId, pollReloginInterval },
+            "[Relogin] Two accounts: logout → close Chrome → rotate PROXY_URLS → new Chrome → login (next credential)"
+          );
+          await browser.logoutVfsAndOpenLoginFirstTab().catch(() => {
+            /* tab may already be gone */
+          });
+          clearApplicantIpCache();
+          await relaunchChromeAfterCredentialSwapLogout();
+          await performVfsLoginFromStore(instanceId);
+          await browser.resolveApplicantIpForPayload();
+        } else {
+          logger.info(
+            { instanceId, pollReloginInterval },
+            "[Relogin] Logout (best-effort) → login page → next credential (if two are configured) → fresh session"
+          );
+          await browser.logoutVfsAndOpenLoginFirstTab();
+          await performVfsLoginFromStore(instanceId);
+        }
         await browser.preparePollingAfterLogin({ skipDashboardNavigate: true });
       }
       : undefined;

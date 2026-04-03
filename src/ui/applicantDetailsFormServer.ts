@@ -98,6 +98,21 @@ function getLoginFormDefaults(): { vfsUsername: string } {
   };
 }
 
+/** How to update optional second VFS account from JSON (Save / Submit). */
+function readSecondCredentialAction(j: Record<string, unknown>): { username2: string; password2: string } | "clear" | "preserve" {
+  const hasSecondKeys =
+    "vfsUsername2" in j || "vfsPassword2" in j || "username2" in j || "password2" in j;
+  if (!hasSecondKeys) return "preserve";
+  const vu2 =
+    (typeof j.vfsUsername2 === "string" ? j.vfsUsername2.trim() : "") ||
+    (typeof j.username2 === "string" ? j.username2.trim() : "");
+  const vp2 =
+    (typeof j.vfsPassword2 === "string" ? j.vfsPassword2 : "") ||
+    (typeof j.password2 === "string" ? j.password2 : "");
+  if (vu2 && vp2 !== "") return { username2: vu2, password2: vp2 };
+  return "clear";
+}
+
 function openUrlInBrowser(url: string): void {
   if (process.env.VFS_APPLICANT_UI_OPEN_BROWSER === "false") return;
   const platform = process.platform;
@@ -187,8 +202,6 @@ function buildPageHtml(collectLogin: boolean): string {
   /** Placed above instance selection so it reads as global, not per-instance. */
   const scheduleAllowedDatesBlock = `
   <fieldset style="border:1px solid #38444d;border-radius:8px;padding:1rem 1rem 0.25rem;margin:0 0 1.25rem">
-    <legend style="color:#8b98a5;font-size:0.9rem">Allowed appointment dates (optional)</legend>
-    <p class="hint" style="margin-top:0">Shared by every instance. Pick a date (it stays in the box after it is added); use another day or <strong>Add date</strong> for more. Remove chips with ×. If polling hits one of these dates, instances 1–${fastSkipCalendarUpTo} skip the calendar and book that date; others still call the calendar but only keep allow-listed dates. Leave the list empty to disable.</p>
     <label for="scheduleDatePicker">Pick a date</label>
     <div class="picker-row">
       <input type="date" id="scheduleDatePicker" />
@@ -205,7 +218,7 @@ function buildPageHtml(collectLogin: boolean): string {
     <legend style="color:#8b98a5;font-size:0.9rem">Bot configuration</legend>
     <label for="numInstances">Number of instances</label>
     <input type="number" id="numInstances" name="numInstances" min="1" max="50" value="${defaultNumInstances}" />
-    <div id="instanceSelectWrapper" style="display:${isMultiInstance ? "block" : "none"}">
+    <div id="instanceSelectWrapper" style="display:block">
       <label for="instanceId" style="margin-top:0.75rem">Select instance to configure (each uses a different Chrome profile / IP)</label>
       <select id="instanceId" name="instanceId">
         ${Array.from({ length: defaultNumInstances }, (_, i) => `<option value="${i + 1}">Instance ${i + 1}</option>`).join("\n        ")}
@@ -222,13 +235,15 @@ function buildPageHtml(collectLogin: boolean): string {
     <input id="vfsUsername" name="vfsUsername" type="email" autocomplete="username" />
     <label for="vfsPassword">Password</label>
     <input id="vfsPassword" name="vfsPassword" type="text" autocomplete="current-password" />
+    <p class="hint" style="margin-top:0.75rem">Second VFS account (optional). If both are set, the bot alternates: after each poll relogin it logs out, closes Chrome, picks the next entry in <code>PROXY_URLS</code>, opens a new browser, then logs in with the other account (unless <code>VFS_CREDENTIAL_SWAP_BROWSER_RESTART=false</code>).</p>
+    <label for="vfsUsername2">Email / username (account 2)</label>
+    <input id="vfsUsername2" name="vfsUsername2" type="email" autocomplete="off" />
+    <label for="vfsPassword2">Password (account 2)</label>
+    <input id="vfsPassword2" name="vfsPassword2" type="text" autocomplete="off" />
   </fieldset>`
     : "";
 
   const title = collectLogin ? "VFS bot — login & applicant" : "VFS bot — applicant details";
-  const hint = collectLogin
-    ? "Each Submit: reconnect to Chrome, then open login if the tab is blank, log in if you are on the login page, or go straight to polling from dashboard / application pages. Submit again anytime for another run."
-    : "Each Submit runs the flow from your current Chrome tab (blank → login URL, login page → sign-in, else polling).";
 
   const collectLoginJs = collectLogin ? "true" : "false";
   const isMultiInstanceJs = isMultiInstance ? "true" : "false";
@@ -242,7 +257,7 @@ function buildPageHtml(collectLogin: boolean): string {
   <title>${title}</title>
   <style>
     :root { font-family: system-ui, sans-serif; background: #0f1419; color: #e7e9ea; }
-    body { max-width: 520px; margin: 2rem auto; padding: 0 1rem; }
+    body { max-width: 1040px; margin: 2rem auto; padding: 0 1.25rem; }
     h1 { font-size: 1.25rem; margin-bottom: 0.5rem; }
     p.hint { color: #8b98a5; font-size: 0.9rem; margin-top: 0; }
     label { display: block; margin-top: 0.75rem; font-size: 0.85rem; color: #8b98a5; }
@@ -250,9 +265,37 @@ function buildPageHtml(collectLogin: boolean): string {
       border-radius: 8px; border: 1px solid #38444d; background: #15202b; color: #e7e9ea; font: inherit; }
     textarea { min-height: 6rem; resize: vertical; }
     .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+    .form-layout {
+      display: grid;
+      grid-template-columns: minmax(280px, 1fr) minmax(320px, 1.15fr);
+      gap: 1.75rem 2.25rem;
+      align-items: start;
+      margin-top: 1.25rem;
+    }
+    @media (max-width: 880px) {
+      .form-layout { grid-template-columns: 1fr; }
+    }
+    .form-col--setup { min-width: 0; }
+    .form-col--details {
+      min-width: 0;
+      padding: 1rem 1.1rem 0.5rem;
+      border: 1px solid #38444d;
+      border-radius: 10px;
+      background: #12181f;
+    }
+    .col-heading {
+      margin: 0 0 0.35rem;
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: #e7e9ea;
+      letter-spacing: 0.02em;
+    }
+    .col-sub { margin: 0 0 0.75rem; font-size: 0.82rem; color: #8b98a5; }
     .picker-row { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; margin-top: 0.25rem; }
     .picker-row input[type="date"] { margin-top: 0; max-width: 11rem; flex: 1 1 auto; min-width: 0; }
-    button { margin-top: 1.25rem; width: 100%; padding: 0.65rem; border: none; border-radius: 8px;
+    .form-actions { margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid #38444d; }
+    button[type="submit"] { margin-top: 0; }
+    button { width: 100%; padding: 0.65rem; border: none; border-radius: 8px;
       background: #1d9bf0; color: #fff; font-weight: 600; cursor: pointer; font-size: 1rem; }
     button:hover { filter: brightness(1.08); }
     button.btn-inline { margin-top: 0; width: auto; padding: 0.5rem 0.9rem; font-size: 0.9rem; }
@@ -263,96 +306,106 @@ function buildPageHtml(collectLogin: boolean): string {
     .date-chip-remove { margin: 0; padding: 0 0.2rem; width: auto; min-width: 0; background: transparent; color: #8b98a5; font-size: 1.15rem; line-height: 1; font-weight: 400; }
     .date-chip-remove:hover { color: #f4212e; filter: none; }
     .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
+    .section-rule { margin: 1.25rem 0; border: none; border-top: 1px solid #38444d; }
+    .section-title { margin: 0 0 0.5rem; font-size: 0.92rem; font-weight: 600; color: #c4cdd4; }
     .ok { color: #00ba7c; margin-top: 1rem; }
     .err { color: #f4212e; margin-top: 1rem; }
   </style>
 </head>
 <body>
-  <h1>${collectLogin ? "Setup" : "Applicant details"}</h1>
-  <p class="hint">${hint}</p>
   <form id="f">
-    ${scheduleAllowedDatesBlock}
-    ${instanceSelectBlock}
-    ${loginBlock}
-    <div class="row2">
-      <div><label for="firstName">First name</label><input id="firstName" name="firstName" autocomplete="given-name" /></div>
-      <div><label for="lastName">Last name</label><input id="lastName" name="lastName" autocomplete="family-name" /></div>
+    <div class="form-layout">
+      <div class="form-col form-col--setup">
+        ${scheduleAllowedDatesBlock}
+        ${instanceSelectBlock}
+        ${loginBlock}
+      </div>
+      <div class="form-col form-col--details">
+        <h2 class="col-heading">Applicant details</h2>
+        <p class="col-sub">Passport, contact, and visa centre / category for save-applicants.</p>
+        <div class="row2">
+          <div><label for="firstName">First name</label><input id="firstName" name="firstName" autocomplete="given-name" /></div>
+          <div><label for="lastName">Last name</label><input id="lastName" name="lastName" autocomplete="family-name" /></div>
+        </div>
+        <label for="emailId">Email</label>
+        <input id="emailId" name="emailId" type="email" autocomplete="email" />
+        <div class="row2">
+          <div><label for="dialCode">Dial code</label><input id="dialCode" name="dialCode" /></div>
+          <div><label for="contactNumber">Phone</label><input id="contactNumber" name="contactNumber" /></div>
+        </div>
+        <label for="dateOfBirth">Date of birth (DD/MM/YYYY)</label>
+        <input id="dateOfBirth" name="dateOfBirth" placeholder="09/03/1988" />
+        <div class="row2">
+          <div><label for="passportNumber">Passport number</label><input id="passportNumber" name="passportNumber" /></div>
+          <div><label for="passportExpirtyDate">Passport expiry (DD/MM/YYYY)</label><input id="passportExpirtyDate" name="passportExpirtyDate" /></div>
+        </div>
+        <label for="gender">Gender</label>
+        <select id="gender" name="gender">
+          <option value="1">MALE</option>
+          <option value="2">FEMALE</option>
+        </select>
+        <label for="vacCode">Visa Application Centre</label>
+        <select id="vacCode" name="vacCode">
+          <option value="">-- Select Centre --</option>
+          <option value="JAI">Bulgaria Visa Application Centre-Jaipur</option>
+          <option value="HYD">Bulgaria Visa Application Centre-Hyderabad</option>
+          <option value="JLD">Bulgaria Visa Application Centre-Jalandhar</option>
+          <option value="BLR">Bulgaria Visa Application Center ,Bangalore</option>
+          <option value="IXC">Bulgaria Visa Application Centre-Chandigarh</option>
+          <option value="PNQ">Bulgaria Visa Application Centre-Pune</option>
+          <option value="COK">Bulgaria Visa Application Centre-Cochin</option>
+          <option value="GOI">Bulgaria Visa Application Centre-Goa</option>
+          <option value="AMD">Bulgaria Visa Application Centre-Ahmedabad</option>
+          <option value="PUD">Bulgaria Visa Application Centre-Puducherry</option>
+          <option value="GUR">Bulgaria Visa Application Center ,Gurugram</option>
+          <option value="NDEL">Bulgaria Visa Application Center ,New Delhi</option>
+          <option value="BKC">Bulgaria Visa Application Center, Mumbai</option>
+          <option value="MAA">Bulgaria Visa Application Centre-Chennai</option>
+          <option value="CCU">Bulgarian visa application center-Kolkata-VAC</option>
+        </select>
+        <label for="selectedSubvisaCategory">Visa Category (Center 1)</label>
+        <select id="selectedSubvisaCategory" name="selectedSubvisaCategory">
+          <option value="">-- Select Category --</option>
+          <option value="LONGSTAY">Long Stay D visa</option>
+          <option value="SAW">Seasonal worker</option>
+          <option value="Busi">Business Visa</option>
+        </select>
+
+        <hr class="section-rule" />
+        <h3 class="section-title">Center 2 (optional)</h3>
+        <p class="hint" style="margin-bottom:1rem">Leave empty to poll only Center 1</p>
+
+        <label for="vacCode2">Visa Application Centre 2 (Optional)</label>
+        <select id="vacCode2" name="vacCode2">
+          <option value="">-- No Second Centre --</option>
+          <option value="JAI">Bulgaria Visa Application Centre-Jaipur</option>
+          <option value="HYD">Bulgaria Visa Application Centre-Hyderabad</option>
+          <option value="JLD">Bulgaria Visa Application Centre-Jalandhar</option>
+          <option value="BLR">Bulgaria Visa Application Center ,Bangalore</option>
+          <option value="IXC">Bulgaria Visa Application Centre-Chandigarh</option>
+          <option value="PNQ">Bulgaria Visa Application Centre-Pune</option>
+          <option value="COK">Bulgaria Visa Application Centre-Cochin</option>
+          <option value="GOI">Bulgaria Visa Application Centre-Goa</option>
+          <option value="AMD">Bulgaria Visa Application Centre-Ahmedabad</option>
+          <option value="PUD">Bulgaria Visa Application Centre-Puducherry</option>
+          <option value="GUR">Bulgaria Visa Application Center ,Gurugram</option>
+          <option value="NDEL">Bulgaria Visa Application Center ,New Delhi</option>
+          <option value="BKC">Bulgaria Visa Application Center, Mumbai</option>
+          <option value="MAA">Bulgaria Visa Application Centre-Chennai</option>
+          <option value="CCU">Bulgarian visa application center-Kolkata-VAC</option>
+        </select>
+        <label for="selectedSubvisaCategory2">Visa Category 2 (Optional)</label>
+        <select id="selectedSubvisaCategory2" name="selectedSubvisaCategory2">
+          <option value="">-- Select Category --</option>
+          <option value="LONGSTAY">Long Stay D visa</option>
+          <option value="SAW">Seasonal worker</option>
+          <option value="Busi">Business Visa</option>
+        </select>
+      </div>
     </div>
-    <label for="emailId">Email</label>
-    <input id="emailId" name="emailId" type="email" autocomplete="email" />
-    <div class="row2">
-      <div><label for="dialCode">Dial code</label><input id="dialCode" name="dialCode" /></div>
-      <div><label for="contactNumber">Phone</label><input id="contactNumber" name="contactNumber" /></div>
+    <div class="form-actions">
+      <button type="submit" id="submitBtn">${isMultiInstance ? "Submit & Run All Instances" : "Submit & Run Bot"}</button>
     </div>
-    <label for="dateOfBirth">Date of birth (DD/MM/YYYY)</label>
-    <input id="dateOfBirth" name="dateOfBirth" placeholder="09/03/1988" />
-    <div class="row2">
-      <div><label for="passportNumber">Passport number</label><input id="passportNumber" name="passportNumber" /></div>
-      <div><label for="passportExpirtyDate">Passport expiry (DD/MM/YYYY)</label><input id="passportExpirtyDate" name="passportExpirtyDate" /></div>
-    </div>
-    <label for="gender">Gender</label>
-    <select id="gender" name="gender">
-      <option value="1">MALE</option>
-      <option value="2">FEMALE</option>
-    </select>
-    <label for="vacCode">Visa Application Centre</label>
-    <select id="vacCode" name="vacCode">
-      <option value="">-- Select Centre --</option>
-      <option value="JAI">Bulgaria Visa Application Centre-Jaipur</option>
-      <option value="HYD">Bulgaria Visa Application Centre-Hyderabad</option>
-      <option value="JLD">Bulgaria Visa Application Centre-Jalandhar</option>
-      <option value="BLR">Bulgaria Visa Application Center ,Bangalore</option>
-      <option value="IXC">Bulgaria Visa Application Centre-Chandigarh</option>
-      <option value="PNQ">Bulgaria Visa Application Centre-Pune</option>
-      <option value="COK">Bulgaria Visa Application Centre-Cochin</option>
-      <option value="GOI">Bulgaria Visa Application Centre-Goa</option>
-      <option value="AMD">Bulgaria Visa Application Centre-Ahmedabad</option>
-      <option value="PUD">Bulgaria Visa Application Centre-Puducherry</option>
-      <option value="GUR">Bulgaria Visa Application Center ,Gurugram</option>
-      <option value="NDEL">Bulgaria Visa Application Center ,New Delhi</option>
-      <option value="BKC">Bulgaria Visa Application Center, Mumbai</option>
-      <option value="MAA">Bulgaria Visa Application Centre-Chennai</option>
-      <option value="CCU">Bulgarian visa application center-Kolkata-VAC</option>
-    </select>
-    <label for="selectedSubvisaCategory">Visa Category (Center 1)</label>
-    <select id="selectedSubvisaCategory" name="selectedSubvisaCategory">
-      <option value="">-- Select Category --</option>
-      <option value="LONGSTAY">Long Stay D visa</option>
-      <option value="SAW">Seasonal worker</option>
-      <option value="Busi">Business Visa</option>
-    </select>
-    
-    <hr style="margin: 1.5rem 0; border: none; border-top: 2px solid #ddd;" />
-    <h3 style="margin-bottom: 0.75rem; color: #555;">Center 2 (Optional)</h3>
-    <p style="margin-top: 0; margin-bottom: 1rem; font-size: 0.9rem; color: #666;">Leave empty to poll only Center 1</p>
-    
-    <label for="vacCode2">Visa Application Centre 2 (Optional)</label>
-    <select id="vacCode2" name="vacCode2">
-      <option value="">-- No Second Centre --</option>
-      <option value="JAI">Bulgaria Visa Application Centre-Jaipur</option>
-      <option value="HYD">Bulgaria Visa Application Centre-Hyderabad</option>
-      <option value="JLD">Bulgaria Visa Application Centre-Jalandhar</option>
-      <option value="BLR">Bulgaria Visa Application Center ,Bangalore</option>
-      <option value="IXC">Bulgaria Visa Application Centre-Chandigarh</option>
-      <option value="PNQ">Bulgaria Visa Application Centre-Pune</option>
-      <option value="COK">Bulgaria Visa Application Centre-Cochin</option>
-      <option value="GOI">Bulgaria Visa Application Centre-Goa</option>
-      <option value="AMD">Bulgaria Visa Application Centre-Ahmedabad</option>
-      <option value="PUD">Bulgaria Visa Application Centre-Puducherry</option>
-      <option value="GUR">Bulgaria Visa Application Center ,Gurugram</option>
-      <option value="NDEL">Bulgaria Visa Application Center ,New Delhi</option>
-      <option value="BKC">Bulgaria Visa Application Center, Mumbai</option>
-      <option value="MAA">Bulgaria Visa Application Centre-Chennai</option>
-      <option value="CCU">Bulgarian visa application center-Kolkata-VAC</option>
-    </select>
-    <label for="selectedSubvisaCategory2">Visa Category 2 (Optional)</label>
-    <select id="selectedSubvisaCategory2" name="selectedSubvisaCategory2">
-      <option value="">-- Select Category --</option>
-      <option value="LONGSTAY">Long Stay D visa</option>
-      <option value="SAW">Seasonal worker</option>
-      <option value="Busi">Business Visa</option>
-    </select>
-    <button type="submit" id="submitBtn" style="margin-top: 1.25rem; width: 100%;">${isMultiInstance ? "Submit & Run All Instances" : "Submit & Run Bot"}</button>
   </form>
   <p id="msg"></p>
   ${buildApplicantFormPageScript(collectLoginJs, isMultiInstanceJs, defaultNumInstancesJs)}
@@ -443,6 +496,8 @@ export function runApplicantFormWithSubmitHandler(
                 ...base,
                 vfsUsername: (creds?.username ?? base.vfsUsername ?? "").trim(),
                 vfsPassword: creds?.password ?? "",
+                vfsUsername2: (creds?.username2 ?? "").trim(),
+                vfsPassword2: creds?.password2 ?? "",
               };
             }
             json(res, 200, payload);
@@ -490,12 +545,18 @@ export function runApplicantFormWithSubmitHandler(
             const vu = typeof j.vfsUsername === "string" ? j.vfsUsername.trim() : "";
             const vp = typeof j.vfsPassword === "string" ? j.vfsPassword : "";
             if (vu && vp) {
-              // Only save credentials if both are provided
-              setSessionLoginCredentials(vu, vp, instanceId);
+              setSessionLoginCredentials(vu, vp, instanceId, readSecondCredentialAction(j));
             }
           }
 
-          const { vfsUsername: _u, vfsPassword: _p, instanceId: _id, ...rest } = j;
+          const {
+            vfsUsername: _u,
+            vfsPassword: _p,
+            vfsUsername2: _u2,
+            vfsPassword2: _p2,
+            instanceId: _id,
+            ...rest
+          } = j;
           const fields = parseApplicantFields(rest);
           const id = instanceId;
           if (id !== undefined && id !== 0) {
@@ -578,10 +639,17 @@ export function runApplicantFormWithSubmitHandler(
               json(res, 400, { ok: false, error: "VFS username and password are required" });
               return;
             }
-            setSessionLoginCredentials(vu, vp, instanceId);
+            setSessionLoginCredentials(vu, vp, instanceId, readSecondCredentialAction(j));
           }
 
-          const { vfsUsername: _u, vfsPassword: _p, instanceId: _id, ...rest } = j;
+          const {
+            vfsUsername: _u,
+            vfsPassword: _p,
+            vfsUsername2: _ux2,
+            vfsPassword2: _px2,
+            instanceId: _id,
+            ...rest
+          } = j;
           const fields = parseApplicantFields(rest);
           if (!fields.firstName || !fields.lastName || !fields.passportNumber) {
             json(res, 400, { ok: false, error: "firstName, lastName, and passportNumber are required" });

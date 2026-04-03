@@ -97,6 +97,11 @@ async function tryResolveApplicantIpFromBrowserPage(page: Page): Promise<string 
 
 let cachedApplicantIp: string | null = null;
 
+/** Call after Chrome/proxy restart so save-applicants IP matches the new egress. */
+export function clearApplicantIpCache(): void {
+  cachedApplicantIp = null;
+}
+
 /** Use after {@link ensureApplicantIpResolved}; otherwise falls back to local NIC IP. */
 export function getApplicantIpForPayload(): string {
   if (cachedApplicantIp) return cachedApplicantIp;

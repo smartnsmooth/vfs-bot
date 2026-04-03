@@ -420,6 +420,41 @@ export class BrowserService {
   }
 
   /**
+   * Best-effort logout before switching accounts, then open the login URL.
+   * VFS varies by site; if no logout control is found we still navigate to the login page.
+   */
+  async logoutVfsAndOpenLoginFirstTab(): Promise<void> {
+    const browser = await this.ensureBrowser();
+    const context = browser.contexts()[0];
+    if (!context) throw new Error("No browser context");
+    const pages = context.pages();
+    const page = this.findPreferredVfsPage(pages) ?? pages[0];
+    if (!page) {
+      await this.openLoginInFirstTab();
+      return;
+    }
+    await page.bringToFront().catch(() => { });
+    logger.info("[Logout] Attempting VFS sign-out before next login...");
+    try {
+      const candidates = [
+        page.getByRole("button", { name: /log\s*out|sign\s*out|log\s*off/i }).first(),
+        page.getByRole("link", { name: /log\s*out|sign\s*out/i }).first(),
+        page.locator('a[href*="logout" i], button[href*="logout" i]').first(),
+      ];
+      for (const loc of candidates) {
+        if (await loc.isVisible({ timeout: 1500 }).catch(() => false)) {
+          await loc.click({ timeout: 5000 }).catch(() => { });
+          await page.waitForTimeout(2000);
+          break;
+        }
+      }
+    } catch {
+      /* continue to login URL */
+    }
+    await this.openLoginInFirstTab();
+  }
+
+  /**
    * Run login on the first tab (must be on login page): fill credentials, Turnstile, submit.
    */
   async loginOnFirstTab(username: string, password: string): Promise<void> {
@@ -1492,14 +1527,14 @@ export class BrowserService {
     const turnstileTokenBeforeRefill = await readCfTurnstileToken();
 
     if (opts.loginRefill) {
-      logger.info(
-        "[Login] Re-filling email/password before Sign In (after Turnstile; VFS/Angular sometimes clears fields while the widget solves)"
-      );
-      await this.fillLoginCredentials(page, opts.loginRefill.username, opts.loginRefill.password, {
-        usernameSelectors: opts.loginRefill.usernameSelectors,
-        passwordSelectors: opts.loginRefill.passwordSelectors,
-        timeoutMs: 15_000,
-      });
+      // logger.info(
+      //   "[Login] Re-filling email/password before Sign In (after Turnstile; VFS/Angular sometimes clears fields while the widget solves)"
+      // );
+      // await this.fillLoginCredentials(page, opts.loginRefill.username, opts.loginRefill.password, {
+      //   usernameSelectors: opts.loginRefill.usernameSelectors,
+      //   passwordSelectors: opts.loginRefill.passwordSelectors,
+      //   timeoutMs: 15_000,
+      // });
 
       const turnstileAfterRefill = await readCfTurnstileToken();
       if (

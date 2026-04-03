@@ -118,6 +118,16 @@ export const config = {
   })(),
 
   /**
+   * When two VFS accounts are saved and poll relogin runs: after logout, kill Chrome, advance `PROXY_URLS`
+   * selection for this profile, spawn a fresh browser, then log in with the next credential.
+   * Set `VFS_CREDENTIAL_SWAP_BROWSER_RESTART=false` to keep logout→login in the same Chrome window.
+   */
+  get credentialSwapBrowserRestart(): boolean {
+    const v = (process.env.VFS_CREDENTIAL_SWAP_BROWSER_RESTART ?? "true").trim().toLowerCase();
+    return v !== "false" && v !== "0" && v !== "no" && v !== "off";
+  },
+
+  /**
    * When true, OTP is read via https://api.mail.tm (see /domains for hostnames — not limited to “@mail.tm”).
    * `VFS_USERNAME` / `VFS_PASSWORD` must match that mail.tm-created mailbox.
    */

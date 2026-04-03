@@ -10,7 +10,19 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
 
   function getNumInstances() {
     const el = document.getElementById("numInstances");
-    return el ? Math.max(1, parseInt(el.value, 10) || 1) : ${defaultNumInstancesJs};
+    if (!el) return ${defaultNumInstancesJs};
+    // Prefer live value; fall back to HTML value attribute (some browsers briefly expose
+    // empty .value before restore) then server default.
+    const fromInput = (el instanceof HTMLInputElement && typeof el.valueAsNumber === "number" && Number.isFinite(el.valueAsNumber) && el.valueAsNumber >= 1)
+      ? Math.floor(el.valueAsNumber)
+      : NaN;
+    if (Number.isFinite(fromInput)) return Math.min(50, fromInput);
+    const parsed = parseInt(String(el.value).trim(), 10);
+    if (Number.isFinite(parsed) && parsed >= 1) return Math.min(50, parsed);
+    const fromAttr = parseInt(String(el.getAttribute("value") || "").trim(), 10);
+    if (Number.isFinite(fromAttr) && fromAttr >= 1) return Math.min(50, fromAttr);
+    const fallback = parseInt(String(${defaultNumInstancesJs}), 10);
+    return Number.isFinite(fallback) && fallback >= 1 ? Math.min(50, fallback) : 1;
   }
 
   function updateInstanceSelector() {
@@ -18,7 +30,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
     isMultiInstance = numInstances > 1;
 
     const wrapper = document.getElementById("instanceSelectWrapper");
-    if (wrapper) wrapper.style.display = isMultiInstance ? "block" : "none";
+    // Always show the selector (even when numInstances=1)
+    if (wrapper) wrapper.style.display = "block";
 
     const select = document.getElementById("instanceId");
     if (select) {
@@ -123,7 +136,9 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
     const d = await r.json();
     if (!d.ok) return;
     const a = d.defaults || {};
+    const skipDefaultIds = { numInstances: true, instanceId: true };
     for (const k of Object.keys(a)) {
+      if (skipDefaultIds[k]) continue;
       if (k === "scheduleAllowedDates" && scheduleDatesUserEdited) continue;
       const el =
         k === "scheduleAllowedDates"
@@ -138,6 +153,14 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
     if (collectLogin && d.loginDefaults && d.loginDefaults.vfsPassword != null) {
       const p = document.getElementById("vfsPassword");
       if (p) p.value = String(d.loginDefaults.vfsPassword);
+    }
+    if (collectLogin && d.loginDefaults && d.loginDefaults.vfsUsername2 != null) {
+      const u2 = document.getElementById("vfsUsername2");
+      if (u2) u2.value = String(d.loginDefaults.vfsUsername2 ?? "");
+    }
+    if (collectLogin && d.loginDefaults && d.loginDefaults.vfsPassword2 != null) {
+      const p2 = document.getElementById("vfsPassword2");
+      if (p2) p2.value = String(d.loginDefaults.vfsPassword2 ?? "");
     }
     renderScheduleAllowedDateChips();
   }
@@ -157,8 +180,12 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
       if (collectLogin) {
         const uEl = document.getElementById("vfsUsername");
         const pEl = document.getElementById("vfsPassword");
+        const u2El = document.getElementById("vfsUsername2");
+        const p2El = document.getElementById("vfsPassword2");
         if (uEl) uEl.value = "";
         if (pEl) pEl.value = "";
+        if (u2El) u2El.value = "";
+        if (p2El) p2El.value = "";
       }
       const fieldsToClear = [
         "firstName",
@@ -193,8 +220,12 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
     if (collectLogin) {
       const uEl = document.getElementById("vfsUsername");
       const pEl = document.getElementById("vfsPassword");
+      const u2El = document.getElementById("vfsUsername2");
+      const p2El = document.getElementById("vfsPassword2");
       if (uEl) uEl.value = "";
       if (pEl) pEl.value = "";
+      if (u2El) u2El.value = "";
+      if (p2El) p2El.value = "";
     }
     const allFields = [
       "firstName",
@@ -220,14 +251,20 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
     if (inst.credentials && collectLogin) {
       const uEl = document.getElementById("vfsUsername");
       const pEl = document.getElementById("vfsPassword");
+      const u2El = document.getElementById("vfsUsername2");
+      const p2El = document.getElementById("vfsPassword2");
       if (uEl) uEl.value = inst.credentials.username || "";
       if (pEl) pEl.value = inst.credentials.password || "";
+      if (u2El) u2El.value = inst.credentials.username2 != null ? String(inst.credentials.username2) : "";
+      if (p2El) p2El.value = inst.credentials.password2 != null ? String(inst.credentials.password2) : "";
     }
 
     if (inst.details) {
+      const skipDetailIds = { numInstances: true, instanceId: true, vfsUsername2: true, vfsPassword2: true };
       const keys = Object.keys(inst.details);
       for (let ki = 0; ki < keys.length; ki++) {
         const k = keys[ki];
+        if (skipDetailIds[k]) continue;
         if (k === "scheduleAllowedDates") continue;
         const el = document.getElementById(k);
         if (el) el.value = inst.details[k] == null ? "" : String(inst.details[k]);
@@ -272,6 +309,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
     if (collectLogin) {
       body.vfsUsername = fd.get("vfsUsername");
       body.vfsPassword = fd.get("vfsPassword");
+      body.vfsUsername2 = fd.get("vfsUsername2");
+      body.vfsPassword2 = fd.get("vfsPassword2");
     }
 
     if (showFeedback) {
@@ -356,6 +395,10 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
         });
       }
 
+      // Sync select option count with #numInstances before any async load (avoids empty
+      // .value being read as 1 and wiping server-rendered options).
+      updateInstanceSelector();
+
       // Always wire the instanceId change listener — the element is always in the DOM.
       // loadInstanceData() and scheduleAutoSave() both guard themselves with isMultiInstance.
       const instanceIdSelect = document.getElementById("instanceId");
@@ -378,6 +421,9 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
       } else {
         await loadDefaults();
       }
+
+      // After defaults / instance payload, keep the instance dropdown aligned with #numInstances.
+      updateInstanceSelector();
     } catch (err) {
       console.error("initApplicantForm failed", err);
     }
@@ -429,6 +475,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
     if (collectLogin) {
       body.vfsUsername = fd.get("vfsUsername");
       body.vfsPassword = fd.get("vfsPassword");
+      body.vfsUsername2 = fd.get("vfsUsername2");
+      body.vfsPassword2 = fd.get("vfsPassword2");
     }
     try {
       const r = await fetch("/api/submit", {

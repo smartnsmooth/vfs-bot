@@ -3,7 +3,14 @@
 
 import { loadInstancesFromDisk, saveInstancesToDisk } from "./instanceStorage";
 
-const instanceCredentials = new Map<number, { username: string; password: string }>();
+export type StoredInstanceCredentials = {
+  username: string;
+  password: string;
+  username2?: string;
+  password2?: string;
+};
+
+const instanceCredentials = new Map<number, StoredInstanceCredentials>();
 
 // Load from disk on module import
 const diskData = loadInstancesFromDisk();
@@ -27,7 +34,7 @@ export function reloadSessionCredentialsFromDisk(): void {
 }
 
 function persistToDisk(): void {
-  const instances: Record<string, { credentials?: { username: string; password: string }; details?: Record<string, unknown> }> = {};
+  const instances: Record<string, { credentials?: StoredInstanceCredentials; details?: Record<string, unknown> }> = {};
   
   // Get credentials
   for (const [id, creds] of instanceCredentials.entries()) {
@@ -45,17 +52,43 @@ function persistToDisk(): void {
   saveInstancesToDisk({ instances });
 }
 
-export function setSessionLoginCredentials(user: string, pass: string, instanceId?: number): void {
+/**
+ * Second pair: set when both provided; `"clear"` removes rotation; `"preserve"` keeps existing second pair when updating primary only.
+ */
+export function setSessionLoginCredentials(
+  user: string,
+  pass: string,
+  instanceId?: number,
+  second?: { username2: string; password2: string } | "clear" | "preserve"
+): void {
   const u = user.trim();
   const p = pass; // keep as-is (spaces may be intentional)
   if (!u || !p) return;
-  
+
   const id = instanceId ?? 0; // 0 = default/single instance mode
-  instanceCredentials.set(id, { username: u, password: p });
+  const prev = instanceCredentials.get(id);
+  const entry: StoredInstanceCredentials = { username: u, password: p };
+
+  if (second === "preserve" || second === undefined) {
+    if (prev?.username2 && prev.password2 != null && String(prev.password2) !== "") {
+      entry.username2 = prev.username2;
+      entry.password2 = prev.password2;
+    }
+  } else if (second === "clear") {
+    /* omit username2/password2 */
+  } else {
+    const u2 = second.username2.trim();
+    const p2 = second.password2;
+    if (u2 && p2 !== "") {
+      entry.username2 = u2;
+      entry.password2 = p2;
+    }
+  }
+  instanceCredentials.set(id, entry);
   persistToDisk();
 }
 
-export function getSessionLoginCredentials(instanceId?: number): { username: string; password: string } | null {
+export function getSessionLoginCredentials(instanceId?: number): StoredInstanceCredentials | null {
   const id = instanceId ?? 0;
   return instanceCredentials.get(id) ?? null;
 }
@@ -69,6 +102,6 @@ export function clearSessionLoginCredentials(instanceId?: number): void {
   persistToDisk();
 }
 
-export function getAllInstanceCredentials(): Map<number, { username: string; password: string }> {
+export function getAllInstanceCredentials(): Map<number, StoredInstanceCredentials> {
   return instanceCredentials;
 }

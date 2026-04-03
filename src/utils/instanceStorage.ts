@@ -6,6 +6,9 @@ interface InstanceData {
   credentials?: {
     username: string;
     password: string;
+    /** Optional second account — bot alternates after each successful login + relogin. */
+    username2?: string;
+    password2?: string;
   };
   details?: Record<string, unknown>;
 }
