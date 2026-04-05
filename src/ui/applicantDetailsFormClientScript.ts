@@ -205,7 +205,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
     const fd = new FormData(form);
     const body = {
       passportExpirtyDate: fd.get("passportExpirtyDate"),
-      nationalityCode: String(fd.get("nationalityCode") || "").trim().toUpperCase(),
+      nationalityCode: String(fd.get("nationalityCode") || "").trim(),
       vacCode: fd.get("vacCode"),
       gender: parseInt(String(fd.get("gender") || "1"), 10),
       selectedSubvisaCategory: fd.get("selectedSubvisaCategory"),
@@ -342,19 +342,6 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
   })();
   void initApplicantForm();
 
-  (function wireNationalityUppercase() {
-    const el = document.getElementById("nationalityCode");
-    if (!el) return;
-    el.addEventListener("input", function (e) {
-      const t = e.target;
-      if (!(t instanceof HTMLInputElement)) return;
-      const start = t.selectionStart;
-      const end = t.selectionEnd;
-      t.value = t.value.toUpperCase().replace(/[^A-Z]/g, "").slice(0, 3);
-      if (start != null && end != null) t.setSelectionRange(start, end);
-    });
-  })();
-
   document.getElementById("f").addEventListener("submit", async function (e) {
     e.preventDefault();
     const msg = document.getElementById("msg");
@@ -362,7 +349,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
     const fd = new FormData(e.target);
     const body = {
       passportExpirtyDate: fd.get("passportExpirtyDate"),
-      nationalityCode: String(fd.get("nationalityCode") || "").trim().toUpperCase(),
+      nationalityCode: String(fd.get("nationalityCode") || "").trim(),
       vacCode: fd.get("vacCode"),
       gender: parseInt(String(fd.get("gender") || "1"), 10),
       selectedSubvisaCategory: fd.get("selectedSubvisaCategory"),
