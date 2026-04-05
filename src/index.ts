@@ -34,13 +34,14 @@ import {
   NoDatesInScheduleRangeError,
 } from "./utils/scheduleAllowedDates.js";
 import { clearApplicantIpCache } from "./utils/applicantIp";
+import { clearChromeSessionDataBeforeLaunch } from "./utils/chromeProfileSessionClean";
 
 const polling = new PollingService();
 const browser = new BrowserService();
 const telegram = new TelegramService();
 
 const POLL_INTERVAL_MS = config.pollingIntervalMs;
-const POST_LOGIN_POLL_DELAY_MS = 20_000;
+const POST_LOGIN_POLL_DELAY_MS = 30_000;
 const FAST_SKIP_CALENDAR_UP_TO_INSTANCE = Math.max(
   0,
   parseInt(process.env.FAST_SKIP_CALENDAR_UP_TO_INSTANCE ?? "5", 10) || 5
@@ -117,17 +118,16 @@ async function killChromeOnPort(port: number): Promise<void> {
 }
 
 /**
- * After logout when alternating two accounts: bump `PROXY_URLS` rotation, kill Chrome, respawn with new proxy.
+ * After logout when alternating two accounts: kill Chrome and respawn.
+ * `PROXY_URLS` index advances on every new Chrome launch inside {@link ensureChromeWithDevTools}.
  */
 async function relaunchChromeAfterCredentialSwapLogout(): Promise<void> {
   const profileId = getBotInstanceId(resolveChromeUserDataDir());
   const rawList = (process.env.PROXY_URLS ?? "").trim();
   const slots = rawList.split(/[\r\n,]+/).map((s) => s.trim()).filter(Boolean).length;
-  bumpProxyRotationForProfile(profileId);
-  const step = proxyRotationOffsetByProfileId.get(profileId) ?? 0;
   logger.info(
-    { profileId, proxyRotationStep: step, proxyUrlSlots: Math.max(1, slots) },
-    "[Relogin] Credential swap: closing proxy tunnel + Chrome; next launch uses next PROXY_URLS entry (cyclic)"
+    { profileId, proxyUrlSlots: Math.max(1, slots) },
+    "[Relogin] Credential swap: closing proxy tunnel + Chrome; respawning (proxy rotates on launch)"
   );
   await closeActiveAnonymizedProxyTunnel();
   await browser.disconnectCdp();
@@ -302,6 +302,15 @@ function hashString(input: string): number {
   return Math.abs(h);
 }
 
+/**
+ * Sticky proxy session string embedded in `PROXY_URLS` via `{session}` or `{instance}`.
+ * - **`PROXY_STICKY_SESSION_ID`**: same string for every launch (fixed sticky pool entry).
+ * - **Default**: `vfs-<profileInstanceId>` — stable for that Chrome user-data-dir / bot instance across runs,
+ *   so cluster instance `1` keeps one session id and instance `2` another (per-instance sticky).
+ * Pair with your vendor’s session-sticky URL format (e.g. `-session-{session}` in the username).
+ * New Chrome launch still uses the same token unless you change env or profile id — for a **new** egress per
+ * launch, change `PROXY_STICKY_SESSION_ID` or rotate `PROXY_URLS` index (`bumpProxyRotationForProfile`).
+ */
 function stableSessionToken(instanceId: string): string {
   const raw = (process.env.PROXY_STICKY_SESSION_ID ?? "").trim();
   if (raw) return raw;
@@ -419,7 +428,6 @@ function checkDevToolsEndpoint(url: string): Promise<boolean> {
 async function ensureChromeWithDevTools(): Promise<void> {
   const userDataDir = resolveChromeUserDataDir();
   const instanceId = getBotInstanceId(userDataDir);
-  const selectedProxy = resolveProxyForInstance(instanceId);
 
   // If Chrome DevTools is already reachable on the target port, skip spawning entirely.
   // On Windows, Chrome is a single-instance app per profile: re-launching it when it is
@@ -430,6 +438,21 @@ async function ensureChromeWithDevTools(): Promise<void> {
       return;
     }
   }
+
+  await clearChromeSessionDataBeforeLaunch(userDataDir);
+
+  const selectedProxy = resolveProxyForInstance(instanceId);
+  bumpProxyRotationForProfile(instanceId);
+  if (selectedProxy) {
+    logger.info(
+      {
+        instanceId,
+        proxyRotationStep: proxyRotationOffsetByProfileId.get(instanceId) ?? 0,
+      },
+      "[Chrome] New launch — using next PROXY_URLS entry (per-instance cyclic rotation)"
+    );
+  }
+  clearApplicantIpCache();
 
   const chromePath = resolveChromeExecutablePath();
   const resolvedProxy = await resolveLaunchProxyServer(selectedProxy);
@@ -668,6 +691,18 @@ function isSaveApplicants422(err: unknown): boolean {
   return err instanceof Error && err.message.includes("Save applicants API error:") && err.message.includes("422");
 }
 
+/** Final save-applicants failure — do not restart polling after this. */
+function isSaveApplicantsFailure(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const m = err.message;
+  return (
+    m.includes("Save applicants API error:") ||
+    m.includes("Save applicants failed HTTP") ||
+    m.includes("Save applicants failed after retry HTTP") ||
+    m.startsWith("Save applicants: response is not JSON")
+  );
+}
+
 function getFixedTimingForInstance(instanceId?: number): { postLoginOffsetMs: number; pollIntervalMs: number } {
   const id = typeof instanceId === "number" && Number.isFinite(instanceId) && instanceId >= 1 ? Math.floor(instanceId) : 1;
   const numInstancesRaw = parseInt(process.env.VFS_BOT_INSTANCES ?? "1", 10);
@@ -717,10 +752,8 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
       if (!isSaveApplicants422(err) || attempt === MAX_SAVE_APPLICANTS_RETRIES) throw err;
       logger.warn(
         { attempt, maxRetries: MAX_SAVE_APPLICANTS_RETRIES, instanceId },
-        "Save applicants returned 422 — retrying after fresh CDP + poll (mimics manual re-submit)"
+        "Save applicants returned 422 — retrying after re-poll"
       );
-      await browser.disconnectCdp();
-      await browser.getFirstTabUrl();
       await browser.preparePollingAfterLogin({ skipDashboardNavigate: true });
       const stillAvailable = await runPollLoop(instanceId);
       if (!stillAvailable) {
@@ -730,7 +763,7 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
     }
   }
   const fastSkipCalendar = (instanceId ?? 1) <= FAST_SKIP_CALENDAR_UP_TO_INSTANCE;
-  const allowed = getScheduleAllowedDates();
+  const allowed = getScheduleAllowedDates(instanceId);
   const calendarOpts =
     allowed && allowed.size > 0 ? { allowedDates: allowed } : undefined;
   // Use the live slot state; fall back to the snapshot taken when booking started in case
@@ -829,6 +862,20 @@ async function performVfsLoginFromStore(instanceId?: number): Promise<void> {
 
 /**
  * One full run after setup form Submit (or headless single run): CDP refresh → tab URL branch → poll → optional booking.
+ *
+ * **Cycle (this codebase):** a single invocation of this function for one cluster child (or one local run).
+ * Cluster: parent sends `run-bot-cycle` after each Submit; on failure the child retries after 15s (`firstSubmit` is
+ * only true on the first attempt). **Instance:** `instanceId` / `BOT_INSTANCE_ID` / `vfs-bot-profile-N` — each
+ * instance uses its own `PROXY_URLS` slot and default sticky token `vfs-<instanceId>` (see `stableSessionToken`).
+ *
+ * **Different public IP per instance:** use multiple `PROXY_URLS` lines and/or `{session}` / `{instance}`; each
+ * instance hashes to a different base index.
+ *
+ * **Different public IP per cycle:** today the proxy index advances and applicant IP cache clears only when
+ * **Chrome is spawned** (`ensureChromeWithDevTools` does not early-return). If DevTools already runs, the same
+ * Chrome+proxy is reused — same egress for that profile until you restart Chrome or use credential-swap restart.
+ * Optional: `VFS_CLEAR_APPLICANT_IP_CACHE_EACH_CYCLE=true` re-resolves IP every cycle (only safe if you also get a
+ * fresh VFS session that cycle, e.g. relogin or new browser).
  */
 async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
   // Reload .env changes for submit-driven runs (so toggles like TURNSTILE_DEMO_MODE take effect
@@ -852,6 +899,16 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
   // Set current instance ID for config getters (e.g., loginUser)
   setCurrentInstanceId(instanceId);
 
+  if (
+    /^true|1|yes$/i.test((process.env.VFS_CLEAR_APPLICANT_IP_CACHE_EACH_CYCLE ?? "").trim())
+  ) {
+    clearApplicantIpCache();
+    logger.info(
+      { instanceId },
+      "Applicant IP cache cleared at cycle start (VFS_CLEAR_APPLICANT_IP_CACHE_EACH_CYCLE) — safe mainly when each cycle uses new Chrome or full relogin so VFS session matches the new reading"
+    );
+  }
+
   // Clear shared slot state at the start of a new cycle
   if (meta.firstSubmit) {
     clearSlotState();
@@ -861,6 +918,10 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
   // 1) Drop old Playwright CDP attachment; 2) ensure Chrome + DevTools; 3) reconnect
   await browser.disconnectCdp();
   await ensureChromeWithDevTools();
+
+  // Log outbound IP as soon as CDP can attach (Chrome proxy egress). A later call reuses cache; if this fails
+  // (no tab yet), the post-login resolve retries.
+  await browser.resolveApplicantIpForPayload();
 
   if (config.turnstileDemoMode) {
     await browser.openUrlInFirstTab(config.turnstileDemoUrl);
@@ -892,7 +953,7 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
     logger.info({ url: firstUrl, instanceId }, "On post-login VFS page — skipping automated login; polling from here");
   }
 
-  /** After login: resolve IP via in-page fetch (same egress as Chrome / proxy extension) for save-applicants. */
+  /** Retry or confirm IP after navigation/login (cached if early resolve already succeeded). */
   await browser.resolveApplicantIpForPayload();
 
   const skipDashboardNavigate = !meta.firstSubmit || kind === "vfs_other";
@@ -972,6 +1033,22 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
         return; // Leave Chrome on the payment page; do not fall through to cycle end.
       } catch (err) {
         instanceBookingActive = false; // Release booking lock so new slot finds can reach this instance again.
+        if (isSaveApplicantsFailure(err)) {
+          logger.error(
+            { err, instanceId },
+            "Save applicants failed — stopping polling (fix applicant payload / session and restart the bot)"
+          );
+          await telegram
+            .alert(
+              "error",
+              `Save applicants failed (instance ${instanceId ?? 1}) — polling stopped: ${err instanceof Error ? err.message : String(err)}`
+            )
+            .catch(() => { });
+          clearSlotState();
+          clearSlotCenterOverride();
+          clearSlotDate();
+          break;
+        }
         const noDates =
           err instanceof NoDatesInScheduleRangeError ||
           (err instanceof Error && (err as Error & { code?: string }).code === "NO_DATES_IN_RANGE");

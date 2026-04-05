@@ -1,24 +1,94 @@
 /**
- * Optional allow-list of appointment dates from setup (YYYY-MM-DD, one per line in UI).
- * Shared on applicant details id 0. Calendar API returns MM/DD/YYYY.
+ * Optional appointment date constraint from setup (per bot instance in applicant details).
+ * Primary: inclusive `scheduleDateRangeStart`–`scheduleDateRangeEnd` (YYYY-MM-DD).
+ * Legacy: `scheduleAllowedDates` discrete list (still read if no valid range).
+ * If the chosen instance has no schedule data, falls back to applicant details id 0 (migration).
+ * Calendar API returns MM/DD/YYYY.
  */
 
+import { getCurrentInstanceId } from "../config/config.js";
 import { getApplicantDetailsOverrides } from "./applicantDetails.store.js";
 
 /** Thrown when filtering removes every calendar date (restart polling). */
 export class NoDatesInScheduleRangeError extends Error {
   readonly code = "NO_DATES_IN_RANGE" as const;
   constructor() {
-    super("No calendar dates match your allowed schedule dates");
+    super("No calendar dates match your allowed schedule date range");
     this.name = "NoDatesInScheduleRangeError";
   }
 }
 
-export function getScheduleAllowedDates(): Set<string> | null {
-  const d = getApplicantDetailsOverrides(0);
+function hasScheduleConstraintInDetails(d: Record<string, unknown> | null | undefined): boolean {
+  if (!d) return false;
+  const rs = typeof d.scheduleDateRangeStart === "string" ? d.scheduleDateRangeStart.trim() : "";
+  const re = typeof d.scheduleDateRangeEnd === "string" ? d.scheduleDateRangeEnd.trim() : "";
+  if (rs && re) return true;
+  const legacy = d.scheduleAllowedDates;
+  if (legacy == null) return false;
+  if (typeof legacy === "string") return legacy.trim() !== "";
+  return Array.isArray(legacy) && legacy.length > 0;
+}
+
+function detailsForScheduleLookup(instanceId: number): Record<string, unknown> | null {
+  const own = getApplicantDetailsOverrides(instanceId);
+  if (hasScheduleConstraintInDetails(own)) return own;
+  if (instanceId !== 0) {
+    const z = getApplicantDetailsOverrides(0);
+    if (hasScheduleConstraintInDetails(z)) return z;
+  } else {
+    const one = getApplicantDetailsOverrides(1);
+    if (hasScheduleConstraintInDetails(one)) return one;
+  }
+  return own;
+}
+
+/**
+ * Allowed dates for calendar filtering / fast-path checks.
+ * @param instanceId Bot instance (1-based in cluster); defaults to {@link getCurrentInstanceId}, then `BOT_INSTANCE_ID`, then 0.
+ */
+export function getScheduleAllowedDates(instanceId?: number): Set<string> | null {
+  let id = instanceId;
+  if (id === undefined) {
+    id = getCurrentInstanceId();
+  }
+  if (id === undefined) {
+    const fromEnv = parseInt(process.env.BOT_INSTANCE_ID ?? "", 10);
+    id = Number.isFinite(fromEnv) && fromEnv >= 1 ? fromEnv : 0;
+  }
+  const d = detailsForScheduleLookup(id);
+  const startRaw = d?.scheduleDateRangeStart;
+  const endRaw = d?.scheduleDateRangeEnd;
+  const start = typeof startRaw === "string" ? startRaw.trim() : "";
+  const end = typeof endRaw === "string" ? endRaw.trim() : "";
+  if (start && end) {
+    const fromRange = expandInclusiveIsoDateRangeToSet(start, end);
+    if (fromRange && fromRange.size > 0) return fromRange;
+  }
   const parsed = normalizeAllowedDatesFromStorage(d?.scheduleAllowedDates);
   if (parsed.length === 0) return null;
   return new Set(parsed);
+}
+
+/** Inclusive UTC calendar days; swaps if start > end; invalid ISO → null. */
+export function expandInclusiveIsoDateRangeToSet(startIso: string, endIso: string): Set<string> | null {
+  let t0 = parseIsoDateUtc(startIso);
+  let t1 = parseIsoDateUtc(endIso);
+  if (t0 == null || t1 == null) return null;
+  if (t0 > t1) [t0, t1] = [t1, t0];
+  const out = new Set<string>();
+  const dayMs = 86_400_000;
+  for (let t = t0; t <= t1; t += dayMs) {
+    out.add(formatUtcYmd(t));
+  }
+  return out;
+}
+
+function formatUtcYmd(utcMs: number): string {
+  const d = new Date(utcMs);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(d.getUTCDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
 }
 
 function normalizeAllowedDatesFromStorage(raw: unknown): string[] {

@@ -2,7 +2,7 @@ import dotenv from "dotenv";
 dotenv.config({ override: true });
 import { spawn, ChildProcess } from "node:child_process";
 import { logger } from "./utils/logger";
-import { runApplicantFormWithSubmitHandler, applicantUiPort } from "./ui/applicantDetailsFormServer";
+import { runApplicantFormWithSubmitHandler } from "./ui/applicantDetailsFormServer";
 import { setSessionLoginCredentials } from "./utils/sessionLogin.store";
 import { setApplicantDetailsOverrides } from "./utils/applicantDetails.store";
 

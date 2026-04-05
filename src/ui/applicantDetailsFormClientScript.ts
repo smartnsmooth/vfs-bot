@@ -51,84 +51,24 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
   }
 
   let autoSaveTimeout = null;
-  let scheduleDatesUserEdited = false;
+  let scheduleRangeUserEdited = false;
 
-  function getScheduleAllowedDatesTextarea() {
-    return document.getElementById("scheduleAllowedDatesHidden");
+  function getScheduleRangeStartEl() {
+    return document.getElementById("scheduleDateRangeStart");
   }
 
-  function parseScheduleAllowedDatesHidden(raw) {
-    const s = String(raw || "").trim();
-    if (!s) return [];
-    const isoRe = /^\\d{4}-\\d{2}-\\d{2}$/;
-    const tokens = s.split(/[|\\s,;]+/).map(function (t) {
-      return t.trim();
-    }).filter(Boolean);
-    return Array.from(new Set(tokens.filter(function (x) {
-      return isoRe.test(x);
-    }))).sort();
+  function getScheduleRangeEndEl() {
+    return document.getElementById("scheduleDateRangeEnd");
   }
 
-  function renderScheduleAllowedDateChips() {
-    const hidden = getScheduleAllowedDatesTextarea();
-    const box = document.getElementById("scheduleAllowedDatesChips");
-    if (!hidden || !box) return;
-    const dates = parseScheduleAllowedDatesHidden(hidden.value);
-    box.innerHTML = "";
-    for (let i = 0; i < dates.length; i++) {
-      const iso = dates[i];
-      const chip = document.createElement("span");
-      chip.className = "date-chip";
-      const lab = document.createElement("span");
-      lab.textContent = iso;
-      const rm = document.createElement("button");
-      rm.type = "button";
-      rm.className = "date-chip-remove";
-      rm.setAttribute("aria-label", "Remove " + iso);
-      rm.textContent = "×";
-      rm.addEventListener("click", function () {
-        scheduleDatesUserEdited = true;
-        const next = parseScheduleAllowedDatesHidden(hidden.value).filter(function (d) {
-          return d !== iso;
-        });
-        hidden.value = next.join("|");
-        renderScheduleAllowedDateChips();
-        if (isMultiInstance) scheduleAutoSave();
-      });
-      chip.appendChild(lab);
-      chip.appendChild(rm);
-      box.appendChild(chip);
-    }
-  }
-
-  function addPickedScheduleDate() {
-    const pick = document.getElementById("scheduleDatePicker");
-    const hidden = getScheduleAllowedDatesTextarea();
-    if (!hidden) return;
-    const iso = pick && pick.value ? pick.value.trim() : "";
-    if (!iso) return;
-    scheduleDatesUserEdited = true;
-    const merged = new Set(parseScheduleAllowedDatesHidden(hidden.value));
-    merged.add(iso);
-    hidden.value = Array.from(merged).sort().join("|");
-    renderScheduleAllowedDateChips();
-    if (isMultiInstance) scheduleAutoSave();
-  }
-
-  function queueAddPickedScheduleDateFromPicker() {
-    const pick = document.getElementById("scheduleDatePicker");
-    if (!pick) return;
-    window.setTimeout(function () {
-      addPickedScheduleDate();
-    }, 0);
-  }
-
-  function clearAllScheduleAllowedDates() {
-    scheduleDatesUserEdited = true;
-    const hidden = getScheduleAllowedDatesTextarea();
-    if (hidden) hidden.value = "";
-    renderScheduleAllowedDateChips();
-    if (isMultiInstance) scheduleAutoSave();
+  function applyInstanceScheduleRangeToForm(details) {
+    if (scheduleRangeUserEdited) return;
+    const sEl = getScheduleRangeStartEl();
+    const eEl = getScheduleRangeEndEl();
+    if (!sEl || !eEl) return;
+    const d = details || {};
+    sEl.value = d.scheduleDateRangeStart != null ? String(d.scheduleDateRangeStart).trim().slice(0, 10) : "";
+    eEl.value = d.scheduleDateRangeEnd != null ? String(d.scheduleDateRangeEnd).trim().slice(0, 10) : "";
   }
 
   async function loadDefaults() {
@@ -139,11 +79,13 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
     const skipDefaultIds = { numInstances: true, instanceId: true };
     for (const k of Object.keys(a)) {
       if (skipDefaultIds[k]) continue;
-      if (k === "scheduleAllowedDates" && scheduleDatesUserEdited) continue;
-      const el =
-        k === "scheduleAllowedDates"
-          ? getScheduleAllowedDatesTextarea()
-          : document.getElementById(k);
+      if ((k === "scheduleDateRangeStart" || k === "scheduleDateRangeEnd") && scheduleRangeUserEdited) continue;
+      if (k === "scheduleDateRangeStart" || k === "scheduleDateRangeEnd") {
+        const el = document.getElementById(k);
+        if (el) el.value = a[k] == null ? "" : String(a[k]).trim().slice(0, 10);
+        continue;
+      }
+      const el = document.getElementById(k);
       if (el) el.value = a[k] == null ? "" : String(a[k]);
     }
     if (collectLogin && d.loginDefaults && d.loginDefaults.vfsUsername) {
@@ -162,7 +104,6 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
       const p2 = document.getElementById("vfsPassword2");
       if (p2) p2.value = String(d.loginDefaults.vfsPassword2 ?? "");
     }
-    renderScheduleAllowedDateChips();
   }
 
   async function loadInstanceData(showAlert) {
@@ -188,14 +129,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
         if (p2El) p2El.value = "";
       }
       const fieldsToClear = [
-        "firstName",
-        "lastName",
-        "emailId",
-        "dialCode",
-        "contactNumber",
-        "dateOfBirth",
-        "passportNumber",
         "passportExpirtyDate",
+        "nationalityCode",
         "vacCode",
         "selectedSubvisaCategory",
         "vacCode2",
@@ -207,13 +142,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
       }
       const genderEl = document.getElementById("gender");
       if (genderEl) genderEl.value = "1";
-      const g0empty = data.instances["0"] && data.instances["0"].details ? data.instances["0"].details : {};
-      const ta0 = getScheduleAllowedDatesTextarea();
-      if (ta0 && !scheduleDatesUserEdited) {
-        ta0.value =
-          g0empty.scheduleAllowedDates != null ? String(g0empty.scheduleAllowedDates) : "";
-      }
-      renderScheduleAllowedDateChips();
+      applyInstanceScheduleRangeToForm({});
       return;
     }
 
@@ -228,14 +157,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
       if (p2El) p2El.value = "";
     }
     const allFields = [
-      "firstName",
-      "lastName",
-      "emailId",
-      "dialCode",
-      "contactNumber",
-      "dateOfBirth",
-      "passportNumber",
       "passportExpirtyDate",
+      "nationalityCode",
       "vacCode",
       "selectedSubvisaCategory",
       "vacCode2",
@@ -265,17 +188,12 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
       for (let ki = 0; ki < keys.length; ki++) {
         const k = keys[ki];
         if (skipDetailIds[k]) continue;
-        if (k === "scheduleAllowedDates") continue;
+        if (k === "scheduleDateRangeStart" || k === "scheduleDateRangeEnd" || k === "scheduleAllowedDates") continue;
         const el = document.getElementById(k);
         if (el) el.value = inst.details[k] == null ? "" : String(inst.details[k]);
       }
     }
-    const g0 = data.instances["0"] && data.instances["0"].details ? data.instances["0"].details : {};
-    const ta = getScheduleAllowedDatesTextarea();
-    if (ta && !scheduleDatesUserEdited) {
-      ta.value = g0.scheduleAllowedDates != null ? String(g0.scheduleAllowedDates) : "";
-    }
-    renderScheduleAllowedDateChips();
+    applyInstanceScheduleRangeToForm(inst.details || {});
 
     if (showAlert) {
       alert("Loaded saved data for Instance " + instanceId);
@@ -286,21 +204,15 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
     const form = document.getElementById("f");
     const fd = new FormData(form);
     const body = {
-      firstName: String(fd.get("firstName") || "").toUpperCase(),
-      lastName: String(fd.get("lastName") || "").toUpperCase(),
-      emailId: String(fd.get("emailId") || "").toUpperCase(),
-      dialCode: fd.get("dialCode"),
-      contactNumber: fd.get("contactNumber"),
-      dateOfBirth: fd.get("dateOfBirth"),
-      passportNumber: String(fd.get("passportNumber") || "").toUpperCase(),
       passportExpirtyDate: fd.get("passportExpirtyDate"),
-      nationalityCode: "IND",
+      nationalityCode: String(fd.get("nationalityCode") || "").trim().toUpperCase(),
       vacCode: fd.get("vacCode"),
       gender: parseInt(String(fd.get("gender") || "1"), 10),
       selectedSubvisaCategory: fd.get("selectedSubvisaCategory"),
       vacCode2: fd.get("vacCode2") || undefined,
       selectedSubvisaCategory2: fd.get("selectedSubvisaCategory2") || undefined,
-      scheduleAllowedDates: String(fd.get("scheduleAllowedDates") ?? ""),
+      scheduleDateRangeStart: String(fd.get("scheduleDateRangeStart") ?? "").trim(),
+      scheduleDateRangeEnd: String(fd.get("scheduleDateRangeEnd") ?? "").trim(),
       numInstances: getNumInstances(),
     };
     if (isMultiInstance) {
@@ -357,23 +269,6 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
     }, 1000);
   }
 
-  function wireScheduleAllowedDatesUi() {
-    const scheduleAddBtn = document.getElementById("scheduleDateAddBtn");
-    const schedulePicker = document.getElementById("scheduleDatePicker");
-    const scheduleClearBtn = document.getElementById("scheduleDatesClearBtn");
-    if (scheduleAddBtn) {
-      scheduleAddBtn.addEventListener("click", function (ev) {
-        ev.preventDefault();
-        addPickedScheduleDate();
-      });
-    }
-    if (schedulePicker) {
-      schedulePicker.addEventListener("change", queueAddPickedScheduleDateFromPicker);
-      schedulePicker.addEventListener("input", queueAddPickedScheduleDateFromPicker);
-    }
-    if (scheduleClearBtn) scheduleClearBtn.addEventListener("click", clearAllScheduleAllowedDates);
-  }
-
   async function initApplicantForm() {
     try {
       // Wire the numInstances input to update the instance selector in real-time.
@@ -387,7 +282,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
           updateInstanceSelector();
           // After rebuilding the selector, load data for the now-selected instance.
           if (isMultiInstance) {
-            scheduleDatesUserEdited = false;
+            scheduleRangeUserEdited = false;
             loadInstanceData(false);
           } else {
             loadDefaults();
@@ -404,7 +299,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
       const instanceIdSelect = document.getElementById("instanceId");
       if (instanceIdSelect) {
         instanceIdSelect.addEventListener("change", function () {
-          scheduleDatesUserEdited = false;
+          scheduleRangeUserEdited = false;
           loadInstanceData(false);
         });
       }
@@ -429,22 +324,36 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
     }
   }
 
-  wireScheduleAllowedDatesUi();
+  (function wireScheduleRangeInputs() {
+    const s = getScheduleRangeStartEl();
+    const e = getScheduleRangeEndEl();
+    function markEdited() {
+      scheduleRangeUserEdited = true;
+      if (isMultiInstance) scheduleAutoSave();
+    }
+    if (s) {
+      s.addEventListener("change", markEdited);
+      s.addEventListener("input", markEdited);
+    }
+    if (e) {
+      e.addEventListener("change", markEdited);
+      e.addEventListener("input", markEdited);
+    }
+  })();
   void initApplicantForm();
 
-  const capitalizeFields = ["firstName", "lastName", "emailId", "passportNumber"];
-  for (let ci = 0; ci < capitalizeFields.length; ci++) {
-    const fieldId = capitalizeFields[ci];
-    const el = document.getElementById(fieldId);
-    if (el) {
-      el.addEventListener("input", function (e) {
-        const start = e.target.selectionStart;
-        const end = e.target.selectionEnd;
-        e.target.value = e.target.value.toUpperCase();
-        e.target.setSelectionRange(start, end);
-      });
-    }
-  }
+  (function wireNationalityUppercase() {
+    const el = document.getElementById("nationalityCode");
+    if (!el) return;
+    el.addEventListener("input", function (e) {
+      const t = e.target;
+      if (!(t instanceof HTMLInputElement)) return;
+      const start = t.selectionStart;
+      const end = t.selectionEnd;
+      t.value = t.value.toUpperCase().replace(/[^A-Z]/g, "").slice(0, 3);
+      if (start != null && end != null) t.setSelectionRange(start, end);
+    });
+  })();
 
   document.getElementById("f").addEventListener("submit", async function (e) {
     e.preventDefault();
@@ -452,21 +361,15 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
     msg.textContent = "";
     const fd = new FormData(e.target);
     const body = {
-      firstName: String(fd.get("firstName") || "").toUpperCase(),
-      lastName: String(fd.get("lastName") || "").toUpperCase(),
-      emailId: String(fd.get("emailId") || "").toUpperCase(),
-      dialCode: fd.get("dialCode"),
-      contactNumber: fd.get("contactNumber"),
-      dateOfBirth: fd.get("dateOfBirth"),
-      passportNumber: String(fd.get("passportNumber") || "").toUpperCase(),
       passportExpirtyDate: fd.get("passportExpirtyDate"),
-      nationalityCode: "IND",
+      nationalityCode: String(fd.get("nationalityCode") || "").trim().toUpperCase(),
       vacCode: fd.get("vacCode"),
       gender: parseInt(String(fd.get("gender") || "1"), 10),
       selectedSubvisaCategory: fd.get("selectedSubvisaCategory"),
       vacCode2: fd.get("vacCode2") || undefined,
       selectedSubvisaCategory2: fd.get("selectedSubvisaCategory2") || undefined,
-      scheduleAllowedDates: String(fd.get("scheduleAllowedDates") ?? ""),
+      scheduleDateRangeStart: String(fd.get("scheduleDateRangeStart") ?? "").trim(),
+      scheduleDateRangeEnd: String(fd.get("scheduleDateRangeEnd") ?? "").trim(),
       numInstances: getNumInstances(),
     };
     if (isMultiInstance) {

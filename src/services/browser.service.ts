@@ -43,9 +43,52 @@ import {
 } from "./mailTm.service";
 import { TelegramService } from "./telegram.service";
 import { TurnstileService, type TurnstileSolveOptions } from "./turnstile.service";
+import type { VfsUserLoginResponse } from "../types/vfsUserLogin.type.js";
+import {
+  flattenVfsLoginResponseForProfile,
+  parseVfsUserLoginResponseBody,
+  stripPasswordStepApplicantFieldsForProfileMerge,
+} from "../types/vfsUserLogin.type.js";
+import { clearVfsLoginProfile, mergeVfsLoginProfile } from "../utils/vfsLoginProfile.store.js";
 
 /** Sniff `clientsource` on any request to this host that sends the header (not only `/application`). */
 const LIFT_API_HOST_MARKER = "lift-api.vfsglobal.com";
+
+/** Confirmed VFS lift-api login endpoint (password and OTP steps both POST here; we match on response URL + POST, not request body). */
+const VFS_LIFT_USER_LOGIN_URL = "https://lift-api.vfsglobal.com/user/login";
+
+function normalizeLiftLoginPathname(pathname: string): string {
+  const p = pathname.replace(/\/+$/, "") || "/";
+  return p.toLowerCase();
+}
+
+/**
+ * Match the lift-api login **response** (browser form submit / fetch often leaves `request.postData()` empty).
+ * Use this in `waitForResponse` / `page.on("response")` to capture JSON for profile merge.
+ */
+function responseIsLiftUserLoginPost(res: import("playwright").Response): boolean {
+  const req = res.request();
+  if (req.method() !== "POST") return false;
+  let u: URL;
+  try {
+    u = new URL(res.url());
+  } catch {
+    return false;
+  }
+  if (u.hostname.toLowerCase() !== "lift-api.vfsglobal.com") return false;
+  return normalizeLiftLoginPathname(u.pathname) === "/user/login";
+}
+
+export type PostOtpLoginCapture = {
+  status: number;
+  url: string;
+  body: string;
+  /** Set when `body` is valid JSON object (parse errors → null). */
+  json: VfsUserLoginResponse | null;
+};
+
+/** Re-export for callers that depended on browser.service for the login JSON shape. */
+export type { VfsUserLoginResponse } from "../types/vfsUserLogin.type.js";
 
 function readClientSourceHeader(headers: Record<string, string>): string | undefined {
   const raw =
@@ -75,6 +118,13 @@ export class BrowserService {
   /** Managed Turnstile metadata captured from network/DOM (best-effort). */
   private capturedTurnstileAction: string | null = null;
   private capturedTurnstileCData: string | null = null;
+  /** Set when the bot performs the second Sign In after OTP (auto flow); see {@link getLastPostOtpLoginResponse}. */
+  private lastPostOtpLoginResponse: PostOtpLoginCapture | null = null;
+
+  /** Response body from the login API call after OTP submit (empty until a login completes that path). */
+  getLastPostOtpLoginResponse(): PostOtpLoginCapture | null {
+    return this.lastPostOtpLoginResponse;
+  }
 
   private getTurnstile(): TurnstileService | null {
     if (!config.capmonsterEnabled || !config.capmonsterApiKey) return null;
@@ -458,6 +508,8 @@ export class BrowserService {
    * Run login on the first tab (must be on login page): fill credentials, Turnstile, submit.
    */
   async loginOnFirstTab(username: string, password: string): Promise<void> {
+    this.lastPostOtpLoginResponse = null;
+    clearVfsLoginProfile();
     const browser = await this.ensureBrowser();
     const context = browser.contexts()[0];
     if (!context) throw new Error("No browser context");
@@ -523,11 +575,46 @@ export class BrowserService {
       );
     }
 
+    const passwordLoginResponsePromise = page
+      .waitForResponse(
+        (res) => {
+          try {
+            return responseIsLiftUserLoginPost(res);
+          } catch {
+            return false;
+          }
+        },
+        { timeout: 90_000 }
+      )
+      .catch((err) => {
+        logger.debug({ err: String(err) }, "[Login] Password-step /user/login waiter finished without a match");
+        return null;
+      });
+
     // Optimized: Submit immediately without unnecessary waits
     await this.submitLoginImmediately(page, submitBtn, {
       waitForManualTurnstile,
       loginRefill: { username, password, usernameSelectors, passwordSelectors },
     });
+
+    const pwdLoginRes = await passwordLoginResponsePromise;
+    if (pwdLoginRes) {
+      const pwdBody = await pwdLoginRes.text().catch(() => "");
+      const pwdJson = parseVfsUserLoginResponseBody(pwdBody);
+      if (pwdJson) {
+        const flat = flattenVfsLoginResponseForProfile(pwdJson);
+        const forStore = stripPasswordStepApplicantFieldsForProfileMerge(flat);
+        if (forStore) mergeVfsLoginProfile(forStore);
+        logger.info(
+          {
+            status: pwdLoginRes.status(),
+            loginUser: pwdJson.loginUser,
+            isAuthenticated: pwdJson.isAuthenticated,
+          },
+          "[Login] Merged password-step /user/login (session flags only — applicant fields come from OTP step)"
+        );
+      }
+    }
 
     if (mailTmReady) {
       const signInEpochMs = Date.now();
@@ -552,6 +639,12 @@ export class BrowserService {
   async waitForLiftClientSourceIfNeeded(): Promise<void> {
     if (config.liftApiClientSource?.trim()) {
       logger.info("clientsource: using VFS_CLIENTSOURCE from env (skip wait)");
+      return;
+    }
+    if (config.randomClientSource) {
+      logger.info(
+        "clientsource: VFS_RANDOM_CLIENTSOURCE=true — slot/lift fetches inject a fresh token per call (skip capture wait)"
+      );
       return;
     }
     if (getCapturedClientSource()?.trim()) {
@@ -697,7 +790,7 @@ export class BrowserService {
     }
   }
 
-  /** Call when a slot is found (uses current VFS tab). Also used after dashboard is shown. */
+  /** Call when a slot is found (uses current VFS tab). */
   async saveApplicantsViaLiftApi(): Promise<void> {
     await this.waitForLiftClientSourceIfNeeded();
     const page = await this.getVfsPage();
@@ -797,6 +890,7 @@ export class BrowserService {
 
   private async saveApplicantsViaLiftApiOnPage(page: Page): Promise<void> {
     await page.waitForTimeout(500);
+    await ensureApplicantIpResolved(page);
     const body = buildSaveApplicantsBody();
     logger.info({ url: SAVE_APPLICANTS_URL }, "Saving applicant via lift-api");
     const beforeCfClearance = await this.getLiftApiCfClearanceValue(page);
@@ -2117,7 +2211,144 @@ export class BrowserService {
     }
 
     logger.info("[OTP] Clicking Sign In...");
-    await this.forceClickSignInButton(page, submitBtn);
+    const dash = this.dashboardUrlRegex();
+    const OTP_LOGIN_CAPTURE_MS = 120_000;
+    /** After dashboard navigation, keep sniffing briefly — the `/user/login` response can follow the route change. */
+    const OTP_LOGIN_POST_DASHBOARD_GRACE_MS = 3000;
+
+    /** Ref: TS does not see assignments that happen only inside `page.on("response")` handlers. */
+    const otpLoginCapture: { res: import("playwright").Response | null } = { res: null };
+    let waitResolved = false;
+    let resolvedViaDashboard = false;
+    let responseDetachTimer: ReturnType<typeof setTimeout> | undefined;
+    let timeoutId: ReturnType<typeof setTimeout> | undefined;
+
+    const detachResponseListener = () => {
+      if (responseDetachTimer !== undefined) {
+        clearTimeout(responseDetachTimer);
+        responseDetachTimer = undefined;
+      }
+      page.off("response", onResponse);
+    };
+
+    const resolveOtpWait = () => {
+      if (waitResolved) return;
+      waitResolved = true;
+      if (timeoutId !== undefined) {
+        clearTimeout(timeoutId);
+        timeoutId = undefined;
+      }
+      page.off("framenavigated", onFrameNav);
+      outerResolveOtpCapture?.();
+    };
+
+    const finishOtpCaptureFull = () => {
+      detachResponseListener();
+      resolveOtpWait();
+    };
+
+    const onResponse = (res: import("playwright").Response) => {
+      try {
+        if (!responseIsLiftUserLoginPost(res)) return;
+        otpLoginCapture.res = res;
+        if (!waitResolved) {
+          finishOtpCaptureFull();
+        }
+      } catch {
+        /* ignore */
+      }
+    };
+
+    const onFrameNav = (frame: import("playwright").Frame) => {
+      if (waitResolved) return;
+      if (frame !== page.mainFrame()) return;
+      try {
+        if (!dash.test(frame.url())) return;
+        resolvedViaDashboard = true;
+        if (timeoutId !== undefined) {
+          clearTimeout(timeoutId);
+          timeoutId = undefined;
+        }
+        page.off("framenavigated", onFrameNav);
+        resolveOtpWait();
+        responseDetachTimer = setTimeout(() => {
+          detachResponseListener();
+        }, OTP_LOGIN_POST_DASHBOARD_GRACE_MS);
+      } catch {
+        /* ignore */
+      }
+    };
+
+    let outerResolveOtpCapture: (() => void) | undefined;
+    const waitForOtpCaptureDone = new Promise<void>((resolve) => {
+      outerResolveOtpCapture = resolve;
+      timeoutId = setTimeout(() => {
+        if (waitResolved) return;
+        finishOtpCaptureFull();
+      }, OTP_LOGIN_CAPTURE_MS);
+      page.on("response", onResponse);
+      page.on("framenavigated", onFrameNav);
+    });
+
+    try {
+      await this.forceClickSignInButton(page, submitBtn);
+    } catch (err) {
+      finishOtpCaptureFull();
+      throw err;
+    }
+    await waitForOtpCaptureDone;
+
+    let capturedOtpLogin = otpLoginCapture.res;
+    if (!capturedOtpLogin && resolvedViaDashboard) {
+      await page.waitForTimeout(OTP_LOGIN_POST_DASHBOARD_GRACE_MS);
+      capturedOtpLogin = otpLoginCapture.res;
+    }
+    detachResponseListener();
+
+    let onDashboard = false;
+    try {
+      onDashboard = dash.test(page.url());
+    } catch {
+      /* ignore */
+    }
+
+    if (capturedOtpLogin) {
+      const body = await capturedOtpLogin.text().catch(() => "");
+      const json = parseVfsUserLoginResponseBody(body);
+      this.lastPostOtpLoginResponse = {
+        status: capturedOtpLogin.status(),
+        url: capturedOtpLogin.url(),
+        body,
+        json,
+      };
+      if (json) {
+        const flat = flattenVfsLoginResponseForProfile(json);
+        if (flat) mergeVfsLoginProfile(flat);
+      }
+      logger.info(
+        {
+          status: this.lastPostOtpLoginResponse.status,
+          url: this.lastPostOtpLoginResponse.url,
+          bodyLength: body.length,
+          isAuthenticated: json?.isAuthenticated,
+          loginUser: json?.loginUser,
+          accessTokenLength: json?.accessToken?.length,
+          error: json?.error,
+          bodyPreview: body.slice(0, 500),
+        },
+        "[Login] Captured POST lift-api /user/login response after OTP (2nd Sign In)"
+      );
+    } else if (onDashboard) {
+      logger.info(
+        { expectedUrl: VFS_LIFT_USER_LOGIN_URL },
+        "[Login] On dashboard after OTP but no lift-api POST /user/login response captured (merge may use other sources)."
+      );
+    } else {
+      logger.warn(
+        { expectedUrl: VFS_LIFT_USER_LOGIN_URL },
+        "[Login] Could not capture lift-api POST /user/login response after OTP (timeout or no matching response)."
+      );
+    }
   }
 
   private async finishLoginAfterFirstSubmit(

@@ -50,7 +50,9 @@ export const config = {
   slotEndpoint: process.env.VFS_SLOT_ENDPOINT ?? "https://lift-api.vfsglobal.com/appointment/CheckIsSlotAvailable",
   /** Slot check + save applicants / calendar / timeslot / fees / schedule (same center & category). */
   slotPayload: {
-    countryCode: process.env.VFS_SLOT_COUNTRY_CODE ?? process.env.VFS_SLOT_COUNTRY ?? "ind",
+    countryCode: (process.env.VFS_SLOT_COUNTRY_CODE ?? process.env.VFS_SLOT_COUNTRY ?? "ind")
+      .trim()
+      .toLowerCase() || "ind",
     /** From setup form session when UI was used; otherwise `VFS_USERNAME`. */
     get loginUser() {
       return resolvedSlotPayloadLoginUser();
@@ -118,8 +120,8 @@ export const config = {
   })(),
 
   /**
-   * When two VFS accounts are saved and poll relogin runs: after logout, kill Chrome, advance `PROXY_URLS`
-   * selection for this profile, spawn a fresh browser, then log in with the next credential.
+   * When two VFS accounts are saved and poll relogin runs: after logout, kill Chrome, spawn a fresh browser
+   * (each launch advances `PROXY_URLS` cyclically for that profile), then log in with the next credential.
    * Set `VFS_CREDENTIAL_SWAP_BROWSER_RESTART=false` to keep logout→login in the same Chrome window.
    */
   get credentialSwapBrowserRestart(): boolean {

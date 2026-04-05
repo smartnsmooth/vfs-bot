@@ -3,6 +3,8 @@ import { getApplicantDetailsOverrides } from "../utils/applicantDetails.store";
 import { getApplicantIpForPayload } from "../utils/applicantIp";
 import { getEffectiveLiftLoginUser } from "../utils/liftLoginUser";
 import { getSlotCenterOverride } from "../utils/slotCenterOverride.store";
+import { getVfsLoginProfile } from "../utils/vfsLoginProfile.store.js";
+import { looksLikeEmailForVfsLogin } from "../types/vfsUserLogin.type.js";
 
 export const SAVE_APPLICANTS_URL =
   process.env.VFS_SAVE_APPLICANTS_URL ?? "https://lift-api.vfsglobal.com/appointment/applicants";
@@ -95,6 +97,8 @@ const SAVE_APPLICANTS_APPLICANT_KEY_ORDER: readonly string[] = [
   "Retryleft",
   "visaSubClass",
   "ipAddress",
+  "applicantImage",
+  "applicantImageData",
 ];
 
 function orderObjectKeys(obj: Record<string, unknown>, order: readonly string[]): Record<string, unknown> {
@@ -115,8 +119,26 @@ function orderObjectKeys(obj: Record<string, unknown>, order: readonly string[])
   return out;
 }
 
+/** lift-api (ind/bgr): root `countryCode` is lowercase (`ind`); applicant `nationalityCode` is uppercase (`IND`). */
+function applyLiftApplicantsCountryNationalityCasing(body: Record<string, unknown>): void {
+  const cc = body.countryCode;
+  if (typeof cc === "string" && cc.trim() !== "") {
+    body.countryCode = cc.trim().toLowerCase();
+  }
+  const list = body.applicantList;
+  if (!Array.isArray(list) || list.length === 0) return;
+  const first = list[0];
+  if (typeof first !== "object" || first === null) return;
+  const a = first as Record<string, unknown>;
+  const nc = a.nationalityCode;
+  if (typeof nc === "string" && nc.trim() !== "") {
+    a.nationalityCode = nc.trim().toUpperCase();
+  }
+}
+
 /** Reorders root + `applicantList[0]` so `JSON.stringify` matches lift-api success shape (merges can append keys). */
 function normalizeSaveApplicantsBody(body: Record<string, unknown>): Record<string, unknown> {
+  applyLiftApplicantsCountryNationalityCasing(body);
   const list = body.applicantList;
   if (!Array.isArray(list) || list.length === 0 || typeof list[0] !== "object" || list[0] === null) {
     return orderObjectKeys(body, SAVE_APPLICANTS_ROOT_KEY_ORDER);
@@ -145,10 +167,18 @@ function applyForcedApplicantNullFieldsFromEnv(body: Record<string, unknown>): v
 }
 
 /** Setup-form / bot-only fields merged into `applicantList[0]` — not part of lift-api save-applicants body. */
-const APPLICANT_UI_ONLY_KEYS = ["scheduleAllowedDates", "vacCode", "vacCode2"] as const;
+const APPLICANT_UI_ONLY_KEYS = [
+  "scheduleAllowedDates",
+  "scheduleDateRangeStart",
+  "scheduleDateRangeEnd",
+  "vacCode",
+  "vacCode2",
+] as const;
 
 /**
- * Match browser-captured lift-api shape: drop UI-only keys; ensure `visaSubClass` (often null) before `ipAddress`.
+ * Match browser-captured lift-api shape: drop UI-only keys; ensure `visaSubClass` (often null);
+ * lift-api may require `applicantImage` / `applicantImageData` keys (even empty), lowercase `emailId`,
+ * and strict JSON key order: `ipAddress` then `applicantImage` then `applicantImageData` (see SAVE_APPLICANTS_APPLICANT_KEY_ORDER).
  */
 function finalizeApplicantForLiftApiPost(body: Record<string, unknown>): void {
   const list = body.applicantList;
@@ -159,6 +189,75 @@ function finalizeApplicantForLiftApiPost(body: Record<string, unknown>): void {
   }
   if (!Object.prototype.hasOwnProperty.call(a, "visaSubClass")) {
     a.visaSubClass = null;
+  }
+  if (!Object.prototype.hasOwnProperty.call(a, "applicantImage")) {
+    a.applicantImage = "";
+  }
+  if (!Object.prototype.hasOwnProperty.call(a, "applicantImageData")) {
+    a.applicantImageData = "";
+  }
+  const em = a.emailId;
+  if (typeof em === "string" && em.trim() !== "") {
+    a.emailId = em.trim().toLowerCase();
+  }
+}
+
+/** Override applicant + root `loginUser` with 1:1 fields from last `POST /user/login` response (see vfsLoginProfile.store). */
+function mergeVfsLoginProfileIntoSaveApplicantsBody(body: Record<string, unknown>): void {
+  const p = getVfsLoginProfile();
+  if (!p) return;
+  const list = body.applicantList;
+  if (!Array.isArray(list) || !list[0] || typeof list[0] !== "object" || list[0] === null) return;
+  const a = list[0] as Record<string, unknown>;
+  const pr = p as Record<string, unknown>;
+
+  const setApplicant = (key: string, val: unknown): void => {
+    if (val === undefined || val === null) return;
+    if (typeof val === "string") {
+      const t = val.trim();
+      if (!t) return;
+      a[key] = t;
+      return;
+    }
+    a[key] = val;
+  };
+
+  setApplicant("firstName", p.firstName);
+  setApplicant("lastName", p.lastName);
+  setApplicant("middleName", pr.middleName);
+  setApplicant("salutation", pr.salutation);
+  setApplicant("dateOfBirth", p.dateOfBirth);
+  setApplicant("passportNumber", p.passportNumber);
+  setApplicant("passportExpirtyDate", pr.passportExpirtyDate);
+  setApplicant("dialCode", p.dialCode);
+  setApplicant("contactNumber", p.contactNumber);
+
+  const eid = typeof pr.emailId === "string" ? pr.emailId.trim() : "";
+  if (eid) {
+    a.emailId = eid.toLowerCase();
+  }
+
+  const nat = typeof pr.nationalityCode === "string" ? pr.nationalityCode.trim() : "";
+  if (nat) {
+    a.nationalityCode = nat.toUpperCase();
+  }
+
+  const g = pr.gender;
+  if (typeof g === "number" && Number.isFinite(g)) {
+    a.gender = g;
+  } else if (typeof g === "string" && g.trim()) {
+    const n = parseInt(g, 10);
+    if (Number.isFinite(n)) a.gender = n;
+  }
+
+  const lu = typeof p.loginUser === "string" ? p.loginUser.trim() : "";
+  if (lu) {
+    body.loginUser = lu;
+    a.loginUser = lu;
+    const hasEmail = typeof a.emailId === "string" && a.emailId.trim() !== "";
+    if (!hasEmail && looksLikeEmailForVfsLogin(lu)) {
+      a.emailId = lu.trim().toLowerCase();
+    }
   }
 }
 
@@ -180,7 +279,7 @@ export function buildSaveApplicantsBodyFromEnv(): Record<string, unknown> {
   }
 
   const loginUser = getEffectiveLiftLoginUser();
-  const countryCode = config.slotPayload.countryCode;
+  const countryCode = String(config.slotPayload.countryCode ?? "").trim().toLowerCase() || "ind";
   const missionCode = config.slotPayload.missionCode;
   
   // Use override if any instance found a slot, otherwise use config
@@ -213,9 +312,9 @@ export function buildSaveApplicantsBodyFromEnv(): Record<string, unknown> {
     confirmPassportNumber: null,
     passportExpirtyDate: process.env.VFS_APPLICANT_PASSPORT_EXP ?? "19/03/2027",
     dateOfBirth: process.env.VFS_APPLICANT_DOB ?? "09/03/1988",
-    emailId: (process.env.VFS_APPLICANT_EMAIL ?? "CONTACTME@GMAIL.COM").toUpperCase(),
+    emailId: (process.env.VFS_APPLICANT_EMAIL ?? "contactme@gmail.com").trim().toLowerCase(),
     employerEmailId: "",
-    nationalityCode: process.env.VFS_APPLICANT_NATIONALITY ?? "ALB",
+    nationalityCode: ((process.env.VFS_APPLICANT_NATIONALITY ?? "ALB").trim() || "ALB").toUpperCase(),
     state: null,
     city: null,
     isEndorsedChild: false,
@@ -255,6 +354,8 @@ export function buildSaveApplicantsBodyFromEnv(): Record<string, unknown> {
     Retryleft: "",
     visaSubClass: null,
     ipAddress: getApplicantIpForPayload(),
+    applicantImage: "",
+    applicantImageData: "",
   };
 
   // Root carries mission/center/visa; applicant must NOT duplicate those (browser capture for ind/bgr omits them).
@@ -282,13 +383,6 @@ export function getApplicantFormDefaults(): Record<string, string> {
   const list = body.applicantList as Record<string, unknown>[] | undefined;
   const a = list?.[0] ?? {};
   const keys = [
-    "firstName",
-    "lastName",
-    "emailId",
-    "contactNumber",
-    "dialCode",
-    "dateOfBirth",
-    "passportNumber",
     "passportExpirtyDate",
     "confirmPassportNumber",
     "nationalityCode",
@@ -330,6 +424,8 @@ export function buildSaveApplicantsBody(): Record<string, unknown> {
     }
     merged = clone;
   }
+
+  mergeVfsLoginProfileIntoSaveApplicantsBody(merged);
 
   applyForcedApplicantNullFieldsFromEnv(merged);
   finalizeApplicantForLiftApiPost(merged);

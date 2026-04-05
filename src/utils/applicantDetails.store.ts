@@ -8,13 +8,6 @@ import { loadInstancesFromDisk, saveInstancesToDisk } from "./instanceStorage";
 
 const instanceApplicantDetails = new Map<number, Record<string, unknown>>();
 
-const GLOBAL_SCHEDULE_KEY = "scheduleAllowedDates" as const;
-
-export function omitGlobalScheduleFields(fields: Record<string, unknown>): Record<string, unknown> {
-  const { scheduleAllowedDates: _s, ...rest } = fields;
-  return rest;
-}
-
 // Load from disk on module import
 const diskData = loadInstancesFromDisk();
 for (const [idStr, data] of Object.entries(diskData.instances)) {
@@ -53,23 +46,6 @@ function persistToDisk(): void {
   }
   
   saveInstancesToDisk({ instances });
-}
-
-/**
- * Merge allowed schedule dates into instance 0 (shared by all instances).
- * Raw body should include `scheduleAllowedDates` string (textarea) when updating.
- */
-export function mergeGlobalScheduleAllowedDatesFromPayload(j: Record<string, unknown>): void {
-  if (!(GLOBAL_SCHEDULE_KEY in j)) return;
-  const cur = instanceApplicantDetails.get(0) ?? {};
-  const next = { ...cur };
-  const v = j[GLOBAL_SCHEDULE_KEY];
-  next[GLOBAL_SCHEDULE_KEY] =
-    typeof v === "string" ? v : Array.isArray(v) ? v.map((x) => String(x)).join("\n") : "";
-  delete next.scheduleDateRangeStart;
-  delete next.scheduleDateRangeEnd;
-  instanceApplicantDetails.set(0, next);
-  persistToDisk();
 }
 
 export function setApplicantDetailsOverrides(fields: Record<string, unknown>, instanceId?: number): void {

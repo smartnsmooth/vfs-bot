@@ -1,5 +1,5 @@
 import { exec } from "node:child_process";
-import { createServer, IncomingMessage, ServerResponse } from "node:http";
+import { createServer, IncomingMessage, Server, ServerResponse } from "node:http";
 import { config } from "../config/config";
 import { getApplicantFormDefaults } from "../config/saveApplicants";
 import { logger } from "../utils/logger";
@@ -7,8 +7,6 @@ import {
   getApplicantDetailsOverrides,
   setApplicantDetailsOverrides,
   getAllInstanceApplicantDetails,
-  mergeGlobalScheduleAllowedDatesFromPayload,
-  omitGlobalScheduleFields,
 } from "../utils/applicantDetails.store";
 import { getSessionLoginCredentials, setSessionLoginCredentials, getAllInstanceCredentials } from "../utils/sessionLogin.store";
 import { buildApplicantFormPageScript } from "./applicantDetailsFormClientScript";
@@ -34,7 +32,7 @@ export function getApplicantFormServerOrigin(): string {
  */
 export function buildApplicantFormSubmitJsonForBot(collectLogin: boolean): Record<string, unknown> | null {
   const defaults = getApplicantFormDefaults();
-  const ov = getApplicantDetailsOverrides();
+  const ov = getApplicantDetailsOverrides(1) ?? getApplicantDetailsOverrides(0);
   const base: Record<string, unknown> = { ...defaults };
   if (ov) Object.assign(base, ov);
   const g = base.gender;
@@ -43,10 +41,11 @@ export function buildApplicantFormSubmitJsonForBot(collectLogin: boolean): Recor
   } else if (typeof g !== "number" || !Number.isFinite(g)) {
     base.gender = 2;
   }
-  const fn = base.firstName;
-  const ln = base.lastName;
-  const pp = base.passportNumber;
-  if (typeof fn !== "string" || !fn.trim() || typeof ln !== "string" || !ln.trim() || typeof pp !== "string" || !pp.trim()) {
+  const exp = base.passportExpirtyDate;
+  const vac = typeof base.vacCode === "string" ? base.vacCode.trim() : "";
+  const cat = typeof base.selectedSubvisaCategory === "string" ? base.selectedSubvisaCategory.trim() : "";
+  const nat = typeof base.nationalityCode === "string" ? base.nationalityCode.trim() : "";
+  if (typeof exp !== "string" || !exp.trim() || !vac || !cat || !nat) {
     return null;
   }
   if (collectLogin) {
@@ -155,14 +154,7 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
   const out: Record<string, unknown> = {};
   const str = (k: string) => (typeof j[k] === "string" ? (j[k] as string).trim() : j[k]);
   const keys = [
-    "firstName",
-    "lastName",
     "middleName",
-    "emailId",
-    "contactNumber",
-    "dialCode",
-    "dateOfBirth",
-    "passportNumber",
     "passportExpirtyDate",
     "confirmPassportNumber",
     "nationalityCode",
@@ -177,6 +169,17 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
     const v = str(k);
     if (v !== undefined && v !== null && String(v) !== "") out[k] = v;
   }
+  if (typeof out.nationalityCode === "string" && out.nationalityCode) {
+    out.nationalityCode = out.nationalityCode.toUpperCase();
+  }
+  if ("scheduleDateRangeStart" in j) {
+    const v = j.scheduleDateRangeStart;
+    if (typeof v === "string" && v.trim() !== "") out.scheduleDateRangeStart = v.trim();
+  }
+  if ("scheduleDateRangeEnd" in j) {
+    const v = j.scheduleDateRangeEnd;
+    if (typeof v === "string" && v.trim() !== "") out.scheduleDateRangeEnd = v.trim();
+  }
   if ("scheduleAllowedDates" in j) {
     const v = j.scheduleAllowedDates;
     out.scheduleAllowedDates =
@@ -187,9 +190,6 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
   } else if (typeof j.gender === "string" && j.gender.trim() !== "") {
     out.gender = parseInt(j.gender, 10);
   }
-  if (typeof out.emailId === "string") {
-    out.emailId = out.emailId.toUpperCase();
-  }
   return out;
 }
 
@@ -199,19 +199,14 @@ function buildPageHtml(collectLogin: boolean): string {
   const fastSkipCalendarUpTo =
     parseInt(process.env.FAST_SKIP_CALENDAR_UP_TO_INSTANCE ?? "5", 10) || 5;
 
-  /** Placed above instance selection so it reads as global, not per-instance. */
+  /** Per-instance date range row in the applicant column. */
   const scheduleAllowedDatesBlock = `
-  <fieldset style="border:1px solid #38444d;border-radius:8px;padding:1rem 1rem 0.25rem;margin:0 0 1.25rem">
-    <label for="scheduleDatePicker">Pick a date</label>
-    <div class="picker-row">
-      <input type="date" id="scheduleDatePicker" />
-      <button type="button" class="btn-inline" id="scheduleDateAddBtn">Add date</button>
-    </div>
-    <p class="hint" style="margin-top:0.75rem;margin-bottom:0.35rem">Selected dates</p>
-    <div id="scheduleAllowedDatesChips" class="date-chips" aria-live="polite"></div>
-    <button type="button" class="btn-secondary btn-inline" id="scheduleDatesClearBtn">Clear all</button>
-    <textarea name="scheduleAllowedDates" id="scheduleAllowedDatesHidden" class="sr-only" autocomplete="off" tabindex="-1" aria-hidden="true"></textarea>
-  </fieldset>`;
+  <div class="schedule-range-row" role="group" aria-label="Appointment date range">
+    <label for="scheduleDateRangeStart">From</label>
+    <input type="date" id="scheduleDateRangeStart" name="scheduleDateRangeStart" />
+    <label for="scheduleDateRangeEnd">To</label>
+    <input type="date" id="scheduleDateRangeEnd" name="scheduleDateRangeEnd" />
+  </div>`;
 
   const instanceSelectBlock = `
   <fieldset style="border:1px solid #38444d;border-radius:8px;padding:1rem 1rem 0.25rem;margin:0 0 1.25rem">
@@ -235,7 +230,7 @@ function buildPageHtml(collectLogin: boolean): string {
     <input id="vfsUsername" name="vfsUsername" type="email" autocomplete="username" />
     <label for="vfsPassword">Password</label>
     <input id="vfsPassword" name="vfsPassword" type="text" autocomplete="current-password" />
-    <p class="hint" style="margin-top:0.75rem">Second VFS account (optional). If both are set, the bot alternates: after each poll relogin it logs out, closes Chrome, picks the next entry in <code>PROXY_URLS</code>, opens a new browser, then logs in with the other account (unless <code>VFS_CREDENTIAL_SWAP_BROWSER_RESTART=false</code>).</p>
+    <p class="hint" style="margin-top:0.75rem">Second VFS account (optional). If both are set, the bot alternates: after each poll relogin it logs out, closes Chrome, opens a new browser (each Chrome launch uses the next <code>PROXY_URLS</code> entry for this profile), then logs in with the other account (unless <code>VFS_CREDENTIAL_SWAP_BROWSER_RESTART=false</code>).</p>
     <label for="vfsUsername2">Email / username (account 2)</label>
     <input id="vfsUsername2" name="vfsUsername2" type="email" autocomplete="off" />
     <label for="vfsPassword2">Password (account 2)</label>
@@ -291,6 +286,16 @@ function buildPageHtml(collectLogin: boolean): string {
       letter-spacing: 0.02em;
     }
     .col-sub { margin: 0 0 0.75rem; font-size: 0.82rem; color: #8b98a5; }
+    .schedule-range-row {
+      display: flex; flex-wrap: wrap; align-items: center; gap: 0.35rem 0.65rem;
+      margin: 0 0 0.85rem;
+    }
+    .schedule-range-row label {
+      display: inline; margin: 0; font-size: 0.85rem; color: #8b98a5; white-space: nowrap;
+    }
+    .schedule-range-row input[type="date"] {
+      width: auto; min-width: 10.25rem; max-width: 12rem; flex: 0 1 auto; margin-top: 0;
+    }
     .picker-row { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; margin-top: 0.25rem; }
     .picker-row input[type="date"] { margin-top: 0; max-width: 11rem; flex: 1 1 auto; min-width: 0; }
     .form-actions { margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid #38444d; }
@@ -316,29 +321,17 @@ function buildPageHtml(collectLogin: boolean): string {
   <form id="f">
     <div class="form-layout">
       <div class="form-col form-col--setup">
-        ${scheduleAllowedDatesBlock}
         ${instanceSelectBlock}
         ${loginBlock}
       </div>
       <div class="form-col form-col--details">
         <h2 class="col-heading">Applicant details</h2>
-        <p class="col-sub">Passport, contact, and visa centre / category for save-applicants.</p>
-        <div class="row2">
-          <div><label for="firstName">First name</label><input id="firstName" name="firstName" autocomplete="given-name" /></div>
-          <div><label for="lastName">Last name</label><input id="lastName" name="lastName" autocomplete="family-name" /></div>
-        </div>
-        <label for="emailId">Email</label>
-        <input id="emailId" name="emailId" type="email" autocomplete="email" />
-        <div class="row2">
-          <div><label for="dialCode">Dial code</label><input id="dialCode" name="dialCode" /></div>
-          <div><label for="contactNumber">Phone</label><input id="contactNumber" name="contactNumber" /></div>
-        </div>
-        <label for="dateOfBirth">Date of birth (DD/MM/YYYY)</label>
-        <input id="dateOfBirth" name="dateOfBirth" placeholder="09/03/1988" />
-        <div class="row2">
-          <div><label for="passportNumber">Passport number</label><input id="passportNumber" name="passportNumber" /></div>
-          <div><label for="passportExpirtyDate">Passport expiry (DD/MM/YYYY)</label><input id="passportExpirtyDate" name="passportExpirtyDate" /></div>
-        </div>
+        <p class="col-sub">Passport expiry, nationality, gender, and visa centre / category. Name, email, phone, DOB, and passport number come from the VFS login response after sign-in.</p>
+        ${scheduleAllowedDatesBlock}
+        <label for="passportExpirtyDate">Passport expiry (DD/MM/YYYY)</label>
+        <input id="passportExpirtyDate" name="passportExpirtyDate" placeholder="23/04/2027" />
+        <label for="nationalityCode">Nationality (ISO 3166-1 alpha-3, e.g. IND, USA, GBR)</label>
+        <input id="nationalityCode" name="nationalityCode" maxlength="3" autocapitalize="characters" autocomplete="off" placeholder="IND" />
         <label for="gender">Gender</label>
         <select id="gender" name="gender">
           <option value="1">MALE</option>
@@ -423,6 +416,58 @@ export type ApplicantFormOptions = {
 
 export type FormSubmitInfo = { firstSubmit: boolean;[key: string]: unknown };
 
+function applicantUiPortFallbackAttempts(): number {
+  const n = parseInt(process.env.VFS_APPLICANT_UI_PORT_TRY ?? "20", 10);
+  return Number.isFinite(n) && n > 0 ? Math.min(100, n) : 20;
+}
+
+/** Try `server.listen(port)` once; rejects with `EADDRINUSE` when the port is taken. */
+function listenOnce(server: Server, port: number, host: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onError = (err: NodeJS.ErrnoException): void => {
+      server.removeListener("error", onError);
+      reject(err);
+    };
+    server.once("error", onError);
+    server.listen(port, host, () => {
+      server.removeListener("error", onError);
+      resolve();
+    });
+  });
+}
+
+/**
+ * Binds `server` on `preferredPort`, then `preferredPort+1`, … until a port is free or attempts exhausted.
+ * Sets `process.env.VFS_APPLICANT_UI_PORT` to the bound port so {@link getApplicantFormServerOrigin} matches.
+ */
+async function bindApplicantFormServerToFreePort(server: Server, host: string, preferredPort: number): Promise<number> {
+  const maxTries = applicantUiPortFallbackAttempts();
+  for (let i = 0; i < maxTries; i++) {
+    const tryPort = preferredPort + i;
+    if (tryPort > 65535) break;
+    try {
+      await listenOnce(server, tryPort, host);
+      if (i > 0) {
+        logger.warn(
+          { requestedPort: preferredPort, boundPort: tryPort },
+          "Applicant UI port was in use; using next free port (close the other bot/cluster or set VFS_APPLICANT_UI_PORT)"
+        );
+      }
+      process.env.VFS_APPLICANT_UI_PORT = String(tryPort);
+      return tryPort;
+    } catch (e) {
+      const err = e as NodeJS.ErrnoException;
+      if (err.code !== "EADDRINUSE") throw err;
+      await new Promise<void>((r) => {
+        server.close(() => r());
+      });
+    }
+  }
+  throw new Error(
+    `Could not bind applicant UI: ports ${preferredPort}–${preferredPort + maxTries - 1} are in use. Stop the other process or set VFS_APPLICANT_UI_PORT to a free port.`
+  );
+}
+
 /**
  * Serves the setup form; **every** successful Submit calls `onSubmit` (HTTP returns immediately).
  * Promise rejects only on server error/timeout; otherwise keeps running.
@@ -438,9 +483,8 @@ export function runApplicantFormWithSubmitHandler(
     return Promise.reject(new Error("Applicant form UI disabled; use run without form handler"));
   }
 
-  const port = applicantUiPort();
+  const preferredPort = applicantUiPort();
   const host = "127.0.0.1";
-  const url = `http://${host}:${port}/`;
 
   return new Promise<never>((_resolve, reject) => {
     let settled = false;
@@ -478,13 +522,7 @@ export function runApplicantFormWithSubmitHandler(
               const det1 = getApplicantDetailsOverrides(1);
               const det0 = getApplicantDetailsOverrides(0);
               const det = det1 ?? det0;
-              if (det) Object.assign(defaults, omitGlobalScheduleFields(det));
-            }
-
-            const shared0 = getApplicantDetailsOverrides(0);
-            const sad = shared0?.scheduleAllowedDates;
-            if (sad != null && String(sad).trim()) {
-              defaults.scheduleAllowedDates = Array.isArray(sad) ? sad.join("\n") : String(sad);
+              if (det) Object.assign(defaults, det);
             }
             const payload: Record<string, unknown> = { ok: true, defaults };
             if (collectLogin) {
@@ -558,13 +596,8 @@ export function runApplicantFormWithSubmitHandler(
             ...rest
           } = j;
           const fields = parseApplicantFields(rest);
-          const id = instanceId;
-          if (id !== undefined && id !== 0) {
-            setApplicantDetailsOverrides(omitGlobalScheduleFields(fields), id);
-          } else {
-            setApplicantDetailsOverrides(fields, id);
-          }
-          mergeGlobalScheduleAllowedDatesFromPayload(j);
+          const id = instanceId ?? 0;
+          setApplicantDetailsOverrides(fields, id);
 
           json(res, 200, { ok: true });
           return;
@@ -588,7 +621,6 @@ export function runApplicantFormWithSubmitHandler(
 
           // In cluster / multi-instance mode, start ALL saved instances up to the chosen count.
           if (submittedNumInstances > 1) {
-            mergeGlobalScheduleAllowedDatesFromPayload(j);
             const credentials = getAllInstanceCredentials();
             const details = getAllInstanceApplicantDetails();
             const allIds = new Set([...credentials.keys(), ...details.keys()]);
@@ -651,12 +683,14 @@ export function runApplicantFormWithSubmitHandler(
             ...rest
           } = j;
           const fields = parseApplicantFields(rest);
-          if (!fields.firstName || !fields.lastName || !fields.passportNumber) {
-            json(res, 400, { ok: false, error: "firstName, lastName, and passportNumber are required" });
+          if (!fields.passportExpirtyDate || !fields.vacCode || !fields.selectedSubvisaCategory || !fields.nationalityCode) {
+            json(res, 400, {
+              ok: false,
+              error: "passport expiry, nationality, visa centre (VAC), and visa category are required",
+            });
             return;
           }
-          setApplicantDetailsOverrides(fields, instanceId);
-          mergeGlobalScheduleAllowedDatesFromPayload(j);
+          setApplicantDetailsOverrides(fields, instanceId ?? 0);
           const firstSubmit = !seenSubmit;
           seenSubmit = true;
           json(res, 200, { ok: true, firstSubmit });
@@ -679,26 +713,32 @@ export function runApplicantFormWithSubmitHandler(
       }
     });
 
-    server.listen(port, host, () => {
-      console.log("\n  >>> Bot setup form: " + url + "\n");
-      openUrlInBrowser(url);
-      const uiTimeoutMs = applicantUiTimeoutMs();
-      if (uiTimeoutMs > 0) {
-        timeoutId = setTimeout(() => {
+    void (async () => {
+      try {
+        const boundPort = await bindApplicantFormServerToFreePort(server, host, preferredPort);
+        const url = `http://${host}:${boundPort}/`;
+        server.on("error", (err) => {
           server.close(() => { });
-          safeReject(
-            new Error(
-              `Applicant UI timed out after ${uiTimeoutMs}ms. Submit the form or set VFS_APPLICANT_UI=false to skip.`
-            )
-          );
-        }, uiTimeoutMs);
+          safeReject(err);
+        });
+        console.log("\n  >>> Bot setup form: " + url + "\n");
+        openUrlInBrowser(url);
+        const uiTimeoutMs = applicantUiTimeoutMs();
+        if (uiTimeoutMs > 0) {
+          timeoutId = setTimeout(() => {
+            server.close(() => { });
+            safeReject(
+              new Error(
+                `Applicant UI timed out after ${uiTimeoutMs}ms. Submit the form or set VFS_APPLICANT_UI=false to skip.`
+              )
+            );
+          }, uiTimeoutMs);
+        }
+      } catch (err) {
+        server.close(() => { });
+        safeReject(err instanceof Error ? err : new Error(String(err)));
       }
-    });
-
-    server.on("error", (err) => {
-      server.close(() => { });
-      safeReject(err);
-    });
+    })();
   });
 }
 
