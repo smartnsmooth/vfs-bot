@@ -18,7 +18,7 @@ import {
   runApplicantFormWithSubmitHandler,
 } from "./ui/applicantDetailsFormServer";
 import { getSessionLoginCredentials, reloadSessionCredentialsFromDisk } from "./utils/sessionLogin.store";
-import { reloadApplicantDetailsFromDisk } from "./utils/applicantDetails.store";
+import { reloadApplicantDetailsFromDisk, getApplicantDetailsOverrides } from "./utils/applicantDetails.store";
 import {
   createSlotFoundWatcher,
   isSlotFoundByAnyInstance,
@@ -705,18 +705,26 @@ function isSaveApplicantsFailure(err: unknown): boolean {
 
 function getFixedTimingForInstance(instanceId?: number): { postLoginOffsetMs: number; pollIntervalMs: number } {
   const id = typeof instanceId === "number" && Number.isFinite(instanceId) && instanceId >= 1 ? Math.floor(instanceId) : 1;
+
+  // Read userPollInterval (seconds) from global store (instance 0), fall back to env/default.
+  const globalDet = getApplicantDetailsOverrides(0);
+  const userPollIntervalSec =
+    globalDet && typeof globalDet.userPollInterval === "number" && globalDet.userPollInterval >= 1
+      ? globalDet.userPollInterval
+      : Math.max(1, Math.round(FIXED_POLL_INTERVAL_MS / 1000));
+
   const numInstancesRaw = parseInt(process.env.VFS_BOT_INSTANCES ?? "1", 10);
   const numInstances = Number.isFinite(numInstancesRaw) && numInstancesRaw > 0 ? numInstancesRaw : 1;
 
-  // Spread instance start times evenly across one poll interval:
-  // stepMs = pollInterval / numInstances
-  // offsetMs(instance i) = (i-1) * stepMs
-  const stepMsUnclamped = Math.floor(FIXED_POLL_INTERVAL_MS / numInstances);
-  const stepMs = Math.max(250, Math.min(FIXED_POLL_INTERVAL_MS, stepMsUnclamped));
+  // stepMs = userPollInterval — the gap between each instance's start offset.
+  // All instances share the same polling interval: stepMs * numInstances (total count, not index).
+  // postLoginOffset staggers start: instance i waits (i-1) * stepMs after the base delay.
+  const stepMs = Math.max(1000, userPollIntervalSec * 1000);
+  const pollIntervalMs = stepMs * numInstances;
 
   return {
     postLoginOffsetMs: (id - 1) * stepMs,
-    pollIntervalMs: FIXED_POLL_INTERVAL_MS,
+    pollIntervalMs,
   };
 }
 

@@ -190,6 +190,12 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
   } else if (typeof j.gender === "string" && j.gender.trim() !== "") {
     out.gender = parseInt(j.gender, 10);
   }
+  if (typeof j.userPollInterval === "number" && Number.isFinite(j.userPollInterval) && j.userPollInterval >= 1) {
+    out.userPollInterval = Math.floor(j.userPollInterval);
+  } else if (typeof j.userPollInterval === "string" && j.userPollInterval.trim() !== "") {
+    const v = parseInt(j.userPollInterval, 10);
+    if (Number.isFinite(v) && v >= 1) out.userPollInterval = v;
+  }
   return out;
 }
 
@@ -208,9 +214,15 @@ function buildPageHtml(collectLogin: boolean): string {
     <input type="date" id="scheduleDateRangeEnd" name="scheduleDateRangeEnd" />
   </div>`;
 
+  const defaultPollIntervalSec = Math.max(1, Math.round(
+    (parseInt(process.env.FIXED_POLL_INTERVAL_MS ?? "60000", 10) || 60_000) / 1000
+  ));
+
   const instanceSelectBlock = `
   <fieldset style="border:1px solid #38444d;border-radius:8px;padding:1rem 1rem 0.25rem;margin:0 0 1.25rem">
     <legend style="color:#8b98a5;font-size:0.9rem">Bot configuration</legend>
+    <label for="userPollInterval" style="margin-top:0.75rem">Poll interval (seconds)</label>
+    <input type="number" id="userPollInterval" name="userPollInterval" min="1" value="${defaultPollIntervalSec}" />
     <label for="numInstances">Number of instances</label>
     <input type="number" id="numInstances" name="numInstances" min="1" max="50" value="${defaultNumInstances}" />
     <div id="instanceSelectWrapper" style="display:block">
@@ -746,6 +758,12 @@ export function runApplicantFormWithSubmitHandler(
               const det = det1 ?? det0;
               if (det) Object.assign(defaults, det);
             }
+
+            // userPollInterval is a global setting stored under instance 0; surface it for all modes.
+            const globalDet = getApplicantDetailsOverrides(0);
+            if (globalDet && typeof globalDet.userPollInterval === "number") {
+              defaults.userPollInterval = globalDet.userPollInterval;
+            }
             const payload: Record<string, unknown> = { ok: true, defaults };
             if (collectLogin) {
               const base = getLoginFormDefaults();
@@ -818,8 +836,15 @@ export function runApplicantFormWithSubmitHandler(
             ...rest
           } = j;
           const fields = parseApplicantFields(rest);
+          const { userPollInterval: upi, ...instanceFields } = fields;
+
+          // userPollInterval is global — save only to instance 0, never per-instance.
+          if (typeof upi === "number") {
+            const global0 = getApplicantDetailsOverrides(0) ?? {};
+            setApplicantDetailsOverrides({ ...global0, userPollInterval: upi }, 0);
+          }
           const id = instanceId ?? 0;
-          setApplicantDetailsOverrides(fields, id);
+          setApplicantDetailsOverrides(instanceFields, id);
 
           json(res, 200, { ok: true });
           return;
@@ -912,7 +937,15 @@ export function runApplicantFormWithSubmitHandler(
             });
             return;
           }
-          setApplicantDetailsOverrides(fields, instanceId ?? 0);
+          const { userPollInterval: upi2, ...instanceFields2 } = fields;
+
+          // userPollInterval is global — save only to instance 0, never per-instance.
+          if (typeof upi2 === "number") {
+            const global0 = getApplicantDetailsOverrides(0) ?? {};
+            setApplicantDetailsOverrides({ ...global0, userPollInterval: upi2 }, 0);
+          }
+          const submitInstanceId = instanceId ?? 0;
+          setApplicantDetailsOverrides(instanceFields2, submitInstanceId);
           const firstSubmit = !seenSubmit;
           seenSubmit = true;
           json(res, 200, { ok: true, firstSubmit });

@@ -214,6 +214,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
       scheduleDateRangeStart: String(fd.get("scheduleDateRangeStart") ?? "").trim(),
       scheduleDateRangeEnd: String(fd.get("scheduleDateRangeEnd") ?? "").trim(),
       numInstances: getNumInstances(),
+      userPollInterval: parseInt(String(fd.get("userPollInterval") || "60"), 10) || 60,
     };
     if (isMultiInstance) {
       body.instanceId = parseInt(String(fd.get("instanceId") || "1"), 10);
@@ -358,6 +359,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
       scheduleDateRangeStart: String(fd.get("scheduleDateRangeStart") ?? "").trim(),
       scheduleDateRangeEnd: String(fd.get("scheduleDateRangeEnd") ?? "").trim(),
       numInstances: getNumInstances(),
+      userPollInterval: parseInt(String(fd.get("userPollInterval") || "60"), 10) || 60,
     };
     if (isMultiInstance) {
       body.instanceId = parseInt(String(fd.get("instanceId") || "1"), 10);
