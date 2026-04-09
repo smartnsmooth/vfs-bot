@@ -3,7 +3,7 @@ import dotenv from "dotenv";
 dotenv.config({ override: false });
 import { exec, spawn } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { get as httpGet } from "node:http";
 import { get as httpsGet } from "node:https";
 import path from "node:path";
@@ -14,7 +14,6 @@ import { PollingService } from "./services/polling.service";
 import { BrowserService } from "./services/browser.service";
 import { TelegramService } from "./services/telegram.service";
 import {
-  isApplicantFormUiDisabled,
   runApplicantFormWithSubmitHandler,
 } from "./ui/applicantDetailsFormServer";
 import { getSessionLoginCredentials, reloadSessionCredentialsFromDisk } from "./utils/sessionLogin.store";
@@ -34,22 +33,18 @@ import {
   NoDatesInScheduleRangeError,
 } from "./utils/scheduleAllowedDates.js";
 import { clearApplicantIpCache } from "./utils/applicantIp";
-import { clearChromeSessionDataBeforeLaunch } from "./utils/chromeProfileSessionClean";
+import { clearChromeSessionDataBeforeLaunch, resolveChromeProfileFolderName } from "./utils/chromeProfileSessionClean";
 
 const polling = new PollingService();
 const browser = new BrowserService();
 const telegram = new TelegramService();
 
-const POLL_INTERVAL_MS = config.pollingIntervalMs;
 const POST_LOGIN_POLL_DELAY_MS = 30_000;
 const FAST_SKIP_CALENDAR_UP_TO_INSTANCE = Math.max(
   0,
   parseInt(process.env.FAST_SKIP_CALENDAR_UP_TO_INSTANCE ?? "5", 10) || 5
 );
-const FIXED_POLL_INTERVAL_MS = Math.max(
-  1000,
-  parseInt(process.env.FIXED_POLL_INTERVAL_MS ?? "60000", 10) || 60_000
-);
+const DEFAULT_POLL_INTERVAL_SEC = 60;
 type ProxyChainModule = {
   anonymizeProxy(proxyUrl: string): Promise<string>;
   closeAnonymizedProxy(url: string, closeConnections?: boolean): Promise<void>;
@@ -294,6 +289,31 @@ function getBotInstanceId(userDataDir: string): string {
   return base || "instance-default";
 }
 
+/**
+ * Remove saved window placement from Chrome's Preferences file so Chrome
+ * doesn't restore an off-screen or wrong-sized window from a previous run.
+ * Must be called before Chrome starts (profile not locked).
+ */
+function clearChromeWindowPlacement(userDataDir: string): void {
+  try {
+    const profile = resolveChromeProfileFolderName();
+    const prefsPath = path.join(userDataDir, profile, "Preferences");
+    if (!existsSync(prefsPath)) return;
+    const raw = readFileSync(prefsPath, "utf-8");
+    const prefs = JSON.parse(raw);
+    let changed = false;
+    if (prefs.browser?.window_placement) {
+      delete prefs.browser.window_placement;
+      changed = true;
+    }
+    if (changed) {
+      writeFileSync(prefsPath, JSON.stringify(prefs), "utf-8");
+    }
+  } catch {
+    // Non-critical — Chrome will just use its default placement
+  }
+}
+
 function hashString(input: string): number {
   let h = 0;
   for (let i = 0; i < input.length; i++) {
@@ -425,16 +445,81 @@ function checkDevToolsEndpoint(url: string): Promise<boolean> {
   });
 }
 
+let cachedScreenSize: { width: number; height: number } | null = null;
+
+/**
+ * Detect the primary monitor's working area (excludes taskbar) via PowerShell.
+ * Result is cached. Falls back to 1920x1040 if detection fails.
+ */
+function detectScreenWorkingArea(): Promise<{ width: number; height: number }> {
+  if (cachedScreenSize) return Promise.resolve(cachedScreenSize);
+  return new Promise((resolve) => {
+    const ps = spawn("powershell", [
+      "-NoProfile", "-NonInteractive", "-Command",
+      "Add-Type -AssemblyName System.Windows.Forms; $a=[System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea; Write-Host \"$($a.Width)x$($a.Height)\"",
+    ], { stdio: ["ignore", "pipe", "ignore"], windowsHide: true });
+    let out = "";
+    ps.stdout!.on("data", (d: Buffer) => { out += d.toString(); });
+    const timer = setTimeout(() => { try { ps.kill(); } catch { } finish(); }, 3000);
+    ps.on("exit", () => { clearTimeout(timer); finish(); });
+    ps.on("error", () => { clearTimeout(timer); finish(); });
+    function finish() {
+      const m = out.trim().match(/^(\d+)x(\d+)$/);
+      if (m) {
+        cachedScreenSize = { width: parseInt(m[1], 10), height: parseInt(m[2], 10) };
+      } else {
+        cachedScreenSize = { width: 1920, height: 1040 };
+      }
+      logger.info({ screen: cachedScreenSize }, "[Chrome] Detected screen working area");
+      resolve(cachedScreenSize);
+    }
+  });
+}
+
+/**
+ * Compute Chrome window size and position for a tiled grid layout.
+ * Instance IDs are 1-based; returns {width, height, x, y} in pixels.
+ */
+async function computeChromeGridPosition(instanceIdx: number, totalInstances: number): Promise<{ width: number; height: number; x: number; y: number }> {
+  const total = Math.max(1, totalInstances);
+  const idx = Math.max(0, instanceIdx - 1); // 0-based
+
+  // Auto layout targets a ~5:2 column-to-row ratio (wider than tall).
+  // 10 instances → 5 cols × 2 rows; 40 → 10 cols × 4 rows.
+  const cols = config.chromeGridColumns > 0
+    ? config.chromeGridColumns
+    : Math.max(1, Math.ceil(Math.sqrt(total * 2.5)));
+  const rows = Math.max(1, Math.ceil(total / cols));
+
+  const screen = await detectScreenWorkingArea();
+  const screenW = config.screenWidth > 0 ? config.screenWidth : screen.width;
+  const screenH = config.screenHeight > 0 ? config.screenHeight : screen.height;
+
+  const w = config.chromeWindowWidth > 0 ? config.chromeWindowWidth : Math.floor(screenW / cols);
+  const h = config.chromeWindowHeight > 0 ? config.chromeWindowHeight : Math.floor(screenH / rows);
+
+  const col = idx % cols;
+  const row = Math.floor(idx / cols);
+
+  return { width: w, height: h, x: col * w, y: row * h };
+}
+
 async function ensureChromeWithDevTools(): Promise<void> {
   const userDataDir = resolveChromeUserDataDir();
   const instanceId = getBotInstanceId(userDataDir);
+  const debugPort = getRemoteDebuggingPort();
 
-  // If Chrome DevTools is already reachable on the target port, skip spawning entirely.
-  // On Windows, Chrome is a single-instance app per profile: re-launching it when it is
-  // already running opens a NEW TAB in the existing window rather than reusing the first tab.
+  // If Chrome DevTools is already reachable on the target port, skip spawning.
+  // But still reposition the window in case it's off-screen or wrong size.
   for (const url of getChromeDevToolsCheckUrls()) {
     if (await checkDevToolsEndpoint(url)) {
       logger.info({ url, instanceId }, "[Chrome] DevTools already running — reusing existing Chrome");
+      const numId = parseInt(process.env.BOT_INSTANCE_ID ?? "1", 10) || 1;
+      const total = parseInt(process.env.BOT_TOTAL_INSTANCES ?? "1", 10) || 1;
+      if (total > 1) {
+        const grid = await computeChromeGridPosition(numId, total);
+        await moveWindowByDebugPort(debugPort, grid);
+      }
       return;
     }
   }
@@ -456,7 +541,12 @@ async function ensureChromeWithDevTools(): Promise<void> {
 
   const chromePath = resolveChromeExecutablePath();
   const resolvedProxy = await resolveLaunchProxyServer(selectedProxy);
-  const debugPort = getRemoteDebuggingPort();
+
+  const numericInstanceId = parseInt(process.env.BOT_INSTANCE_ID ?? "1", 10) || 1;
+  const totalInstances = parseInt(process.env.BOT_TOTAL_INSTANCES ?? "1", 10) || 1;
+  const grid = await computeChromeGridPosition(numericInstanceId, totalInstances);
+
+  clearChromeWindowPlacement(userDataDir);
 
   const chromeArgs = [
     `--remote-debugging-port=${debugPort}`,
@@ -474,6 +564,11 @@ async function ensureChromeWithDevTools(): Promise<void> {
   }
   chromeArgs.push(config.loginPageUrl);
 
+  logger.info(
+    { instanceId, grid, totalInstances },
+    `[Chrome] Launching at grid position col=${grid.x / grid.width}, row=${grid.y / grid.height} (${grid.width}x${grid.height})`
+  );
+
   const child = spawn(chromePath, chromeArgs, { detached: true, stdio: "ignore" });
   child.unref();
   if (selectedProxy && !resolvedProxy.launchProxy) {
@@ -486,12 +581,192 @@ async function ensureChromeWithDevTools(): Promise<void> {
   while (Date.now() - startedAt < maxWaitMs) {
     for (const url of getChromeDevToolsCheckUrls()) {
       if (await checkDevToolsEndpoint(url)) {
+        // Small delay for Chrome window to fully render before moving it
+        await new Promise((r) => setTimeout(r, 500));
+        await moveWindowByDebugPort(debugPort, grid);
         return;
       }
     }
     await new Promise((r) => setTimeout(r, delayMs));
   }
   throw new Error("Chrome DevTools did not become ready. Start Chrome manually with --remote-debugging-port=9222");
+}
+
+/**
+ * Move and resize the Chrome window that owns the given debugging port.
+ * Writes a .ps1 temp script (avoids quoting hell) that uses Win32 MoveWindow.
+ */
+function moveWindowByDebugPort(
+  debugPort: number,
+  bounds: { width: number; height: number; x: number; y: number },
+): Promise<void> {
+  const scriptContent = `
+Add-Type -Name "WM" -Namespace "Win32Move" -MemberDefinition @'
+[DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr h,int x,int y,int w,int h2,bool r);
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int c);
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+[DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+'@ -ErrorAction SilentlyContinue
+
+$roots = @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object {
+  $_.CommandLine -match '--remote-debugging-port=${debugPort}\\b'
+} | Select-Object -ExpandProperty ProcessId)
+Write-Host "MOVE port=${debugPort} bounds=${bounds.x},${bounds.y},${bounds.width},${bounds.height} roots=$($roots.Count)"
+if ($roots.Count -eq 0) { Write-Host "MOVE no Chrome found for port ${debugPort}"; exit 0 }
+
+$all = @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Select-Object ProcessId,ParentProcessId)
+$set = [System.Collections.Generic.HashSet[int]]::new()
+foreach ($r in $roots) { $set.Add($r) | Out-Null }
+$go = $true
+while ($go) {
+  $go = $false
+  foreach ($p in $all) {
+    if ($set.Contains($p.ParentProcessId) -and -not $set.Contains($p.ProcessId)) {
+      $set.Add($p.ProcessId) | Out-Null
+      $go = $true
+    }
+  }
+}
+Write-Host "MOVE tree PIDs: $($set.Count)"
+
+$moved = $false
+foreach ($procId in $set) {
+  $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
+  if ($proc -and $proc.MainWindowHandle -ne [IntPtr]::Zero) {
+    $h = $proc.MainWindowHandle
+    Write-Host "MOVE found window PID=$procId handle=$h title=$($proc.MainWindowTitle)"
+    # SW_RESTORE=9 restores from minimized/maximized/hidden; then move+resize
+    [Win32Move.WM]::ShowWindow($h, 9) | Out-Null
+    [Win32Move.WM]::SetForegroundWindow($h) | Out-Null
+    $result = [Win32Move.WM]::MoveWindow($h, ${bounds.x}, ${bounds.y}, ${bounds.width}, ${bounds.height}, $true)
+    Write-Host "MOVE result=$result"
+    $moved = $true
+    break
+  }
+}
+if (-not $moved) { Write-Host "MOVE no window handle found in tree" }
+`.trim();
+
+  const tmpDir = process.env.TEMP || process.env.TMP || "C:\\Windows\\Temp";
+  const scriptPath = path.join(tmpDir, `vfs-move-chrome-${debugPort}.ps1`);
+
+  writeFileSync(scriptPath, scriptContent, "utf-8");
+
+  return new Promise((resolve) => {
+    const ps = spawn("powershell", [
+      "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath,
+    ], {
+      stdio: ["ignore", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    let stdout = "";
+    let stderr = "";
+    ps.stdout!.on("data", (d: Buffer) => { stdout += d.toString(); });
+    ps.stderr!.on("data", (d: Buffer) => { stderr += d.toString(); });
+    const timer = setTimeout(() => { try { ps.kill(); } catch { } done(); }, 8000);
+    ps.on("exit", (code) => {
+      clearTimeout(timer);
+      if (stdout.trim()) {
+        logger.info({ debugPort }, `[Chrome] MoveWindow: ${stdout.trim()}`);
+      }
+      if (code !== 0 && stderr.trim()) {
+        logger.warn({ debugPort, code, stderr: stderr.trim() }, "[Chrome] MoveWindow script error");
+      }
+      done();
+    });
+    ps.on("error", (err) => {
+      clearTimeout(timer);
+      logger.warn({ err, debugPort }, "[Chrome] Failed to spawn PowerShell for MoveWindow");
+      done();
+    });
+    let resolved = false;
+    function done() {
+      if (!resolved) {
+        resolved = true;
+        try { unlinkSync(scriptPath); } catch { }
+        resolve();
+      }
+    }
+  });
+}
+
+/**
+ * Minimize or restore the Chrome window identified by its remote-debugging port.
+ * Uses Win32 ShowWindow via PowerShell: SW_MINIMIZE=6, SW_RESTORE=9.
+ */
+function chromeWindowShowCommand(debugPort: number, swCommand: number, label: string): Promise<void> {
+  if (process.platform !== "win32") return Promise.resolve();
+  const scriptContent = `
+Add-Type -Name "WC" -Namespace "Win32Chrome" -MemberDefinition @'
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h,int c);
+'@ -ErrorAction SilentlyContinue
+
+$roots = @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Where-Object {
+  $_.CommandLine -match '--remote-debugging-port=${debugPort}\\b'
+} | Select-Object -ExpandProperty ProcessId)
+if ($roots.Count -eq 0) { Write-Host "${label} no Chrome for port ${debugPort}"; exit 0 }
+
+$all = @(Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" | Select-Object ProcessId,ParentProcessId)
+$set = [System.Collections.Generic.HashSet[int]]::new()
+foreach ($r in $roots) { $set.Add($r) | Out-Null }
+$go = $true
+while ($go) {
+  $go = $false
+  foreach ($p in $all) {
+    if ($set.Contains($p.ParentProcessId) -and -not $set.Contains($p.ProcessId)) {
+      $set.Add($p.ProcessId) | Out-Null; $go = $true
+    }
+  }
+}
+$done = $false
+foreach ($procId in $set) {
+  $proc = Get-Process -Id $procId -ErrorAction SilentlyContinue
+  if ($proc -and $proc.MainWindowHandle -ne [IntPtr]::Zero) {
+    [Win32Chrome.WC]::ShowWindow($proc.MainWindowHandle, ${swCommand}) | Out-Null
+    Write-Host "${label} OK PID=$procId"
+    $done = $true; break
+  }
+}
+if (-not $done) { Write-Host "${label} no window handle found" }
+`.trim();
+
+  const tmpDir = process.env.TEMP || process.env.TMP || "C:\\Windows\\Temp";
+  const scriptPath = path.join(tmpDir, `vfs-chrome-${label.toLowerCase().replace(/\W+/g, "-")}-${debugPort}.ps1`);
+  writeFileSync(scriptPath, scriptContent, "utf-8");
+
+  return new Promise((resolve) => {
+    const ps = spawn("powershell", [
+      "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", scriptPath,
+    ], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true });
+    let stdout = "";
+    let stderr = "";
+    ps.stdout!.on("data", (d: Buffer) => { stdout += d.toString(); });
+    ps.stderr!.on("data", (d: Buffer) => { stderr += d.toString(); });
+    const timer = setTimeout(() => { try { ps.kill(); } catch { } finish(); }, 6000);
+    ps.on("exit", (code) => {
+      clearTimeout(timer);
+      if (stdout.trim()) logger.info({ debugPort }, `[Chrome] ${label}: ${stdout.trim()}`);
+      if (code !== 0 && stderr.trim()) logger.warn({ debugPort, code }, `[Chrome] ${label} error: ${stderr.trim()}`);
+      finish();
+    });
+    ps.on("error", (err) => {
+      clearTimeout(timer);
+      logger.warn({ err, debugPort }, `[Chrome] ${label} spawn failed`);
+      finish();
+    });
+    let resolved = false;
+    function finish() {
+      if (!resolved) { resolved = true; try { unlinkSync(scriptPath); } catch { } resolve(); }
+    }
+  });
+}
+
+function minimizeChromeWindow(): Promise<void> {
+  return chromeWindowShowCommand(getRemoteDebuggingPort(), 6, "MINIMIZE");
+}
+
+function restoreChromeWindow(): Promise<void> {
+  return chromeWindowShowCommand(getRemoteDebuggingPort(), 9, "RESTORE");
 }
 
 /**
@@ -566,56 +841,65 @@ async function runPollLoop(
           break;
         }
 
-        let foundInThisPoll = false;
+        // Round-robin: check one center per poll round, alternating each iteration.
+        const center = centers[completed % centers.length]!;
 
-        // Check each center sequentially
-        for (const center of centers) {
-          if (await checkPeerFoundSlotAndJoinBooking(instanceId)) {
-            return true;
-          }
+        if (await checkPeerFoundSlotAndJoinBooking(instanceId)) {
+          return true;
+        }
 
+        const currentUrl = await browser.getFirstTabUrl();
+        if (!/\/(applications|dashboard|home)/i.test(currentUrl)) {
+          logger.error({ instanceId, currentUrl }, "Browser is not on the dashboard page. Stopping polling.");
+          await telegram.alert("error", `Not on dashboard page (${currentUrl || "unknown"}). Polling stopped.`).catch(() => { });
+          return false;
+        }
+
+        logger.info(
+          { instanceId, centerNumber: center.centerNumber, vacCode: center.vacCode, visaCategoryCode: center.visaCategoryCode, poll: completed + 1 },
+          `Checking Center ${center.centerNumber}`
+        );
+
+        const { slot, response, centerNumber, centerCode, visaCategoryCode, unauthorized, rateLimited } = await polling.checkSlotsInBrowser(browser, {
+          centerCode: center.vacCode,
+          visaCategoryCode: center.visaCategoryCode,
+          centerNumber: center.centerNumber,
+        });
+
+        console.log(`[Poll Center ${center.centerNumber}]`, JSON.stringify(response, null, 2));
+
+        if (unauthorized) {
+          logger.error({ instanceId }, "401 Unauthorized — session expired or invalid. Stopping polling. Please re-login on the VFS tab.");
+          await telegram.alert("error", "401 Unauthorized — session expired. Polling stopped. Please re-login.").catch(() => { });
+          return false;
+        }
+
+        if (rateLimited) {
+          logger.error({ instanceId }, "429 Too Many Requests — rate limited by VFS API. Stopping polling.");
+          await telegram.alert("error", "429 Too Many Requests — rate limited. Polling stopped.").catch(() => { });
+          return false;
+        }
+
+        if (slot) {
+          slotFound = true;
+
+          markSlotFound(instanceId ?? 0, centerCode!, visaCategoryCode!, slot);
+          setSlotCenterOverride(centerCode!, visaCategoryCode!);
+
+          await telegram.alert("slot_found", `Slot (Center ${centerNumber}): ${slot.center || "—"} ${slot.date} ${slot.time}`, { slotId: slot.id, centerNumber }).catch(() => { });
           logger.info(
-            { instanceId, centerNumber: center.centerNumber, vacCode: center.vacCode, visaCategoryCode: center.visaCategoryCode },
-            `Checking Center ${center.centerNumber}`
+            { instanceId, centerNumber, centerCode, visaCategoryCode, slot },
+            `Slot found by this instance in Center ${centerNumber} — broadcasting center/category to all instances`
           );
-
-          const { slot, response, centerNumber, centerCode, visaCategoryCode } = await polling.checkSlotsInBrowser(browser, {
-            centerCode: center.vacCode,
-            visaCategoryCode: center.visaCategoryCode,
-            centerNumber: center.centerNumber,
-          });
-
-          console.log(`[Poll Center ${center.centerNumber}]`, JSON.stringify(response, null, 2));
-
-          if (slot) {
-            slotFound = true;
-            foundInThisPoll = true;
-
-            // Mark slot as found for ALL instances with this instance's center/category
-            markSlotFound(instanceId ?? 0, centerCode!, visaCategoryCode!, slot);
-
-            // Set override for this instance too (in case it's used later)
-            setSlotCenterOverride(centerCode!, visaCategoryCode!);
-
-            await telegram.alert("slot_found", `Slot (Center ${centerNumber}): ${slot.center || "—"} ${slot.date} ${slot.time}`, { slotId: slot.id, centerNumber }).catch(() => { });
-            logger.info(
-              { instanceId, centerNumber, centerCode, visaCategoryCode, slot },
-              `Slot found by this instance in Center ${centerNumber} — broadcasting center/category to all instances`
-            );
-            break; // Stop checking other centers once a slot is found
-          }
-
-          if (await checkPeerFoundSlotAndJoinBooking(instanceId)) {
-            return true;
-          }
+          break;
         }
 
-        if (foundInThisPoll) {
-          break; // Exit poll loop if slot found
-        } else {
-          await telegram.alert("no_slot_found", `No slot found in ${centers.map((c) => c.vacCode).join("+")}`, { instanceId }).catch(() => { });
-          logger.info({ instanceId }, `No slot found in ${centers.map((c) => c.vacCode).join("+")}`);
+        if (await checkPeerFoundSlotAndJoinBooking(instanceId)) {
+          return true;
         }
+
+        await telegram.alert("no_slot_found", `No slot in Center ${center.centerNumber} (${center.vacCode})`).catch(() => { });
+        logger.info({ instanceId, centerNumber: center.centerNumber, vacCode: center.vacCode }, `No slot found in Center ${center.centerNumber}`);
       } catch (err) {
         logger.error({ err, instanceId }, "Poll error");
         await telegram.alert("error", err instanceof Error ? err.message : "Poll error").catch(() => { });
@@ -638,7 +922,9 @@ async function runPollLoop(
           await opts.onRelogin();
           logger.info({ instanceId }, "[Relogin] Session refreshed — resuming polling");
         } catch (err) {
-          logger.error({ err, instanceId }, "[Relogin] Re-login failed — continuing poll without session refresh");
+          logger.error({ err, instanceId }, "[Relogin] Re-login failed — stopping polling (no valid session)");
+          await telegram.alert("error", "Re-login failed — polling stopped. Please check the browser and re-login manually.").catch(() => { });
+          return false;
         }
       }
 
@@ -711,19 +997,20 @@ function getFixedTimingForInstance(instanceId?: number): { postLoginOffsetMs: nu
   const userPollIntervalSec =
     globalDet && typeof globalDet.userPollInterval === "number" && globalDet.userPollInterval >= 1
       ? globalDet.userPollInterval
-      : Math.max(1, Math.round(FIXED_POLL_INTERVAL_MS / 1000));
+      : DEFAULT_POLL_INTERVAL_SEC;
 
-  const numInstancesRaw = parseInt(process.env.VFS_BOT_INSTANCES ?? "1", 10);
+  const numInstancesRaw = parseInt(process.env.BOT_TOTAL_INSTANCES ?? "1", 10);
   const numInstances = Number.isFinite(numInstancesRaw) && numInstancesRaw > 0 ? numInstancesRaw : 1;
 
-  // stepMs = userPollInterval — the gap between each instance's start offset.
-  // All instances share the same polling interval: stepMs * numInstances (total count, not index).
-  // postLoginOffset staggers start: instance i waits (i-1) * stepMs after the base delay.
   const stepMs = Math.max(1000, userPollIntervalSec * 1000);
-  const pollIntervalMs = stepMs * numInstances;
+
+  // POLL_INTERVAL_SCALED: true (default) = userInterval * instanceCount + per-instance offset; false = userInterval only, no offset.
+  const scaled = (process.env.POLL_INTERVAL_SCALED ?? "true").trim().toLowerCase();
+  const isScaled = scaled !== "false" && scaled !== "0";
+  const pollIntervalMs = isScaled ? stepMs * numInstances : stepMs;
 
   return {
-    postLoginOffsetMs: (id - 1) * stepMs,
+    postLoginOffsetMs: isScaled ? (id - 1) * stepMs : 0,
     pollIntervalMs,
   };
 }
@@ -855,7 +1142,7 @@ async function performVfsLoginFromStore(instanceId?: number): Promise<void> {
   const p = resolveLoginPassword(instanceId);
   if (!u || !p) {
     throw new Error(
-      "VFS login missing: fill username/password on the setup form, or set VFS_USERNAME / VFS_PASSWORD in .env (or disable UI with VFS_APPLICANT_UI=false)."
+      "VFS login missing: fill username/password on the setup form, or set VFS_USERNAME / VFS_PASSWORD in .env."
     );
   }
   if (hasSecondCredentials(instanceId)) {
@@ -955,6 +1242,8 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
     firstUrl = await browser.getFirstTabUrl();
     kind = classifyVfsFirstTabUrl(firstUrl);
     didLoginThisCycle = true;
+    await minimizeChromeWindow();
+    logger.info({ instanceId }, "[Chrome] Minimized browser after login");
   } else if (kind === "dashboard") {
     logger.info({ instanceId }, "On dashboard — skipping automated login");
   } else if (kind === "vfs_other") {
@@ -971,8 +1260,10 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
     return;
   }
 
+  const skipPolling = !!(getApplicantDetailsOverrides(0)?.skipPolling);
+
   let slotFoundDuringPoll = false;
-  if (config.pollingEnabled) {
+  if (!skipPolling) {
     if (didLoginThisCycle) {
       // Dashboard: no auto "Start new booking" / center / category (handle in browser yourself).
       await new Promise((r) => setTimeout(r, POST_LOGIN_POLL_DELAY_MS));
@@ -1022,7 +1313,7 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
     });
   }
 
-  const runBookingChain = !config.pollingEnabled || slotFoundDuringPoll;
+  const runBookingChain = skipPolling || slotFoundDuringPoll;
 
   if (runBookingChain) {
     let pollHits = slotFoundDuringPoll;
@@ -1037,6 +1328,8 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
         // Booking chain completed (schedule API called) — payment page is now open.
         instanceBookingActive = false;
         instanceOnPaymentPage = true;
+        await restoreChromeWindow();
+        logger.info({ instanceId }, "[Chrome] Restored browser for payment page");
         logger.info({ instanceId }, "[Booking] Complete — Chrome is on the payment page and will stay there permanently");
         return; // Leave Chrome on the payment page; do not fall through to cycle end.
       } catch (err) {
@@ -1075,7 +1368,7 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
         clearSlotState();
         clearSlotCenterOverride();
         clearSlotDate();
-        if (!config.pollingEnabled) {
+        if (skipPolling) {
           throw err;
         }
         await browser.preparePollingAfterLogin({ skipDashboardNavigate: true });
@@ -1119,21 +1412,14 @@ async function start(): Promise<void> {
 
           if (msg?.type === "run-bot-cycle") {
             syncInstanceStoresFromDisk();
-            let cycleAttempt = 0;
-            while (true) {
-              cycleAttempt++;
-              try {
-                await runOneBotCycle({ firstSubmit: cycleAttempt === 1, instanceId: myInstanceId });
-                process.send?.({ type: "bot-cycle-complete", instanceId: myInstanceId });
-                break;
-              } catch (err) {
-                logger.error({ err, instanceId: myInstanceId, cycleAttempt }, "Bot cycle failed — restarting after 15s");
-                await telegram
-                  .alert("error", `Cycle error (instance ${myInstanceId}), restarting: ${err instanceof Error ? err.message : String(err)}`)
-                  .catch(() => { });
-                await new Promise((r) => setTimeout(r, 15_000));
-                syncInstanceStoresFromDisk();
-              }
+            try {
+              await runOneBotCycle({ firstSubmit: true, instanceId: myInstanceId });
+              process.send?.({ type: "bot-cycle-complete", instanceId: myInstanceId });
+            } catch (err) {
+              logger.error({ err, instanceId: myInstanceId }, "Bot cycle failed — stopped");
+              await telegram
+                .alert("error", `Bot ${myInstanceId} is stopped.`)
+                .catch(() => { });
             }
           }
         });
@@ -1145,12 +1431,6 @@ async function start(): Promise<void> {
   }
 
   await ensureChromeWithDevTools();
-
-  if (isApplicantFormUiDisabled()) {
-    logger.info("Applicant UI disabled — single bot cycle from current Chrome tab");
-    await runOneBotCycle({ firstSubmit: true });
-    return;
-  }
 
   await runApplicantFormWithSubmitHandler((info) => {
     const instanceId = typeof info.instanceId === "number" ? info.instanceId : undefined;

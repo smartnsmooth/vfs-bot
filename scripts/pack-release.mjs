@@ -90,7 +90,7 @@ ${nodeLine}
 3) Put your .env in this folder (copy .env.example to .env and edit).
 4) Double click start.bat (single instance) OR start-cluster.bat (multiple instances).
 
-Note: For cluster mode, configure VFS_BOT_INSTANCES in .env (default: 3 instances).
+Note: For cluster mode, set the number of instances from the setup form UI.
 `;
   fs.writeFileSync(path.join(outDir, "README.txt"), content, "utf8");
 }

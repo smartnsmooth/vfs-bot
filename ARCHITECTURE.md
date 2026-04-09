@@ -22,7 +22,7 @@
 | **Booking/hold page URL** | `.env`: `VFS_HOLD_PAGE_URL` (browser opens this for hold + CAPTCHA) |
 | **Slot API response shape** | `src/services/polling.service.ts`: `SlotApiResponse` and parsing of `data.slots` / `data.data.slots` |
 | **Turnstile / CAPTCHA** | `src/services/browser.service.ts`: `solveAndInjectTurnstile()`; `src/services/turnstile.service.ts` (CapMonster). Set `CAPMONSTER_API_KEY` for auto-solve. |
-| **Form fields** (pre-fill) | `src/services/browser.service.ts`: `prefillFormIfPresent()` and `.env`: `VFS_APPLICANT_NAME`, `VFS_APPLICANT_EMAIL`, `VFS_APPLICANT_PHONE` |
+| **Form fields** (pre-fill) | `src/services/browser.service.ts`: `prefillFormIfPresent()` (applicant details come from the setup form at runtime) |
 | **Anti-bot / rate limits** | `src/utils/proxy.util.ts` and `.env`: `PROXY_URL` or `PROXY_LIST`; optionally increase `POLLING_INTERVAL_MS` |
 | **Session / cookies** | `src/services/session.service.ts`: how cookie is read (body vs `Set-Cookie` header); refresh logic |
 

@@ -1,4 +1,3 @@
-import { randomBytes } from "node:crypto";
 import { chromium, Browser, BrowserContext, Page } from "playwright";
 
 /** Returns true when the error is Playwright's "Target closed" family of errors. */
@@ -97,15 +96,6 @@ function readClientSourceHeader(headers: Record<string, string>): string | undef
     headers["ClientSource"] ??
     headers["CLIENTSOURCE"];
   return raw?.trim() || undefined;
-}
-
-/**
- * Generates a fresh random clientsource token matching the VFS format:
- * 256 random bytes encoded as standard base64 (≈ 344 character string ending with "==").
- * Called per-request when VFS_RANDOM_CLIENTSOURCE=true.
- */
-function generateRandomClientSource(): string {
-  return randomBytes(256).toString("base64");
 }
 
 export class BrowserService {
@@ -602,6 +592,16 @@ export class BrowserService {
       const pwdBody = await pwdLoginRes.text().catch(() => "");
       const pwdJson = parseVfsUserLoginResponseBody(pwdBody);
       if (pwdJson) {
+        const errObj = pwdJson.error as { code?: number; description?: string } | undefined;
+        if (errObj && errObj.code === 413 && errObj.description === "Invalid Sender User") {
+          logger.error(
+            { status: pwdLoginRes.status(), error: errObj },
+            "[Login] Login failed — email not registered (error 413 / Invalid Sender User)"
+          );
+          void new TelegramService()
+            .alert("error", "The entered email id is not registered.")
+            .catch(() => {});
+        }
         const flat = flattenVfsLoginResponseForProfile(pwdJson);
         const forStore = stripPasswordStepApplicantFieldsForProfileMerge(flat);
         if (forStore) mergeVfsLoginProfile(forStore);
@@ -633,34 +633,37 @@ export class BrowserService {
   }
 
   /**
-   * If `VFS_CLIENTSOURCE` is unset and nothing was captured yet, blocks until the browser POSTs
-   * any lift-api request that sends `clientsource` (e.g. dashboard SPA) or until timeout.
+   * Blocks until the browser POSTs any lift-api request that sends `clientsource`
+   * (e.g. dashboard SPA navigation after login). Sends periodic Telegram alerts while waiting.
    */
   async waitForLiftClientSourceIfNeeded(): Promise<void> {
-    if (config.liftApiClientSource?.trim()) {
-      logger.info("clientsource: using VFS_CLIENTSOURCE from env (skip wait)");
-      return;
-    }
-    if (config.randomClientSource) {
-      logger.info(
-        "clientsource: VFS_RANDOM_CLIENTSOURCE=true — slot/lift fetches inject a fresh token per call (skip capture wait)"
-      );
-      return;
-    }
     if (getCapturedClientSource()?.trim()) {
       logger.info("clientsource: already captured from browser");
       return;
     }
     await this.ensureBrowser();
-    const timeoutMs = Math.max(
-      5000,
-      parseInt(process.env.VFS_WAIT_CLIENTSOURCE_MS ?? "180000", 10) || 180_000
-    );
+    const telegram = new TelegramService();
+    const ALERT_INTERVAL_MS = 60_000;
     logger.info(
-      { timeoutMs },
-      "No clientsource in env; waiting for a lift-api request with clientsource header (e.g. open or refresh VFS dashboard after login)..."
+      "Waiting for clientsource capture from browser (lift-api request with clientsource header)..."
     );
-    await waitForClientSourceCapture(timeoutMs);
+    await telegram
+      .alert("info", "Waiting for clientsource — open or refresh VFS dashboard in Chrome so the bot can capture it.")
+      .catch(() => { });
+
+    const alertTimer = setInterval(() => {
+      if (getCapturedClientSource()?.trim()) return;
+      logger.info("Still waiting for clientsource capture...");
+      telegram
+        .alert("info", "Still waiting for clientsource — navigate VFS dashboard in Chrome to trigger a lift-api request.")
+        .catch(() => { });
+    }, ALERT_INTERVAL_MS);
+
+    try {
+      await waitForClientSourceCapture();
+    } finally {
+      clearInterval(alertTimer);
+    }
     logger.info("clientsource captured; proceeding");
   }
 
@@ -672,7 +675,7 @@ export class BrowserService {
   async preparePollingAfterLogin(options?: { skipDashboardNavigate?: boolean }): Promise<void> {
     const page = await this.getVfsPage();
     const skipNav = options?.skipDashboardNavigate === true;
-    if (!config.liftApiClientSource?.trim() && !skipNav) {
+    if (!skipNav) {
       logger.info({ url: page.url() }, "Pre-poll: staying on current VFS tab (not navigating to application-detail)");
     }
     // Resubmit rounds skip dashboard nav; waiting here for a new /application would block and prevent slot checks.
@@ -864,26 +867,16 @@ export class BrowserService {
   private async getVfsPage(): Promise<Page> {
     const browser = await this.ensureBrowser();
     const pages = browser.contexts()[0]?.pages() ?? [];
-    const pollingPage = config.pollingPageUrl ?? "https://visa.vfsglobal.com/ind/en/bgr/application-detail";
-    const origin = new URL(pollingPage).origin;
 
-    const page =
-      pages.find((p) => {
-        try {
-          const u = p.url();
-          return u.startsWith(pollingPage) || (u.startsWith(origin) && u.includes("dashboard"));
-        } catch {
-          return false;
-        }
-      }) ?? pages.find((p) => {
-        try {
-          return p.url().includes("visa.vfsglobal.com");
-        } catch {
-          return false;
-        }
-      });
+    const page = pages.find((p) => {
+      try {
+        return p.url().includes("visa.vfsglobal.com");
+      } catch {
+        return false;
+      }
+    });
 
-    if (!page) throw new Error(`No VFS tab open. Keep ${pollingPage} (or dashboard) open in a tab.`);
+    if (!page) throw new Error("No VFS tab open. Keep a visa.vfsglobal.com tab open in Chrome.");
     this.attachLiftApiClientSourceSniffer(page.context());
     return page;
   }
@@ -1000,7 +993,7 @@ export class BrowserService {
     if (dates.length > 0) {
       // Shard instances across available calendar dates:
       // Example: instances=10, dates=3 => [4,3,3] instances per date.
-      const totalInstances = Math.max(1, parseInt(process.env.VFS_BOT_INSTANCES ?? "1", 10) || 1);
+      const totalInstances = Math.max(1, parseInt(process.env.BOT_TOTAL_INSTANCES ?? "1", 10) || 1);
       const myId = getCurrentInstanceId() ?? 1;
       const myIdx = Math.max(0, Math.min(totalInstances - 1, myId - 1));
 
@@ -1242,7 +1235,7 @@ export class BrowserService {
       await this.maybeSolveTurnstileInRecoveryPage(page);
       await page.waitForTimeout(1500);
     } finally {
-      const restore = prevUrl || config.pollingPageUrl || "https://visa.vfsglobal.com/";
+      const restore = prevUrl || "https://visa.vfsglobal.com/";
       await page.goto(restore, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => { });
     }
   }
@@ -1301,9 +1294,7 @@ export class BrowserService {
   ): Promise<{ status: number; body: string }> {
     this.assertVfsPageLoggedInForLiftApi(page);
     const { origin, referer, route } = this.getLiftApiPageContextFromSource(page);
-    const clientSourceOverride: string | null = config.randomClientSource
-      ? generateRandomClientSource()
-      : config.liftApiClientSource?.trim() || getCapturedClientSource()?.trim() || null;
+    const clientSourceOverride: string | null = getCapturedClientSource()?.trim() || null;
     return page.evaluate(
       async (args: {
         url: string;
@@ -1932,8 +1923,10 @@ export class BrowserService {
     maxMs: number
   ): Promise<"dashboard" | "otp" | "neither"> {
     const deadline = Date.now() + maxMs;
+    const t0 = Date.now();
     let iter = 0;
     let lastProgressLog = 0;
+    logger.info({ maxMs }, "[login] Waiting for dashboard or OTP field...");
     while (Date.now() < deadline) {
       iter += 1;
       let url = "";
@@ -1960,8 +1953,12 @@ export class BrowserService {
         }
       }
       const now = Date.now();
-      if (isMailTmVerbose() && now - lastProgressLog >= 10_000) {
+      if (now - lastProgressLog >= 5_000) {
         lastProgressLog = now;
+        logger.info(
+          { step: "login.wait_dash_or_otp", elapsedMs: now - t0, remainingMs: deadline - now, url },
+          "[login] Still waiting for dashboard or OTP field..."
+        );
       }
       try {
         await page.waitForTimeout(350);
@@ -2322,6 +2319,16 @@ export class BrowserService {
         json,
       };
       if (json) {
+        const errObj = json.error as { code?: number; description?: string } | undefined;
+        if (errObj && errObj.code === 413 && errObj.description === "Invalid Sender User") {
+          logger.error(
+            { status: capturedOtpLogin.status(), error: errObj },
+            "[Login] Login failed — email not registered (error 413 / Invalid Sender User)"
+          );
+          void new TelegramService()
+            .alert("error", "The entered email id is not registered.")
+            .catch(() => {});
+        }
         const flat = flattenVfsLoginResponseForProfile(json);
         if (flat) mergeVfsLoginProfile(flat);
       }

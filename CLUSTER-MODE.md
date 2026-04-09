@@ -19,9 +19,6 @@ The bot now supports running multiple instances simultaneously, each with its ow
 ### 1. Configure `.env`
 
 ```env
-# Number of instances (default: 5)
-VFS_BOT_INSTANCES=5
-
 # Proxy URLs - each instance automatically gets a different IP
 # Using the {session} placeholder ensures sticky sessions per instance
 PROXY_URLS=http://user-session-{session}:pass@host:port
@@ -29,6 +26,8 @@ PROXY_URLS=http://user-session-{session}:pass@host:port
 # Optionally set BOT_INSTANCE_ID to override the auto-generated ID
 # BOT_INSTANCE_ID=custom-id
 ```
+
+> The number of instances is set from the setup form UI when you click Submit — no `.env` variable needed.
 
 ### 2. Usage
 
@@ -173,8 +172,7 @@ Check logs for:
 ## Migration from Single to Cluster
 
 1. Your existing `.env` works as-is
-2. Set `VFS_BOT_INSTANCES=5` to enable cluster mode
-3. Use `npm run dev:cluster` instead of `npm run dev`
-4. Form UI automatically shows instance selector when `VFS_BOT_INSTANCES > 1`
+2. Use `npm run dev:cluster` instead of `npm run dev`
+3. Set the number of instances from the setup form UI and click Submit
 
 No code changes needed - the bot detects cluster mode automatically.

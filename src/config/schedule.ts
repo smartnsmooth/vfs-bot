@@ -1,10 +1,10 @@
-import { config } from "./config";
+import { config, getCurrentInstanceId } from "./config";
 import { getEffectiveLiftLoginUser } from "../utils/liftLoginUser";
 import { getTotalAmount } from "../utils/totalAmount.store";
 import { getSlotCenterOverride } from "../utils/slotCenterOverride.store";
+import { getApplicantDetailsOverrides } from "../utils/applicantDetails.store";
 
-export const SCHEDULE_URL =
-  process.env.VFS_SCHEDULE_URL ?? "https://lift-api.vfsglobal.com/appointment/schedule";
+export const SCHEDULE_URL = "https://lift-api.vfsglobal.com/appointment/schedule";
 
 /** POST /appointment/schedule — after timeslot; needs urn + allocationId. */
 export function buildScheduleBody(urn: string, allocationId: string): Record<string, unknown> {
@@ -25,13 +25,18 @@ export function buildScheduleBody(urn: string, allocationId: string): Record<str
   }
 
   const override = getSlotCenterOverride();
+  const details = getApplicantDetailsOverrides(getCurrentInstanceId());
+  const centerCode = override?.centerCode
+    || (typeof details?.vacCode === "string" ? details.vacCode.trim() : "");
+
+  if (!centerCode) throw new Error("Schedule API requires centerCode from slot override or setup form");
 
   return {
     CanVFSReachoutToApplicant: process.env.VFS_SCHEDULE_CAN_REACHOUT !== "false",
     TnCConsentAndAcceptance: process.env.VFS_SCHEDULE_TNC !== "false",
     allocationId: alloc,
     aurn: null,
-    centerCode: override?.centerCode ?? config.slotPayload.vacCode,
+    centerCode,
     countryCode: config.slotPayload.countryCode,
     loginUser,
     missionCode: config.slotPayload.missionCode,

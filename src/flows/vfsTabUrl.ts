@@ -1,5 +1,3 @@
-import { config } from "../config/config";
-
 export type VfsTabKind = "blank" | "login" | "dashboard" | "vfs_other";
 
 /**
@@ -19,16 +17,6 @@ export function classifyVfsFirstTabUrl(raw: string): VfsTabKind {
 
   if (u.includes("dashboard")) return "dashboard";
 
-  const pollingPath = (() => {
-    try {
-      return new URL(config.pollingPageUrl || "").pathname.toLowerCase();
-    } catch {
-      return "";
-    }
-  })();
-  if (pollingPath && u.includes(pollingPath.replace(/\/$/, ""))) return "dashboard";
-
-  // application-detail, your-details, booking steps, etc.
   if (
     u.includes("your-details") ||
     u.includes("application-detail") ||
@@ -40,6 +28,5 @@ export function classifyVfsFirstTabUrl(raw: string): VfsTabKind {
     return "vfs_other";
   }
 
-  // Any other path on visa portal (logged-in area) — treat like post-login
   return "vfs_other";
 }

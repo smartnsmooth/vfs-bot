@@ -2,17 +2,14 @@
  * Inline page script for the applicant setup form. Kept in its own module so regex and
  * string escapes are not broken by nesting inside buildPageHtml's template literal.
  */
-export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInstanceJs: string, defaultNumInstancesJs: string): string {
+export function buildApplicantFormPageScript(collectLoginJs: string): string {
   return `<script>
 (function () {
   const collectLogin = ${collectLoginJs};
-  let isMultiInstance = ${isMultiInstanceJs};
 
   function getNumInstances() {
     const el = document.getElementById("numInstances");
-    if (!el) return ${defaultNumInstancesJs};
-    // Prefer live value; fall back to HTML value attribute (some browsers briefly expose
-    // empty .value before restore) then server default.
+    if (!el) return 1;
     const fromInput = (el instanceof HTMLInputElement && typeof el.valueAsNumber === "number" && Number.isFinite(el.valueAsNumber) && el.valueAsNumber >= 1)
       ? Math.floor(el.valueAsNumber)
       : NaN;
@@ -21,16 +18,13 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
     if (Number.isFinite(parsed) && parsed >= 1) return Math.min(50, parsed);
     const fromAttr = parseInt(String(el.getAttribute("value") || "").trim(), 10);
     if (Number.isFinite(fromAttr) && fromAttr >= 1) return Math.min(50, fromAttr);
-    const fallback = parseInt(String(${defaultNumInstancesJs}), 10);
-    return Number.isFinite(fallback) && fallback >= 1 ? Math.min(50, fallback) : 1;
+    return 1;
   }
 
   function updateInstanceSelector() {
     const numInstances = getNumInstances();
-    isMultiInstance = numInstances > 1;
 
     const wrapper = document.getElementById("instanceSelectWrapper");
-    // Always show the selector (even when numInstances=1)
     if (wrapper) wrapper.style.display = "block";
 
     const select = document.getElementById("instanceId");
@@ -45,9 +39,28 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
         select.appendChild(opt);
       }
     }
+  }
 
-    const btn = document.getElementById("submitBtn");
-    if (btn) btn.textContent = isMultiInstance ? "Submit & Run All Instances" : "Submit & Run Bot";
+  const countryMissionMap = {
+    ind: [{label: "Bulgaria", value: "bgr"}, {label: "Latvia", value: "lva"}],
+    sau: [{label: "Portugal", value: "prt"}],
+  };
+
+  function updateMissionOptions() {
+    const countryEl = document.getElementById("countryCode");
+    const missionEl = document.getElementById("missionCode");
+    if (!countryEl || !missionEl) return;
+    const country = countryEl.value;
+    const prevMission = missionEl.value;
+    const options = countryMissionMap[country] || [];
+    missionEl.innerHTML = "";
+    for (let i = 0; i < options.length; i++) {
+      const opt = document.createElement("option");
+      opt.value = options[i].value;
+      opt.textContent = options[i].label;
+      if (options[i].value === prevMission) opt.selected = true;
+      missionEl.appendChild(opt);
+    }
   }
 
   let autoSaveTimeout = null;
@@ -71,43 +84,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
     eEl.value = d.scheduleDateRangeEnd != null ? String(d.scheduleDateRangeEnd).trim().slice(0, 10) : "";
   }
 
-  async function loadDefaults() {
-    const r = await fetch("/api/defaults");
-    const d = await r.json();
-    if (!d.ok) return;
-    const a = d.defaults || {};
-    const skipDefaultIds = { numInstances: true, instanceId: true };
-    for (const k of Object.keys(a)) {
-      if (skipDefaultIds[k]) continue;
-      if ((k === "scheduleDateRangeStart" || k === "scheduleDateRangeEnd") && scheduleRangeUserEdited) continue;
-      if (k === "scheduleDateRangeStart" || k === "scheduleDateRangeEnd") {
-        const el = document.getElementById(k);
-        if (el) el.value = a[k] == null ? "" : String(a[k]).trim().slice(0, 10);
-        continue;
-      }
-      const el = document.getElementById(k);
-      if (el) el.value = a[k] == null ? "" : String(a[k]);
-    }
-    if (collectLogin && d.loginDefaults && d.loginDefaults.vfsUsername) {
-      const u = document.getElementById("vfsUsername");
-      if (u) u.value = String(d.loginDefaults.vfsUsername);
-    }
-    if (collectLogin && d.loginDefaults && d.loginDefaults.vfsPassword != null) {
-      const p = document.getElementById("vfsPassword");
-      if (p) p.value = String(d.loginDefaults.vfsPassword);
-    }
-    if (collectLogin && d.loginDefaults && d.loginDefaults.vfsUsername2 != null) {
-      const u2 = document.getElementById("vfsUsername2");
-      if (u2) u2.value = String(d.loginDefaults.vfsUsername2 ?? "");
-    }
-    if (collectLogin && d.loginDefaults && d.loginDefaults.vfsPassword2 != null) {
-      const p2 = document.getElementById("vfsPassword2");
-      if (p2) p2.value = String(d.loginDefaults.vfsPassword2 ?? "");
-    }
-  }
-
   async function loadInstanceData(showAlert) {
-    if (!isMultiInstance) return;
     const instanceId = parseInt(document.getElementById("instanceId").value, 10);
     const r = await fetch("/api/instances");
     const data = await r.json();
@@ -128,6 +105,11 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
         if (u2El) u2El.value = "";
         if (p2El) p2El.value = "";
       }
+      const ccEl = document.getElementById("countryCode");
+      if (ccEl) ccEl.value = "ind";
+      updateMissionOptions();
+      const mcEl = document.getElementById("missionCode");
+      if (mcEl) mcEl.value = "bgr";
       const fieldsToClear = [
         "passportExpirtyDate",
         "nationalityCode",
@@ -142,6 +124,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
       }
       const genderEl = document.getElementById("gender");
       if (genderEl) genderEl.value = "1";
+      const skipEl = document.getElementById("skipPolling");
+      if (skipEl) skipEl.checked = false;
       applyInstanceScheduleRangeToForm({});
       return;
     }
@@ -183,7 +167,14 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
     }
 
     if (inst.details) {
-      const skipDetailIds = { numInstances: true, instanceId: true, vfsUsername2: true, vfsPassword2: true };
+      const skipDetailIds = { numInstances: true, instanceId: true, vfsUsername2: true, vfsPassword2: true, skipPolling: true, countryCode: true, missionCode: true };
+      // Restore countryCode first, then rebuild mission options, then restore missionCode.
+      const ccEl = document.getElementById("countryCode");
+      if (ccEl && inst.details.countryCode) ccEl.value = String(inst.details.countryCode);
+      updateMissionOptions();
+      const mcEl = document.getElementById("missionCode");
+      if (mcEl && inst.details.missionCode) mcEl.value = String(inst.details.missionCode);
+
       const keys = Object.keys(inst.details);
       for (let ki = 0; ki < keys.length; ki++) {
         const k = keys[ki];
@@ -195,6 +186,14 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
     }
     applyInstanceScheduleRangeToForm(inst.details || {});
 
+    // skipPolling is global (instance 0); apply from whichever source has it.
+    const globalInst = data.instances["0"];
+    const skipEl = document.getElementById("skipPolling");
+    if (skipEl) {
+      const src = (globalInst && globalInst.details) || (inst && inst.details) || {};
+      skipEl.checked = !!src.skipPolling;
+    }
+
     if (showAlert) {
       alert("Loaded saved data for Instance " + instanceId);
     }
@@ -204,6 +203,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
     const form = document.getElementById("f");
     const fd = new FormData(form);
     const body = {
+      countryCode: fd.get("countryCode") || "ind",
+      missionCode: fd.get("missionCode") || "bgr",
       passportExpirtyDate: fd.get("passportExpirtyDate"),
       nationalityCode: String(fd.get("nationalityCode") || "").trim(),
       vacCode: fd.get("vacCode"),
@@ -215,10 +216,9 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
       scheduleDateRangeEnd: String(fd.get("scheduleDateRangeEnd") ?? "").trim(),
       numInstances: getNumInstances(),
       userPollInterval: parseInt(String(fd.get("userPollInterval") || "60"), 10) || 60,
+      skipPolling: !!fd.get("skipPolling"),
+      instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
     };
-    if (isMultiInstance) {
-      body.instanceId = parseInt(String(fd.get("instanceId") || "1"), 10);
-    }
     if (collectLogin) {
       body.vfsUsername = fd.get("vfsUsername");
       body.vfsPassword = fd.get("vfsPassword");
@@ -243,9 +243,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
         const msg = document.getElementById("msg");
         if (j.ok) {
           msg.className = "ok";
-          msg.textContent = isMultiInstance
-            ? "✓ Saved for Instance " + body.instanceId
-            : "✓ Saved";
+          msg.textContent = "\\u2713 Saved for Instance " + body.instanceId;
         } else {
           msg.className = "err";
           msg.textContent = j.error || "Save failed";
@@ -261,7 +259,6 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
   }
 
   function scheduleAutoSave() {
-    if (!isMultiInstance) return;
     if (autoSaveTimeout) {
       clearTimeout(autoSaveTimeout);
     }
@@ -272,31 +269,30 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
 
   async function initApplicantForm() {
     try {
-      // Wire the numInstances input to update the instance selector in real-time.
+      const countryCodeSelect = document.getElementById("countryCode");
+      if (countryCodeSelect) {
+        countryCodeSelect.addEventListener("change", function () {
+          updateMissionOptions();
+          scheduleAutoSave();
+        });
+      }
+      updateMissionOptions();
+
       const numInstancesInput = document.getElementById("numInstances");
       if (numInstancesInput) {
         numInstancesInput.addEventListener("input", function () {
           updateInstanceSelector();
-          if (isMultiInstance) scheduleAutoSave();
+          scheduleAutoSave();
         });
         numInstancesInput.addEventListener("change", function () {
           updateInstanceSelector();
-          // After rebuilding the selector, load data for the now-selected instance.
-          if (isMultiInstance) {
-            scheduleRangeUserEdited = false;
-            loadInstanceData(false);
-          } else {
-            loadDefaults();
-          }
+          scheduleRangeUserEdited = false;
+          loadInstanceData(false);
         });
       }
 
-      // Sync select option count with #numInstances before any async load (avoids empty
-      // .value being read as 1 and wiping server-rendered options).
       updateInstanceSelector();
 
-      // Always wire the instanceId change listener — the element is always in the DOM.
-      // loadInstanceData() and scheduleAutoSave() both guard themselves with isMultiInstance.
       const instanceIdSelect = document.getElementById("instanceId");
       if (instanceIdSelect) {
         instanceIdSelect.addEventListener("change", function () {
@@ -305,20 +301,14 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
         });
       }
 
-      // Always wire auto-save so it kicks in as soon as the user switches to multi-instance.
       const form = document.getElementById("f");
       form.querySelectorAll("input, select, textarea").forEach(function (input) {
         input.addEventListener("input", scheduleAutoSave);
         input.addEventListener("change", scheduleAutoSave);
       });
 
-      if (isMultiInstance) {
-        await loadInstanceData(false);
-      } else {
-        await loadDefaults();
-      }
+      await loadInstanceData(false);
 
-      // After defaults / instance payload, keep the instance dropdown aligned with #numInstances.
       updateInstanceSelector();
     } catch (err) {
       console.error("initApplicantForm failed", err);
@@ -330,7 +320,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
     const e = getScheduleRangeEndEl();
     function markEdited() {
       scheduleRangeUserEdited = true;
-      if (isMultiInstance) scheduleAutoSave();
+      scheduleAutoSave();
     }
     if (s) {
       s.addEventListener("change", markEdited);
@@ -349,6 +339,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
     msg.textContent = "";
     const fd = new FormData(e.target);
     const body = {
+      countryCode: fd.get("countryCode") || "ind",
+      missionCode: fd.get("missionCode") || "bgr",
       passportExpirtyDate: fd.get("passportExpirtyDate"),
       nationalityCode: String(fd.get("nationalityCode") || "").trim(),
       vacCode: fd.get("vacCode"),
@@ -360,10 +352,9 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
       scheduleDateRangeEnd: String(fd.get("scheduleDateRangeEnd") ?? "").trim(),
       numInstances: getNumInstances(),
       userPollInterval: parseInt(String(fd.get("userPollInterval") || "60"), 10) || 60,
+      skipPolling: !!fd.get("skipPolling"),
+      instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
     };
-    if (isMultiInstance) {
-      body.instanceId = parseInt(String(fd.get("instanceId") || "1"), 10);
-    }
     if (collectLogin) {
       body.vfsUsername = fd.get("vfsUsername");
       body.vfsPassword = fd.get("vfsPassword");
@@ -379,14 +370,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string, isMultiInst
       const j = await r.json();
       if (j.ok) {
         msg.className = "ok";
-        if (isMultiInstance) {
-          msg.textContent =
-            "✓ Started " + (j.queued || "all") + " bot instance(s). Check terminal for progress.";
-        } else {
-          msg.textContent = j.firstSubmit
-            ? "Saved — bot run started in the background. Submit again for another run or to refresh data."
-            : "Saved — another bot run was queued. Check the terminal for progress.";
-        }
+        msg.textContent =
+          "\\u2713 Started " + (j.queued || "all") + " bot instance(s). Check terminal for progress.";
       } else {
         msg.className = "err";
         msg.textContent = j.error || "Submit failed";

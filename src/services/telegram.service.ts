@@ -30,10 +30,10 @@ function formatTelegramPrefix(): string {
 export type AlertType = "slot_found" | "no_slot_found" | "hold_success" | "payment_ready" | "error" | "info";
 
 export class TelegramService {
-  async notify(message: string): Promise<void> {
+  async notify(message: string, opts?: { raw?: boolean }): Promise<void> {
     const client = getBot();
     if (!client) return;
-    const text = `${formatTelegramPrefix()}\n${message}`;
+    const text = opts?.raw ? message : `${formatTelegramPrefix()}\n${message}`;
     try {
       await client.sendMessage(config.telegramChatId, text);
     } catch (err) {

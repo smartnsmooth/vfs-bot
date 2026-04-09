@@ -5,9 +5,11 @@ import { logger } from "./utils/logger";
 import { runApplicantFormWithSubmitHandler } from "./ui/applicantDetailsFormServer";
 import { setSessionLoginCredentials } from "./utils/sessionLogin.store";
 import { setApplicantDetailsOverrides } from "./utils/applicantDetails.store";
+import { TelegramService } from "./services/telegram.service";
 
 /** How many bot instances are currently running. Set by ensureInstances(). */
 let currentNumInstances = 0;
+let lastTelegramNotifyBatchTs = 0;
 const BASE_DEBUGGING_PORT = 9222;
 const BASE_PROFILE_DIR = process.env.CHROME_USER_DATA_DIR ?? "C:/vfs-bot-profile";
 
@@ -80,6 +82,12 @@ async function startFormServer(): Promise<void> {
       ? Math.floor(formData.numInstances)
       : currentNumInstances || 1;
     ensureInstances(submittedCount);
+    const now = Date.now();
+    if (now - lastTelegramNotifyBatchTs > 2000) {
+      lastTelegramNotifyBatchTs = now;
+      const dt = new Date().toLocaleString();
+      void new TelegramService().notify(`${dt} — ${submittedCount} bot${submittedCount > 1 ? "s are" : " is"} running...`, { raw: true }).catch(() => {});
+    }
 
     const instanceId = typeof formData.instanceId === "number" ? formData.instanceId : 1;
 
@@ -151,12 +159,9 @@ function spawnBotInstance(instanceId: number, totalInstances: number): ChildProc
   const env = {
     ...process.env,
     BOT_INSTANCE_ID: String(instanceId),
-    // Propagate the UI-chosen instance count into child processes so index.ts can derive
-    // fixed polling + stagger settings from the runtime value (not just .env).
-    VFS_BOT_INSTANCES: String(totalInstances),
+    BOT_TOTAL_INSTANCES: String(totalInstances),
     BROWSER_CDP_URL: `http://127.0.0.1:${debugPort}`,
     CHROME_USER_DATA_DIR: profileDir,
-    VFS_APPLICANT_UI: "false",
     BOT_CLUSTER_MODE: "true",
   };
 
