@@ -132,7 +132,7 @@ export const config = {
 
   mailTmOtpEnabled: process.env.ENABLE_MAIL_TM_OTP === "true",
   /** Max time to poll mail.tm after OTP step appears. */
-  mailTmOtpTimeoutMs: Math.max(30_000, Number.isFinite(MAIL_TM_OTP_TIMEOUT_MS) ? MAIL_TM_OTP_TIMEOUT_MS : 120_000),
+  mailTmOtpTimeoutMs: Math.max(300_000, Number.isFinite(MAIL_TM_OTP_TIMEOUT_MS) ? MAIL_TM_OTP_TIMEOUT_MS : 120_000),
   /** Interval between mail.tm message polls. */
   mailTmPollIntervalMs: Math.max(2_000, Number.isFinite(MAIL_TM_POLL_MS) ? MAIL_TM_POLL_MS : 4_000),
   /**

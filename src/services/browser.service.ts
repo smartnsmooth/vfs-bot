@@ -22,7 +22,7 @@ import { ensureApplicantIpResolved } from "../utils/applicantIp";
 import { getAllocationId, setAllocationId } from "../utils/allocationId.store";
 import { getApplicationUrn, setApplicationUrn } from "../utils/applicationUrn.store";
 import { getSlotDate, setSlotDate } from "../utils/slotDate.store";
-import { setTotalAmount } from "../utils/totalAmount.store";
+import { setTotalAmount, setCurrency } from "../utils/totalAmount.store";
 import {
   getCapturedClientSource,
   setCapturedClientSource,
@@ -600,7 +600,7 @@ export class BrowserService {
           );
           void new TelegramService()
             .alert("error", "The entered email id is not registered.")
-            .catch(() => {});
+            .catch(() => { });
         }
         const flat = flattenVfsLoginResponseForProfile(pwdJson);
         const forStore = stripPasswordStepApplicantFieldsForProfileMerge(flat);
@@ -886,35 +886,13 @@ export class BrowserService {
     await ensureApplicantIpResolved(page);
     const body = buildSaveApplicantsBody();
     logger.info({ url: SAVE_APPLICANTS_URL }, "Saving applicant via lift-api");
-    const beforeCfClearance = await this.getLiftApiCfClearanceValue(page);
 
-    const first = await this.postLiftJsonFromPage(page, SAVE_APPLICANTS_URL, body);
-    console.log("[Applicants] HTTP", first.status, first.body.slice(0, 500));
-    if (first.status < 200 || first.status >= 300) {
-      // Cloudflare challenge: manual browser calls show a Turnstile iframe; fetch-only calls often return 403 HTML.
-      if (this.isCloudflareJustAMoment(first.status, first.body)) {
-        const mode = this.getCfChallengeRecoveryMode();
-        logger.warn({ status: first.status, mode }, "Cloudflare challenge detected. Recovering cf_clearance then retrying once...");
+    const res = await this.retryOnCfChallenge(page, "Applicants", () =>
+      this.postLiftJsonFromPage(page, SAVE_APPLICANTS_URL, body),
+      SAVE_APPLICANTS_URL
+    );
 
-        await this.recoverCfClearanceForLiftApi(page, mode);
-        await this.waitForLiftApiCfClearanceChange(page, beforeCfClearance);
-
-        const retry = await this.postLiftJsonFromPage(page, SAVE_APPLICANTS_URL, body);
-        console.log("[Applicants] Retry HTTP", retry.status, retry.body.slice(0, 500));
-        if (retry.status < 200 || retry.status >= 300) {
-          throw new Error(`Save applicants failed after retry HTTP ${retry.status}: ${retry.body.slice(0, 300)}`);
-        }
-
-        const parsedRetry = this.parseApplicantsResponseJson(retry.body);
-        if (parsedRetry.urn) setApplicationUrn(parsedRetry.urn);
-        logger.info({ urn: parsedRetry.urn }, "Applicants saved (retry)");
-        return;
-      }
-
-      throw new Error(`Save applicants failed HTTP ${first.status}: ${first.body.slice(0, 300)}`);
-    }
-
-    const parsed = this.parseApplicantsResponseJson(first.body);
+    const parsed = this.parseApplicantsResponseJson(res.body);
     if (parsed.urn) setApplicationUrn(parsed.urn);
     logger.info({ urn: parsed.urn }, "Applicants saved");
   }
@@ -922,16 +900,16 @@ export class BrowserService {
   private async postFeesLiftApiOnPage(page: Page, urn: string): Promise<void> {
     const feesPayload = buildFeesBody(urn);
     logger.info({ url: FEES_URL }, "Calling lift-api fees");
-    const res = await this.postLiftJsonFromPage(page, FEES_URL, feesPayload);
-    console.log("[Fees] HTTP", res.status, res.body.slice(0, 500));
-    if (res.status < 200 || res.status >= 300) {
-      throw new Error(`Fees failed HTTP ${res.status}: ${res.body.slice(0, 300)}`);
-    }
+    const res = await this.retryOnCfChallenge(page, "Fees", () =>
+      this.postLiftJsonFromPage(page, FEES_URL, feesPayload),
+      FEES_URL
+    );
     try {
       const j = JSON.parse(res.body) as {
         error?: unknown;
         totalAmount?: unknown;
         totalamount?: unknown;
+        feeDetails?: Array<{ currency?: unknown }>;
       };
       if (j.error != null && j.error !== "") {
         throw new Error(`Fees API error: ${JSON.stringify(j.error)}`);
@@ -947,6 +925,12 @@ export class BrowserService {
       } else {
         logger.warn("Fees response has no totalAmount; nothing stored");
       }
+      if (j.feeDetails && j.feeDetails.length > 0 && typeof j.feeDetails[0]?.currency === "string" && j.feeDetails[0]?.currency.trim() !== "") {
+        setCurrency(j.feeDetails[0]?.currency);
+        logger.info({ currency: j.feeDetails[0]?.currency }, "Stored fees currency");
+      } else {
+        logger.warn("Fees response has no currency; nothing stored");
+      }
     } catch (e) {
       if (e instanceof Error && e.message.startsWith("Fees API error")) throw e;
       throw new Error("Fees: response is not JSON");
@@ -961,11 +945,10 @@ export class BrowserService {
   ): Promise<void> {
     const payload = buildCalendarBody(urn);
     logger.info({ url: CALENDAR_URL, fromDate: payload.fromDate }, "Calling lift-api calendar");
-    const res = await this.postLiftJsonFromPage(page, CALENDAR_URL, payload);
-    console.log("[Calendar] HTTP", res.status, res.body.slice(0, 800));
-    if (res.status < 200 || res.status >= 300) {
-      throw new Error(`Calendar failed HTTP ${res.status}: ${res.body.slice(0, 300)}`);
-    }
+    const res = await this.retryOnCfChallenge(page, "Calendar", () =>
+      this.postLiftJsonFromPage(page, CALENDAR_URL, payload),
+      CALENDAR_URL
+    );
     let j: { error?: unknown; calendars?: Array<{ date?: string; isWeekend?: boolean }> };
     try {
       j = JSON.parse(res.body) as typeof j;
@@ -1028,11 +1011,10 @@ export class BrowserService {
   private async postTimeslotLiftApiOnPage(page: Page, urn: string, slotDateFromCalendar: string): Promise<void> {
     const payload = buildTimeslotBody(urn, slotDateFromCalendar);
     logger.info({ url: TIMESLOT_URL, slotDate: payload.slotDate }, "Calling lift-api timeslot");
-    const res = await this.postLiftJsonFromPage(page, TIMESLOT_URL, payload);
-    console.log("[Timeslot] HTTP", res.status, res.body.slice(0, 800));
-    if (res.status < 200 || res.status >= 300) {
-      throw new Error(`Timeslot failed HTTP ${res.status}: ${res.body.slice(0, 300)}`);
-    }
+    const res = await this.retryOnCfChallenge(page, "Timeslot", () =>
+      this.postLiftJsonFromPage(page, TIMESLOT_URL, payload),
+      TIMESLOT_URL
+    );
     let j: {
       error?: unknown;
       slots?: Array<{ allocationId?: string; slot?: string; type?: string }>;
@@ -1066,29 +1048,11 @@ export class BrowserService {
     const payload = buildScheduleBody(urn, allocationId);
     logger.info({ url: SCHEDULE_URL }, "Calling lift-api schedule");
 
-    // Sec-Fetch-* cannot be set from page fetch(); inject via route for schedule only.
-    const configuredSchedule = new URL(SCHEDULE_URL);
-    const matchScheduleLiftApiUrl = (u: URL): boolean =>
-      u.origin === configuredSchedule.origin && u.pathname === configuredSchedule.pathname;
-    await page.route(matchScheduleLiftApiUrl, async (route) => {
-      if (route.request().method() !== "POST") {
-        await route.continue();
-        return;
-      }
-      const headers = { ...route.request().headers(), "sec-fetch-site": "same-site" };
-      await route.continue({ headers });
-    });
-
-    let res: { status: number; body: string };
-    try {
-      res = await this.postLiftJsonFromPage(page, SCHEDULE_URL, payload);
-    } finally {
-      await page.unroute(matchScheduleLiftApiUrl);
-    }
-    console.log("[Schedule] HTTP", res.status, res.body.slice(0, 800));
-    if (res.status < 200 || res.status >= 300) {
-      throw new Error(`Schedule failed HTTP ${res.status}: ${res.body.slice(0, 300)}`);
-    }
+    const res = await this.retryOnCfChallenge(page, "Schedule", () =>
+      this.postLiftJsonFromPage(page, SCHEDULE_URL, payload),
+      SCHEDULE_URL
+    );
+    console.log("[Schedule] Final HTTP", res.status, res.body.slice(0, 800));
     let j: {
       error?: unknown;
       IsAppointmentBooked?: boolean;
@@ -1171,10 +1135,9 @@ export class BrowserService {
     logger.info({ redirectedTo: page.url() }, "Schedule redirect navigation completed");
   }
 
-  private isCloudflareJustAMoment(status: number, body: string): boolean {
-    if (status !== 403) return false;
+  private isCloudflareJustAMoment(_status: number, body: string): boolean {
     const s = body.toLowerCase();
-    return s.includes("just a moment") || s.includes("cf-browser-verification") || s.includes("turnstile");
+    return s.includes("just a moment") || s.includes("cf-browser-verification") || s.includes("turnstile") || s.includes("_cf_chl_opt");
   }
 
   private getCfChallengeRecoveryMode(): "new_tab" | "same_tab" {
@@ -1207,15 +1170,15 @@ export class BrowserService {
    * mode=new_tab is safest (uses a temporary tab).
    * mode=same_tab navigates current tab to the lift-api URL and then returns back.
    */
-  private async recoverCfClearanceForLiftApi(page: Page, mode: "new_tab" | "same_tab"): Promise<void> {
-    const liftUrl = SAVE_APPLICANTS_URL;
+  private async recoverCfClearanceForLiftApi(page: Page, mode: "new_tab" | "same_tab", targetUrl?: string): Promise<void> {
+    const liftUrl = targetUrl || SAVE_APPLICANTS_URL;
 
     if (mode === "new_tab") {
       const tmp = await page.context().newPage();
       try {
+        logger.info({ url: liftUrl, mode }, "Opening recovery tab for CF challenge");
         await tmp.goto(liftUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
-        await this.maybeSolveTurnstileInRecoveryPage(tmp);
-        await tmp.waitForTimeout(1500);
+        await this.waitForCfChallengeResolution(tmp, page.context());
       } finally {
         await tmp.close().catch(() => { });
       }
@@ -1231,12 +1194,14 @@ export class BrowserService {
     })();
 
     try {
+      logger.info({ url: liftUrl, mode }, "Navigating current tab for CF challenge recovery");
       await page.goto(liftUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
-      await this.maybeSolveTurnstileInRecoveryPage(page);
-      await page.waitForTimeout(1500);
+      await this.waitForCfChallengeResolution(page, page.context());
     } finally {
-      const restore = prevUrl || "https://visa.vfsglobal.com/";
-      await page.goto(restore, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => { });
+      if (mode === "same_tab") {
+        const restore = prevUrl || "https://visa.vfsglobal.com/";
+        await page.goto(restore, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => { });
+      }
     }
   }
 
@@ -1248,6 +1213,99 @@ export class BrowserService {
     }
     logger.info("Recovery page: please solve Turnstile in the browser, then press Enter in this terminal.");
     await waitForEnter();
+  }
+
+  /**
+   * Wait for Cloudflare managed challenge to auto-resolve.
+   * The challenge JS runs in the browser and, on success, sets cf_clearance and
+   * redirects the page. We poll for either the cookie appearing or the page
+   * navigating away from the challenge.
+   */
+  private async waitForCfChallengeResolution(recoveryPage: Page, ctx: import("playwright").BrowserContext): Promise<void> {
+    const maxWaitMs = 35_000;
+    const pollMs = 1_000;
+    const deadline = Date.now() + maxWaitMs;
+
+    logger.info("Waiting for Cloudflare managed challenge to auto-resolve...");
+
+    while (Date.now() < deadline) {
+      const cookies = await ctx.cookies(["https://lift-api.vfsglobal.com"]);
+      const cf = cookies.find((c) => c.name === "cf_clearance");
+      if (cf?.value?.trim()) {
+        logger.info("cf_clearance cookie found during challenge resolution");
+        break;
+      }
+
+      const pageContent = await recoveryPage.content().catch(() => "");
+      if (!pageContent.toLowerCase().includes("just a moment") && !pageContent.includes("_cf_chl_opt")) {
+        logger.info("Challenge page resolved (page content changed)");
+        break;
+      }
+
+      const hasTurnstileWidget = await recoveryPage.evaluate(() => {
+        return !!(
+          document.querySelector('iframe[src*="challenges.cloudflare.com"]') ||
+          document.querySelector('[data-sitekey]') ||
+          document.querySelector('input[name="cf-turnstile-response"]')
+        );
+      }).catch(() => false);
+
+      if (hasTurnstileWidget) {
+        logger.info("Turnstile widget detected on challenge page, attempting solve...");
+        await this.maybeSolveTurnstileInRecoveryPage(recoveryPage);
+        await recoveryPage.waitForTimeout(2_000);
+        continue;
+      }
+
+      await recoveryPage.waitForTimeout(pollMs);
+    }
+
+    await recoveryPage.waitForTimeout(2_000);
+
+    const finalCookies = await ctx.cookies(["https://lift-api.vfsglobal.com"]);
+    const finalCf = finalCookies.find((c) => c.name === "cf_clearance");
+    if (finalCf?.value?.trim()) {
+      logger.info({ cookieLen: finalCf.value.length }, "CF recovery: cf_clearance obtained");
+    } else {
+      logger.warn("CF recovery: cf_clearance NOT obtained after waiting — retry will likely fail");
+    }
+  }
+
+  /**
+   * Generic CF challenge recovery for any lift-api POST.
+   * Detects "Just a moment" HTML, refreshes cf_clearance via the challenged URL, and retries once.
+   * Returns the successful response or throws on failure.
+   */
+  private async retryOnCfChallenge(
+    page: Page,
+    label: string,
+    postFn: () => Promise<{ status: number; body: string }>,
+    recoveryUrl?: string
+  ): Promise<{ status: number; body: string }> {
+    const beforeCfClearance = await this.getLiftApiCfClearanceValue(page);
+    const first = await postFn();
+    console.log(`[${label}] HTTP`, first.status, first.body.slice(0, 800));
+
+    if (first.status >= 200 && first.status < 300 && !this.isCloudflareJustAMoment(first.status, first.body)) {
+      return first;
+    }
+
+    if (this.isCloudflareJustAMoment(first.status, first.body)) {
+      const mode = this.getCfChallengeRecoveryMode();
+      logger.warn({ status: first.status, mode, step: label }, "Cloudflare challenge detected. Recovering cf_clearance then retrying once...");
+
+      await this.recoverCfClearanceForLiftApi(page, mode, recoveryUrl);
+      await this.waitForLiftApiCfClearanceChange(page, beforeCfClearance);
+
+      const retry = await postFn();
+      console.log(`[${label}] Retry HTTP`, retry.status, retry.body.slice(0, 800));
+      if (retry.status < 200 || retry.status >= 300) {
+        throw new Error(`${label} failed after CF retry HTTP ${retry.status}: ${retry.body.slice(0, 300)}`);
+      }
+      return retry;
+    }
+
+    throw new Error(`${label} failed HTTP ${first.status}: ${first.body.slice(0, 300)}`);
   }
 
   private parseApplicantsResponseJson(body: string): { urn?: string; error?: unknown; applicantList?: unknown } {
@@ -2327,7 +2385,7 @@ export class BrowserService {
           );
           void new TelegramService()
             .alert("error", "The entered email id is not registered.")
-            .catch(() => {});
+            .catch(() => { });
         }
         const flat = flattenVfsLoginResponseForProfile(json);
         if (flat) mergeVfsLoginProfile(flat);

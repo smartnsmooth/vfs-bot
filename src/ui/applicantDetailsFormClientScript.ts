@@ -42,9 +42,123 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
   }
 
   const countryMissionMap = {
-    ind: [{label: "Bulgaria", value: "bgr"}, {label: "Latvia", value: "lva"}],
+    ind: [{label: "Bulgaria", value: "bgr"}],
+    egy: [{label: "Portugal", value: "prt"}],
     sau: [{label: "Portugal", value: "prt"}],
   };
+
+  const centerCategoryMap = {
+    "ind-bgr": [
+      { value: "JAI", label: "Bulgaria Visa Application Centre-Jaipur", categories: [
+        { value: "LONGSTAY", label: "Long Stay D visa" },
+        { value: "SAW", label: "Seasonal worker" },
+        { value: "Busi", label: "Business Visa" },
+      ]},
+      { value: "HYD", label: "Bulgaria Visa Application Centre-Hyderabad", categories: [
+        { value: "LONGSTAY", label: "Long Stay D visa" },
+        { value: "SAW", label: "Seasonal worker" },
+        { value: "Busi", label: "Business Visa" },
+      ]},
+      { value: "JLD", label: "Bulgaria Visa Application Centre-Jalandhar", categories: [
+        { value: "LONGSTAY", label: "Long Stay D visa" },
+        { value: "SAW", label: "Seasonal worker" },
+        { value: "Busi", label: "Business Visa" },
+      ]},
+      { value: "BLR", label: "Bulgaria Visa Application Center ,Bangalore", categories: [
+        { value: "LONGSTAY", label: "Long Stay D visa" },
+        { value: "SAW", label: "Seasonal worker" },
+        { value: "Busi", label: "Business Visa" },
+      ]},
+      { value: "IXC", label: "Bulgaria Visa Application Centre-Chandigarh", categories: [
+        { value: "LONGSTAY", label: "Long Stay D visa" },
+        { value: "SAW", label: "Seasonal worker" },
+        { value: "Busi", label: "Business Visa" },
+      ]},
+      { value: "PNQ", label: "Bulgaria Visa Application Centre-Pune", categories: [
+        { value: "LONGSTAY", label: "Long Stay D visa" },
+        { value: "SAW", label: "Seasonal worker" },
+        { value: "Busi", label: "Business Visa" },
+      ]},
+      { value: "COK", label: "Bulgaria Visa Application Centre-Cochin", categories: [
+        { value: "LONGSTAY", label: "Long Stay D visa" },
+        { value: "SAW", label: "Seasonal worker" },
+        { value: "Busi", label: "Business Visa" },
+      ]},
+      { value: "GOI", label: "Bulgaria Visa Application Centre-Goa", categories: [
+        { value: "LONGSTAY", label: "Long Stay D visa" },
+        { value: "SAW", label: "Seasonal worker" },
+        { value: "Busi", label: "Business Visa" },
+      ]},
+      { value: "AMD", label: "Bulgaria Visa Application Centre-Ahmedabad", categories: [
+        { value: "LONGSTAY", label: "Long Stay D visa" },
+        { value: "SAW", label: "Seasonal worker" },
+        { value: "Busi", label: "Business Visa" },
+      ]},
+      { value: "PUD", label: "Bulgaria Visa Application Centre-Puducherry", categories: [
+        { value: "LONGSTAY", label: "Long Stay D visa" },
+        { value: "SAW", label: "Seasonal worker" },
+        { value: "Busi", label: "Business Visa" },
+      ]},
+      { value: "GUR", label: "Bulgaria Visa Application Center ,Gurugram", categories: [
+        { value: "LONGSTAY", label: "Long Stay D visa" },
+        { value: "SAW", label: "Seasonal worker" },
+        { value: "Busi", label: "Business Visa" },
+      ]},
+      { value: "NDEL", label: "Bulgaria Visa Application Center ,New Delhi", categories: [
+        { value: "LONGSTAY", label: "Long Stay D visa" },
+        { value: "SAW", label: "Seasonal worker" },
+        { value: "Busi", label: "Business Visa" },
+      ]},
+      { value: "BKC", label: "Bulgaria Visa Application Center, Mumbai", categories: [
+        { value: "LONGSTAY", label: "Long Stay D visa" },
+        { value: "SAW", label: "Seasonal worker" },
+        { value: "Busi", label: "Business Visa" },
+      ]},
+      { value: "MAA", label: "Bulgaria Visa Application Centre-Chennai", categories: [
+        { value: "LONGSTAY", label: "Long Stay D visa" },
+        { value: "SAW", label: "Seasonal worker" },
+        { value: "Busi", label: "Business Visa" },
+      ]},
+      { value: "CCU", label: "Bulgarian visa application center-Kolkata-VAC", categories: [
+        { value: "LONGSTAY", label: "Long Stay D visa" },
+        { value: "SAW", label: "Seasonal worker" },
+        { value: "Busi", label: "Business Visa" },
+      ]},
+    ],
+    "egy-prt": [
+      { value: "POAL", label: "Portugal Visa Application Center-Alexandria", categories: [
+        { value: "JB", label: "Job seeker" },
+        { value: "LT", label: "Long Term Visa - National" },
+        { value: "SWC", label: "Subordinated Work" },
+        { value: "Apel", label: "Appeal against the decision" },
+      ]},
+      { value: "POCA", label: "Portugal Visa Application Center-Cairo", categories: [
+        { value: "JB", label: "Job seeker" },
+        { value: "LT", label: "Long Term Visa - National" },
+        { value: "DV", label: "Long term Visa- E visa" },
+        { value: "SWC", label: "Subordinated Work" },
+        { value: "Apel", label: "Appeal against the decision" },
+      ]},
+    ],
+  };
+
+  var manualApplicantRoutes = { "egy-prt": true };
+  var manualApplicantFieldIds = ["firstName", "lastName", "dateOfBirth", "passportNumber", "dialCode", "contactNumber"];
+
+  function getRouteKey() {
+    var cc = (document.getElementById("countryCode") || {}).value || "";
+    var mc = (document.getElementById("missionCode") || {}).value || "";
+    return cc + "-" + mc;
+  }
+
+  function isManualApplicantRoute() {
+    return !!manualApplicantRoutes[getRouteKey()];
+  }
+
+  function updateManualApplicantFields() {
+    var el = document.getElementById("manualApplicantFields");
+    if (el) el.style.display = isManualApplicantRoute() ? "" : "none";
+  }
 
   function updateMissionOptions() {
     const countryEl = document.getElementById("countryCode");
@@ -61,6 +175,70 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       if (options[i].value === prevMission) opt.selected = true;
       missionEl.appendChild(opt);
     }
+    updateCenterOptions();
+    updateManualApplicantFields();
+  }
+
+  function populateCenterSelect(selectId, placeholderText, centers, prevValue) {
+    const el = document.getElementById(selectId);
+    if (!el) return;
+    el.innerHTML = "";
+    const ph = document.createElement("option");
+    ph.value = "";
+    ph.textContent = placeholderText;
+    el.appendChild(ph);
+    for (let i = 0; i < centers.length; i++) {
+      const opt = document.createElement("option");
+      opt.value = centers[i].value;
+      opt.textContent = centers[i].label;
+      if (centers[i].value === prevValue) opt.selected = true;
+      el.appendChild(opt);
+    }
+  }
+
+  function populateCategorySelect(selectId, categories, prevValue) {
+    const el = document.getElementById(selectId);
+    if (!el) return;
+    el.innerHTML = "";
+    const ph = document.createElement("option");
+    ph.value = "";
+    ph.textContent = "-- Select Category --";
+    el.appendChild(ph);
+    for (let i = 0; i < categories.length; i++) {
+      const opt = document.createElement("option");
+      opt.value = categories[i].value;
+      opt.textContent = categories[i].label;
+      if (categories[i].value === prevValue) opt.selected = true;
+      el.appendChild(opt);
+    }
+  }
+
+  function updateCenterOptions() {
+    var key = getRouteKey();
+    var centers = centerCategoryMap[key] || [];
+    var prevVac1 = (document.getElementById("vacCode") || {}).value || "";
+    var prevVac2 = (document.getElementById("vacCode2") || {}).value || "";
+    populateCenterSelect("vacCode", "-- Select Centre --", centers, prevVac1);
+    populateCenterSelect("vacCode2", "-- No Second Centre --", centers, prevVac2);
+    updateCategoryOptions("vacCode", "selectedSubvisaCategory");
+    updateCategoryOptions("vacCode2", "selectedSubvisaCategory2");
+  }
+
+  function updateCategoryOptions(centerSelectId, categorySelectId) {
+    var key = getRouteKey();
+    var centers = centerCategoryMap[key] || [];
+    var centerEl = document.getElementById(centerSelectId);
+    var prevCat = (document.getElementById(categorySelectId) || {}).value || "";
+    var categories = [];
+    if (centerEl && centerEl.value) {
+      for (var i = 0; i < centers.length; i++) {
+        if (centers[i].value === centerEl.value) {
+          categories = centers[i].categories;
+          break;
+        }
+      }
+    }
+    populateCategorySelect(categorySelectId, categories, prevCat);
   }
 
   let autoSaveTimeout = null;
@@ -110,14 +288,14 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       updateMissionOptions();
       const mcEl = document.getElementById("missionCode");
       if (mcEl) mcEl.value = "bgr";
-      const fieldsToClear = [
+      var fieldsToClear = [
         "passportExpirtyDate",
         "nationalityCode",
         "vacCode",
         "selectedSubvisaCategory",
         "vacCode2",
         "selectedSubvisaCategory2",
-      ];
+      ].concat(manualApplicantFieldIds);
       for (let fi = 0; fi < fieldsToClear.length; fi++) {
         const el = document.getElementById(fieldsToClear[fi]);
         if (el) el.value = "";
@@ -140,14 +318,14 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       if (u2El) u2El.value = "";
       if (p2El) p2El.value = "";
     }
-    const allFields = [
+    var allFields = [
       "passportExpirtyDate",
       "nationalityCode",
       "vacCode",
       "selectedSubvisaCategory",
       "vacCode2",
       "selectedSubvisaCategory2",
-    ];
+    ].concat(manualApplicantFieldIds);
     for (let ai = 0; ai < allFields.length; ai++) {
       const el = document.getElementById(allFields[ai]);
       if (el) el.value = "";
@@ -173,16 +351,28 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       if (ccEl && inst.details.countryCode) ccEl.value = String(inst.details.countryCode);
       updateMissionOptions();
       const mcEl = document.getElementById("missionCode");
-      if (mcEl && inst.details.missionCode) mcEl.value = String(inst.details.missionCode);
+      if (mcEl && inst.details.missionCode) { mcEl.value = String(inst.details.missionCode); updateCenterOptions(); }
 
+      const skipCenterCatIds = { vacCode: true, selectedSubvisaCategory: true, vacCode2: true, selectedSubvisaCategory2: true };
       const keys = Object.keys(inst.details);
       for (let ki = 0; ki < keys.length; ki++) {
         const k = keys[ki];
-        if (skipDetailIds[k]) continue;
+        if (skipDetailIds[k] || skipCenterCatIds[k]) continue;
         if (k === "scheduleDateRangeStart" || k === "scheduleDateRangeEnd" || k === "scheduleAllowedDates") continue;
         const el = document.getElementById(k);
         if (el) el.value = inst.details[k] == null ? "" : String(inst.details[k]);
       }
+      // Restore center selections, then rebuild per-center categories, then restore category selections.
+      var vc1El = document.getElementById("vacCode");
+      if (vc1El && inst.details.vacCode) vc1El.value = String(inst.details.vacCode);
+      updateCategoryOptions("vacCode", "selectedSubvisaCategory");
+      var sc1El = document.getElementById("selectedSubvisaCategory");
+      if (sc1El && inst.details.selectedSubvisaCategory) sc1El.value = String(inst.details.selectedSubvisaCategory);
+      var vc2El = document.getElementById("vacCode2");
+      if (vc2El && inst.details.vacCode2) vc2El.value = String(inst.details.vacCode2);
+      updateCategoryOptions("vacCode2", "selectedSubvisaCategory2");
+      var sc2El = document.getElementById("selectedSubvisaCategory2");
+      if (sc2El && inst.details.selectedSubvisaCategory2) sc2El.value = String(inst.details.selectedSubvisaCategory2);
     }
     applyInstanceScheduleRangeToForm(inst.details || {});
 
@@ -212,6 +402,12 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       selectedSubvisaCategory: fd.get("selectedSubvisaCategory"),
       vacCode2: fd.get("vacCode2") || undefined,
       selectedSubvisaCategory2: fd.get("selectedSubvisaCategory2") || undefined,
+      firstName: String(fd.get("firstName") || "").trim() || undefined,
+      lastName: String(fd.get("lastName") || "").trim() || undefined,
+      dateOfBirth: String(fd.get("dateOfBirth") || "").trim() || undefined,
+      passportNumber: String(fd.get("passportNumber") || "").trim() || undefined,
+      dialCode: String(fd.get("dialCode") || "").trim() || undefined,
+      contactNumber: String(fd.get("contactNumber") || "").trim() || undefined,
       scheduleDateRangeStart: String(fd.get("scheduleDateRangeStart") ?? "").trim(),
       scheduleDateRangeEnd: String(fd.get("scheduleDateRangeEnd") ?? "").trim(),
       numInstances: getNumInstances(),
@@ -273,6 +469,27 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       if (countryCodeSelect) {
         countryCodeSelect.addEventListener("change", function () {
           updateMissionOptions();
+          scheduleAutoSave();
+        });
+      }
+      const missionCodeSelect = document.getElementById("missionCode");
+      if (missionCodeSelect) {
+        missionCodeSelect.addEventListener("change", function () {
+          updateCenterOptions();
+          scheduleAutoSave();
+        });
+      }
+      const vacCodeSelect = document.getElementById("vacCode");
+      if (vacCodeSelect) {
+        vacCodeSelect.addEventListener("change", function () {
+          updateCategoryOptions("vacCode", "selectedSubvisaCategory");
+          scheduleAutoSave();
+        });
+      }
+      const vacCode2Select = document.getElementById("vacCode2");
+      if (vacCode2Select) {
+        vacCode2Select.addEventListener("change", function () {
+          updateCategoryOptions("vacCode2", "selectedSubvisaCategory2");
           scheduleAutoSave();
         });
       }
@@ -348,6 +565,12 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       selectedSubvisaCategory: fd.get("selectedSubvisaCategory"),
       vacCode2: fd.get("vacCode2") || undefined,
       selectedSubvisaCategory2: fd.get("selectedSubvisaCategory2") || undefined,
+      firstName: String(fd.get("firstName") || "").trim() || undefined,
+      lastName: String(fd.get("lastName") || "").trim() || undefined,
+      dateOfBirth: String(fd.get("dateOfBirth") || "").trim() || undefined,
+      passportNumber: String(fd.get("passportNumber") || "").trim() || undefined,
+      dialCode: String(fd.get("dialCode") || "").trim() || undefined,
+      contactNumber: String(fd.get("contactNumber") || "").trim() || undefined,
       scheduleDateRangeStart: String(fd.get("scheduleDateRangeStart") ?? "").trim(),
       scheduleDateRangeEnd: String(fd.get("scheduleDateRangeEnd") ?? "").trim(),
       numInstances: getNumInstances(),

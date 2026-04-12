@@ -1,6 +1,6 @@
 import { config, getCurrentInstanceId } from "./config";
 import { getEffectiveLiftLoginUser } from "../utils/liftLoginUser";
-import { getTotalAmount } from "../utils/totalAmount.store";
+import { getTotalAmount, getCurrency } from "../utils/totalAmount.store";
 import { getSlotCenterOverride } from "../utils/slotCenterOverride.store";
 import { getApplicantDetailsOverrides } from "../utils/applicantDetails.store";
 
@@ -22,6 +22,11 @@ export function buildScheduleBody(urn: string, allocationId: string): Record<str
   const totalAmountNum = Number.parseFloat(normalizedAmount);
   if (!Number.isFinite(totalAmountNum)) {
     throw new Error(`Schedule API requires numeric totalAmount from fees response; got: ${totalAmountRaw}`);
+  }
+
+  const currencyRaw = getCurrency();
+  if (!currencyRaw) {
+    throw new Error("Schedule API requires currency from fees response");
   }
 
   const override = getSlotCenterOverride();
@@ -47,7 +52,7 @@ export function buildScheduleBody(urn: string, allocationId: string): Record<str
       clientId: "",
       merchantId: "",
       amount: totalAmountNum,
-      currency: "INR",
+      currency: currencyRaw,
     },
     urn: u,
   };

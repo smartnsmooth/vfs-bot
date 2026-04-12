@@ -138,6 +138,12 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
   const out: Record<string, unknown> = {};
   const str = (k: string) => (typeof j[k] === "string" ? (j[k] as string).trim() : j[k]);
   const keys = [
+    "firstName",
+    "lastName",
+    "dateOfBirth",
+    "passportNumber",
+    "dialCode",
+    "contactNumber",
     "middleName",
     "passportExpirtyDate",
     "confirmPassportNumber",
@@ -206,12 +212,12 @@ function buildPageHtml(collectLogin: boolean): string {
     <label for="countryCode" style="margin-top:0.5rem">From country</label>
     <select id="countryCode" name="countryCode">
       <option value="ind">India</option>
+      <option value="egy">Egypt</option>
       <option value="sau">Saudi Arabia</option>
     </select>
     <label for="missionCode" style="margin-top:0.75rem">To country</label>
     <select id="missionCode" name="missionCode">
       <option value="bgr">Bulgaria</option>
-      <option value="lva">Latvia</option>
       <option value="prt">Portugal</option>
     </select>
     <div style="display:flex;align-items:center;gap:0.5rem;margin-top:0.75rem">
@@ -333,7 +339,38 @@ function buildPageHtml(collectLogin: boolean): string {
       </div>
       <div class="form-col form-col--details">
         <h2 class="col-heading">Applicant details</h2>
-        <p class="col-sub">Passport expiry, nationality, gender, and visa centre / category. Name, email, phone, DOB, and passport number come from the VFS login response after sign-in.</p>
+        <div id="manualApplicantFields" style="margin-bottom:1rem;display:none">
+          <div class="row2">
+            <div>
+              <label for="firstName">First name</label>
+              <input id="firstName" name="firstName" placeholder="John" />
+            </div>
+            <div>
+              <label for="lastName">Last name</label>
+              <input id="lastName" name="lastName" placeholder="Doe" />
+            </div>
+          </div>
+          <div class="row2">
+            <div>
+              <label for="dateOfBirth">Date of birth (DD/MM/YYYY)</label>
+              <input id="dateOfBirth" name="dateOfBirth" placeholder="15/06/1990" />
+            </div>
+            <div>
+              <label for="passportNumber">Passport number</label>
+              <input id="passportNumber" name="passportNumber" placeholder="A12345678" />
+            </div>
+          </div>
+          <div class="row2">
+            <div>
+              <label for="dialCode">Dial code</label>
+              <input id="dialCode" name="dialCode" placeholder="+20" />
+            </div>
+            <div>
+              <label for="contactNumber">Contact number</label>
+              <input id="contactNumber" name="contactNumber" placeholder="1012345678" />
+            </div>
+          </div>
+        </div>
         ${scheduleAllowedDatesBlock}
         <label for="passportExpirtyDate">Passport expiry (DD/MM/YYYY)</label>
         <input id="passportExpirtyDate" name="passportExpirtyDate" placeholder="23/04/2027" />
@@ -569,28 +606,10 @@ function buildPageHtml(collectLogin: boolean): string {
         <label for="vacCode">Visa Application Centre</label>
         <select id="vacCode" name="vacCode">
           <option value="">-- Select Centre --</option>
-          <option value="JAI">Bulgaria Visa Application Centre-Jaipur</option>
-          <option value="HYD">Bulgaria Visa Application Centre-Hyderabad</option>
-          <option value="JLD">Bulgaria Visa Application Centre-Jalandhar</option>
-          <option value="BLR">Bulgaria Visa Application Center ,Bangalore</option>
-          <option value="IXC">Bulgaria Visa Application Centre-Chandigarh</option>
-          <option value="PNQ">Bulgaria Visa Application Centre-Pune</option>
-          <option value="COK">Bulgaria Visa Application Centre-Cochin</option>
-          <option value="GOI">Bulgaria Visa Application Centre-Goa</option>
-          <option value="AMD">Bulgaria Visa Application Centre-Ahmedabad</option>
-          <option value="PUD">Bulgaria Visa Application Centre-Puducherry</option>
-          <option value="GUR">Bulgaria Visa Application Center ,Gurugram</option>
-          <option value="NDEL">Bulgaria Visa Application Center ,New Delhi</option>
-          <option value="BKC">Bulgaria Visa Application Center, Mumbai</option>
-          <option value="MAA">Bulgaria Visa Application Centre-Chennai</option>
-          <option value="CCU">Bulgarian visa application center-Kolkata-VAC</option>
         </select>
         <label for="selectedSubvisaCategory">Visa Category (Center 1)</label>
         <select id="selectedSubvisaCategory" name="selectedSubvisaCategory">
           <option value="">-- Select Category --</option>
-          <option value="LONGSTAY">Long Stay D visa</option>
-          <option value="SAW">Seasonal worker</option>
-          <option value="Busi">Business Visa</option>
         </select>
 
         <hr class="section-rule" />
@@ -600,28 +619,10 @@ function buildPageHtml(collectLogin: boolean): string {
         <label for="vacCode2">Visa Application Centre 2 (Optional)</label>
         <select id="vacCode2" name="vacCode2">
           <option value="">-- No Second Centre --</option>
-          <option value="JAI">Bulgaria Visa Application Centre-Jaipur</option>
-          <option value="HYD">Bulgaria Visa Application Centre-Hyderabad</option>
-          <option value="JLD">Bulgaria Visa Application Centre-Jalandhar</option>
-          <option value="BLR">Bulgaria Visa Application Center ,Bangalore</option>
-          <option value="IXC">Bulgaria Visa Application Centre-Chandigarh</option>
-          <option value="PNQ">Bulgaria Visa Application Centre-Pune</option>
-          <option value="COK">Bulgaria Visa Application Centre-Cochin</option>
-          <option value="GOI">Bulgaria Visa Application Centre-Goa</option>
-          <option value="AMD">Bulgaria Visa Application Centre-Ahmedabad</option>
-          <option value="PUD">Bulgaria Visa Application Centre-Puducherry</option>
-          <option value="GUR">Bulgaria Visa Application Center ,Gurugram</option>
-          <option value="NDEL">Bulgaria Visa Application Center ,New Delhi</option>
-          <option value="BKC">Bulgaria Visa Application Center, Mumbai</option>
-          <option value="MAA">Bulgaria Visa Application Centre-Chennai</option>
-          <option value="CCU">Bulgarian visa application center-Kolkata-VAC</option>
         </select>
         <label for="selectedSubvisaCategory2">Visa Category 2 (Optional)</label>
         <select id="selectedSubvisaCategory2" name="selectedSubvisaCategory2">
           <option value="">-- Select Category --</option>
-          <option value="LONGSTAY">Long Stay D visa</option>
-          <option value="SAW">Seasonal worker</option>
-          <option value="Busi">Business Visa</option>
         </select>
       </div>
     </div>

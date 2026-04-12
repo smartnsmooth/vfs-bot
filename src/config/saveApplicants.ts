@@ -396,7 +396,14 @@ export function buildSaveApplicantsBody(): Record<string, unknown> {
     if (lu) {
       clone.loginUser = lu;
       const list = clone.applicantList as Record<string, unknown>[] | undefined;
-      if (list?.[0]) list[0].loginUser = lu;
+      if (list?.[0]) {
+        list[0].loginUser = lu;
+        const a = list[0] as Record<string, unknown>;
+        const hasEmail = typeof a.emailId === "string" && a.emailId.trim() !== "";
+        if (!hasEmail && looksLikeEmailForVfsLogin(lu)) {
+          a.emailId = lu.trim().toLowerCase();
+        }
+      }
     }
     merged = clone;
   }
