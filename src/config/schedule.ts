@@ -37,14 +37,12 @@ export function buildScheduleBody(urn: string, allocationId: string): Record<str
   if (!centerCode) throw new Error("Schedule API requires centerCode from slot override or setup form");
 
   return {
-    CanVFSReachoutToApplicant: process.env.VFS_SCHEDULE_CAN_REACHOUT !== "false",
-    TnCConsentAndAcceptance: process.env.VFS_SCHEDULE_TNC !== "false",
-    allocationId: alloc,
-    aurn: null,
-    centerCode,
-    countryCode: config.slotPayload.countryCode,
-    loginUser,
     missionCode: config.slotPayload.missionCode,
+    countryCode: config.slotPayload.countryCode,
+    centerCode,
+    loginUser,
+    urn: u,
+    aurn: null,
     notificationType: (process.env.VFS_SCHEDULE_NOTIFICATION_TYPE ?? "none").trim() || "none",
     paymentdetails: {
       paymentmode: "Online",
@@ -54,6 +52,8 @@ export function buildScheduleBody(urn: string, allocationId: string): Record<str
       amount: totalAmountNum,
       currency: currencyRaw,
     },
-    urn: u,
+    allocationId: alloc,
+    CanVFSReachoutToApplicant: process.env.VFS_SCHEDULE_CAN_REACHOUT !== "false",
+    TnCConsentAndAcceptance: process.env.VFS_SCHEDULE_TNC !== "false",
   };
 }

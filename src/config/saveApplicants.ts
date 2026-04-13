@@ -96,8 +96,6 @@ const SAVE_APPLICANTS_APPLICANT_KEY_ORDER: readonly string[] = [
   "Retryleft",
   "visaSubClass",
   "ipAddress",
-  "applicantImage",
-  "applicantImageData",
 ];
 
 function orderObjectKeys(obj: Record<string, unknown>, order: readonly string[]): Record<string, unknown> {
@@ -162,12 +160,16 @@ const APPLICANT_UI_ONLY_KEYS = [
   "vacCode",
   "vacCode2",
   "selectedSubvisaCategory2",
+  "applicantImage",
+  "applicantImageData",
+  "countryCode",
+  "missionCode",
 ] as const;
 
 /**
  * Match browser-captured lift-api shape: drop UI-only keys; ensure `visaSubClass` (often null);
- * lift-api may require `applicantImage` / `applicantImageData` keys (even empty), lowercase `emailId`,
- * and strict JSON key order: `ipAddress` then `applicantImage` then `applicantImageData` (see SAVE_APPLICANTS_APPLICANT_KEY_ORDER).
+ * Uppercase `emailId`, force `selectedSubvisaCategory` to null,
+ * and strict JSON key order (see SAVE_APPLICANTS_APPLICANT_KEY_ORDER).
  */
 function finalizeApplicantForLiftApiPost(body: Record<string, unknown>): void {
   const list = body.applicantList;
@@ -179,15 +181,10 @@ function finalizeApplicantForLiftApiPost(body: Record<string, unknown>): void {
   if (!Object.prototype.hasOwnProperty.call(a, "visaSubClass")) {
     a.visaSubClass = null;
   }
-  if (!Object.prototype.hasOwnProperty.call(a, "applicantImage")) {
-    a.applicantImage = "";
-  }
-  if (!Object.prototype.hasOwnProperty.call(a, "applicantImageData")) {
-    a.applicantImageData = "";
-  }
+  a.selectedSubvisaCategory = null;
   const em = a.emailId;
   if (typeof em === "string" && em.trim() !== "") {
-    a.emailId = em.trim().toLowerCase();
+    a.emailId = em.trim().toUpperCase();
   }
 }
 
@@ -223,7 +220,7 @@ function mergeVfsLoginProfileIntoSaveApplicantsBody(body: Record<string, unknown
 
   const eid = typeof pr.emailId === "string" ? pr.emailId.trim() : "";
   if (eid) {
-    a.emailId = eid.toLowerCase();
+    a.emailId = eid.toUpperCase();
   }
 
   const nat = typeof pr.nationalityCode === "string" ? pr.nationalityCode.trim() : "";
@@ -245,7 +242,7 @@ function mergeVfsLoginProfileIntoSaveApplicantsBody(body: Record<string, unknown
     a.loginUser = lu;
     const hasEmail = typeof a.emailId === "string" && a.emailId.trim() !== "";
     if (!hasEmail && looksLikeEmailForVfsLogin(lu)) {
-      a.emailId = lu.trim().toLowerCase();
+      a.emailId = lu.trim().toUpperCase();
     }
   }
 }
@@ -331,8 +328,6 @@ export function buildSaveApplicantsBodyFromEnv(): Record<string, unknown> {
     Retryleft: "",
     visaSubClass: null,
     ipAddress: getApplicantIpForPayload(),
-    applicantImage: "",
-    applicantImageData: "",
   };
 
   return normalizeSaveApplicantsBody({
@@ -401,7 +396,7 @@ export function buildSaveApplicantsBody(): Record<string, unknown> {
         const a = list[0] as Record<string, unknown>;
         const hasEmail = typeof a.emailId === "string" && a.emailId.trim() !== "";
         if (!hasEmail && looksLikeEmailForVfsLogin(lu)) {
-          a.emailId = lu.trim().toLowerCase();
+          a.emailId = lu.trim().toUpperCase();
         }
       }
     }

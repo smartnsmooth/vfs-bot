@@ -887,10 +887,7 @@ export class BrowserService {
     const body = buildSaveApplicantsBody();
     logger.info({ url: SAVE_APPLICANTS_URL }, "Saving applicant via lift-api");
 
-    const res = await this.retryOnCfChallenge(page, "Applicants", () =>
-      this.postLiftJsonFromPage(page, SAVE_APPLICANTS_URL, body),
-      SAVE_APPLICANTS_URL
-    );
+    const res = await this.postLiftJsonFromPage(page, SAVE_APPLICANTS_URL, body);
 
     const parsed = this.parseApplicantsResponseJson(res.body);
     if (parsed.urn) setApplicationUrn(parsed.urn);
@@ -900,10 +897,7 @@ export class BrowserService {
   private async postFeesLiftApiOnPage(page: Page, urn: string): Promise<void> {
     const feesPayload = buildFeesBody(urn);
     logger.info({ url: FEES_URL }, "Calling lift-api fees");
-    const res = await this.retryOnCfChallenge(page, "Fees", () =>
-      this.postLiftJsonFromPage(page, FEES_URL, feesPayload),
-      FEES_URL
-    );
+    const res = await this.postLiftJsonFromPage(page, FEES_URL, feesPayload);
     try {
       const j = JSON.parse(res.body) as {
         error?: unknown;
@@ -945,10 +939,7 @@ export class BrowserService {
   ): Promise<void> {
     const payload = buildCalendarBody(urn);
     logger.info({ url: CALENDAR_URL, fromDate: payload.fromDate }, "Calling lift-api calendar");
-    const res = await this.retryOnCfChallenge(page, "Calendar", () =>
-      this.postLiftJsonFromPage(page, CALENDAR_URL, payload),
-      CALENDAR_URL
-    );
+    const res = await this.postLiftJsonFromPage(page, CALENDAR_URL, payload);
     let j: { error?: unknown; calendars?: Array<{ date?: string; isWeekend?: boolean }> };
     try {
       j = JSON.parse(res.body) as typeof j;
@@ -1011,10 +1002,7 @@ export class BrowserService {
   private async postTimeslotLiftApiOnPage(page: Page, urn: string, slotDateFromCalendar: string): Promise<void> {
     const payload = buildTimeslotBody(urn, slotDateFromCalendar);
     logger.info({ url: TIMESLOT_URL, slotDate: payload.slotDate }, "Calling lift-api timeslot");
-    const res = await this.retryOnCfChallenge(page, "Timeslot", () =>
-      this.postLiftJsonFromPage(page, TIMESLOT_URL, payload),
-      TIMESLOT_URL
-    );
+    const res = await this.postLiftJsonFromPage(page, TIMESLOT_URL, payload);
     let j: {
       error?: unknown;
       slots?: Array<{ allocationId?: string; slot?: string; type?: string }>;
@@ -1048,10 +1036,7 @@ export class BrowserService {
     const payload = buildScheduleBody(urn, allocationId);
     logger.info({ url: SCHEDULE_URL }, "Calling lift-api schedule");
 
-    const res = await this.retryOnCfChallenge(page, "Schedule", () =>
-      this.postLiftJsonFromPage(page, SCHEDULE_URL, payload),
-      SCHEDULE_URL
-    );
+    const res = await this.postLiftJsonFromPage(page, SCHEDULE_URL, payload);
     console.log("[Schedule] Final HTTP", res.status, res.body.slice(0, 800));
     let j: {
       error?: unknown;
@@ -1133,179 +1118,6 @@ export class BrowserService {
       page.evaluate((u) => window.location.assign(u), finalUrl),
     ]);
     logger.info({ redirectedTo: page.url() }, "Schedule redirect navigation completed");
-  }
-
-  private isCloudflareJustAMoment(_status: number, body: string): boolean {
-    const s = body.toLowerCase();
-    return s.includes("just a moment") || s.includes("cf-browser-verification") || s.includes("turnstile") || s.includes("_cf_chl_opt");
-  }
-
-  private getCfChallengeRecoveryMode(): "new_tab" | "same_tab" {
-    const raw = process.env.VFS_CF_CHALLENGE_RECOVERY_MODE ?? "new_tab";
-    const v = raw.toLowerCase().trim();
-    if (v === "same_tab" || v === "sometab" || v === "same") return "same_tab";
-    return "new_tab";
-  }
-
-  private async getLiftApiCfClearanceValue(page: Page): Promise<string | null> {
-    const cookies = await page.context().cookies(["https://lift-api.vfsglobal.com"]);
-    const cf = cookies.find((c) => c.name === "cf_clearance");
-    return cf?.value?.trim() ?? null;
-  }
-
-  private async waitForLiftApiCfClearanceChange(page: Page, before: string | null): Promise<void> {
-    const timeoutMs = 25_000;
-    const pollMs = 500;
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      const now = await this.getLiftApiCfClearanceValue(page);
-      if (now && now !== before) return;
-      await page.waitForTimeout(pollMs);
-    }
-    logger.warn("cf_clearance did not change within timeout; retry may still fail.");
-  }
-
-  /**
-   * Trigger Cloudflare challenge in a real browser context so cf_clearance updates.
-   * mode=new_tab is safest (uses a temporary tab).
-   * mode=same_tab navigates current tab to the lift-api URL and then returns back.
-   */
-  private async recoverCfClearanceForLiftApi(page: Page, mode: "new_tab" | "same_tab", targetUrl?: string): Promise<void> {
-    const liftUrl = targetUrl || SAVE_APPLICANTS_URL;
-
-    if (mode === "new_tab") {
-      const tmp = await page.context().newPage();
-      try {
-        logger.info({ url: liftUrl, mode }, "Opening recovery tab for CF challenge");
-        await tmp.goto(liftUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
-        await this.waitForCfChallengeResolution(tmp, page.context());
-      } finally {
-        await tmp.close().catch(() => { });
-      }
-      return;
-    }
-
-    const prevUrl = (() => {
-      try {
-        return page.url();
-      } catch {
-        return "";
-      }
-    })();
-
-    try {
-      logger.info({ url: liftUrl, mode }, "Navigating current tab for CF challenge recovery");
-      await page.goto(liftUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
-      await this.waitForCfChallengeResolution(page, page.context());
-    } finally {
-      if (mode === "same_tab") {
-        const restore = prevUrl || "https://visa.vfsglobal.com/";
-        await page.goto(restore, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => { });
-      }
-    }
-  }
-
-  private async maybeSolveTurnstileInRecoveryPage(page: Page): Promise<void> {
-    if (config.capmonsterEnabled && config.capmonsterApiKey) {
-      // Solve if a Turnstile widget exists on the recovery page.
-      await this.solveAndInjectTurnstile(page, page.url());
-      return;
-    }
-    logger.info("Recovery page: please solve Turnstile in the browser, then press Enter in this terminal.");
-    await waitForEnter();
-  }
-
-  /**
-   * Wait for Cloudflare managed challenge to auto-resolve.
-   * The challenge JS runs in the browser and, on success, sets cf_clearance and
-   * redirects the page. We poll for either the cookie appearing or the page
-   * navigating away from the challenge.
-   */
-  private async waitForCfChallengeResolution(recoveryPage: Page, ctx: import("playwright").BrowserContext): Promise<void> {
-    const maxWaitMs = 35_000;
-    const pollMs = 1_000;
-    const deadline = Date.now() + maxWaitMs;
-
-    logger.info("Waiting for Cloudflare managed challenge to auto-resolve...");
-
-    while (Date.now() < deadline) {
-      const cookies = await ctx.cookies(["https://lift-api.vfsglobal.com"]);
-      const cf = cookies.find((c) => c.name === "cf_clearance");
-      if (cf?.value?.trim()) {
-        logger.info("cf_clearance cookie found during challenge resolution");
-        break;
-      }
-
-      const pageContent = await recoveryPage.content().catch(() => "");
-      if (!pageContent.toLowerCase().includes("just a moment") && !pageContent.includes("_cf_chl_opt")) {
-        logger.info("Challenge page resolved (page content changed)");
-        break;
-      }
-
-      const hasTurnstileWidget = await recoveryPage.evaluate(() => {
-        return !!(
-          document.querySelector('iframe[src*="challenges.cloudflare.com"]') ||
-          document.querySelector('[data-sitekey]') ||
-          document.querySelector('input[name="cf-turnstile-response"]')
-        );
-      }).catch(() => false);
-
-      if (hasTurnstileWidget) {
-        logger.info("Turnstile widget detected on challenge page, attempting solve...");
-        await this.maybeSolveTurnstileInRecoveryPage(recoveryPage);
-        await recoveryPage.waitForTimeout(2_000);
-        continue;
-      }
-
-      await recoveryPage.waitForTimeout(pollMs);
-    }
-
-    await recoveryPage.waitForTimeout(2_000);
-
-    const finalCookies = await ctx.cookies(["https://lift-api.vfsglobal.com"]);
-    const finalCf = finalCookies.find((c) => c.name === "cf_clearance");
-    if (finalCf?.value?.trim()) {
-      logger.info({ cookieLen: finalCf.value.length }, "CF recovery: cf_clearance obtained");
-    } else {
-      logger.warn("CF recovery: cf_clearance NOT obtained after waiting — retry will likely fail");
-    }
-  }
-
-  /**
-   * Generic CF challenge recovery for any lift-api POST.
-   * Detects "Just a moment" HTML, refreshes cf_clearance via the challenged URL, and retries once.
-   * Returns the successful response or throws on failure.
-   */
-  private async retryOnCfChallenge(
-    page: Page,
-    label: string,
-    postFn: () => Promise<{ status: number; body: string }>,
-    recoveryUrl?: string
-  ): Promise<{ status: number; body: string }> {
-    const beforeCfClearance = await this.getLiftApiCfClearanceValue(page);
-    const first = await postFn();
-    console.log(`[${label}] HTTP`, first.status, first.body.slice(0, 800));
-
-    if (first.status >= 200 && first.status < 300 && !this.isCloudflareJustAMoment(first.status, first.body)) {
-      return first;
-    }
-
-    if (this.isCloudflareJustAMoment(first.status, first.body)) {
-      const mode = this.getCfChallengeRecoveryMode();
-      logger.warn({ status: first.status, mode, step: label }, "Cloudflare challenge detected. Recovering cf_clearance then retrying once...");
-
-      await this.recoverCfClearanceForLiftApi(page, mode, recoveryUrl);
-      await this.waitForLiftApiCfClearanceChange(page, beforeCfClearance);
-
-      const retry = await postFn();
-      console.log(`[${label}] Retry HTTP`, retry.status, retry.body.slice(0, 800));
-      if (retry.status < 200 || retry.status >= 300) {
-        throw new Error(`${label} failed after CF retry HTTP ${retry.status}: ${retry.body.slice(0, 300)}`);
-      }
-      return retry;
-    }
-
-    throw new Error(`${label} failed HTTP ${first.status}: ${first.body.slice(0, 300)}`);
   }
 
   private parseApplicantsResponseJson(body: string): { urn?: string; error?: unknown; applicantList?: unknown } {

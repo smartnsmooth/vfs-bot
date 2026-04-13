@@ -39,7 +39,7 @@ const polling = new PollingService();
 const browser = new BrowserService();
 const telegram = new TelegramService();
 
-const POST_LOGIN_POLL_DELAY_MS = 30_000;
+const POST_LOGIN_POLL_DELAY_MS = 60_000;
 const FAST_SKIP_CALENDAR_UP_TO_INSTANCE = Math.max(
   0,
   parseInt(process.env.FAST_SKIP_CALENDAR_UP_TO_INSTANCE ?? "5", 10) || 5
