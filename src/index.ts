@@ -41,7 +41,7 @@ const browser = new BrowserService();
 const telegram = new TelegramService();
 
 const POLL_INTERVAL_MS = config.pollingIntervalMs;
-const POST_LOGIN_POLL_DELAY_MS = 30_000;
+const POST_LOGIN_POLL_DELAY_MS = 60_000;
 const FAST_SKIP_CALENDAR_UP_TO_INSTANCE = Math.max(
   0,
   parseInt(process.env.FAST_SKIP_CALENDAR_UP_TO_INSTANCE ?? "5", 10) || 5
@@ -842,6 +842,12 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
     } else {
       throw err;
     }
+  }
+
+  const isEgyptPortugal =
+    config.slotPayload.countryCode === "egy" && config.slotPayload.missionCode === "prt";
+  if (isEgyptPortugal) {
+    await browser.postMapVasLiftApi();
   }
 
   await browser.postFeesLiftApi();

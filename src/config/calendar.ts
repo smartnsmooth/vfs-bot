@@ -1,9 +1,9 @@
-import { config } from "./config";
+import { config, getCurrentInstanceId } from "./config";
 import { getEffectiveLiftLoginUser } from "../utils/liftLoginUser";
 import { getSlotCenterOverride } from "../utils/slotCenterOverride.store";
+import { getApplicantDetailsOverrides } from "../utils/applicantDetails.store";
 
-export const CALENDAR_URL =
-  process.env.VFS_CALENDAR_URL ?? "https://lift-api.vfsglobal.com/appointment/calendar";
+export const CALENDAR_URL = "https://lift-api.vfsglobal.com/appointment/calendar";
 
 /** DD/MM/YYYY — two days after today in local timezone. */
 function calendarFromDate(): string {
@@ -22,15 +22,24 @@ export function buildCalendarBody(urn: string): Record<string, unknown> {
 
   const loginUser = getEffectiveLiftLoginUser();
   const override = getSlotCenterOverride();
+  const details = getApplicantDetailsOverrides(getCurrentInstanceId());
+  const centerCode = override?.centerCode
+    || (typeof details?.vacCode === "string" ? details.vacCode.trim() : "");
+  const visaCategoryCode = override?.visaCategoryCode
+    || (typeof details?.selectedSubvisaCategory === "string" ? details.selectedSubvisaCategory.trim() : "");
+
+  if (!centerCode || !visaCategoryCode) {
+    throw new Error("Calendar API requires centerCode/visaCategoryCode from slot override or setup form");
+  }
 
   return {
-    centerCode: override?.centerCode ?? config.slotPayload.vacCode,
+    centerCode,
     countryCode: config.slotPayload.countryCode,
     fromDate: calendarFromDate(),
     loginUser,
     missionCode: config.slotPayload.missionCode,
-    payCode: config.slotPayload.payCode ?? "",
+    payCode: "",
     urn: u,
-    visaCategoryCode: override?.visaCategoryCode ?? config.slotPayload.visaCategoryCode,
+    visaCategoryCode,
   };
 }

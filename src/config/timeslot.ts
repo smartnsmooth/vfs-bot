@@ -1,9 +1,9 @@
-import { config } from "./config";
+import { config, getCurrentInstanceId } from "./config";
 import { getEffectiveLiftLoginUser } from "../utils/liftLoginUser";
 import { getSlotCenterOverride } from "../utils/slotCenterOverride.store";
+import { getApplicantDetailsOverrides } from "../utils/applicantDetails.store";
 
-export const TIMESLOT_URL =
-  process.env.VFS_TIMESLOT_URL ?? "https://lift-api.vfsglobal.com/appointment/timeslot";
+export const TIMESLOT_URL = "https://lift-api.vfsglobal.com/appointment/timeslot";
 
 /**
  * Calendar API returns dates like MM/DD/YYYY (e.g. 03/19/2026).
@@ -24,14 +24,23 @@ export function buildTimeslotBody(urn: string, slotDateFromCalendar: string): Re
   const loginUser = getEffectiveLiftLoginUser();
   const slotDate = calendarDateToTimeslotSlotDate(slotDateFromCalendar);
   const override = getSlotCenterOverride();
+  const details = getApplicantDetailsOverrides(getCurrentInstanceId());
+  const centerCode = override?.centerCode
+    || (typeof details?.vacCode === "string" ? details.vacCode.trim() : "");
+  const visaCategoryCode = override?.visaCategoryCode
+    || (typeof details?.selectedSubvisaCategory === "string" ? details.selectedSubvisaCategory.trim() : "");
+
+  if (!centerCode || !visaCategoryCode) {
+    throw new Error("Timeslot API requires centerCode/visaCategoryCode from slot override or setup form");
+  }
 
   return {
-    centerCode: override?.centerCode ?? config.slotPayload.vacCode,
+    centerCode,
     countryCode: config.slotPayload.countryCode,
     loginUser,
     missionCode: config.slotPayload.missionCode,
     slotDate,
     urn: u,
-    visaCategoryCode: override?.visaCategoryCode ?? config.slotPayload.visaCategoryCode,
+    visaCategoryCode,
   };
 }

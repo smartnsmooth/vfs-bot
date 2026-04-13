@@ -1,4 +1,3 @@
-import { randomBytes } from "node:crypto";
 import { chromium, Browser, BrowserContext, Page } from "playwright";
 
 /** Returns true when the error is Playwright's "Target closed" family of errors. */
@@ -17,13 +16,14 @@ import { buildCalendarBody, CALENDAR_URL } from "../config/calendar";
 import { buildScheduleBody, SCHEDULE_URL } from "../config/schedule";
 import { buildTimeslotBody, TIMESLOT_URL } from "../config/timeslot";
 import { buildFeesBody, FEES_URL } from "../config/fees";
+import { buildMapVasBody, MAPVAS_URL } from "../config/mapvas";
 import { buildSaveApplicantsBody, SAVE_APPLICANTS_URL } from "../config/saveApplicants";
 import { logger } from "../utils/logger";
 import { ensureApplicantIpResolved } from "../utils/applicantIp";
 import { getAllocationId, setAllocationId } from "../utils/allocationId.store";
 import { getApplicationUrn, setApplicationUrn } from "../utils/applicationUrn.store";
 import { getSlotDate, setSlotDate } from "../utils/slotDate.store";
-import { setTotalAmount } from "../utils/totalAmount.store";
+import { setTotalAmount, setCurrency } from "../utils/totalAmount.store";
 import {
   getCapturedClientSource,
   setCapturedClientSource,
@@ -97,15 +97,6 @@ function readClientSourceHeader(headers: Record<string, string>): string | undef
     headers["ClientSource"] ??
     headers["CLIENTSOURCE"];
   return raw?.trim() || undefined;
-}
-
-/**
- * Generates a fresh random clientsource token matching the VFS format:
- * 256 random bytes encoded as standard base64 (≈ 344 character string ending with "==").
- * Called per-request when VFS_RANDOM_CLIENTSOURCE=true.
- */
-function generateRandomClientSource(): string {
-  return randomBytes(256).toString("base64");
 }
 
 export class BrowserService {
@@ -844,6 +835,19 @@ export class BrowserService {
   }
 
   /**
+   * POST /vas/mapvas (after timeslot, before fees). Egypt→Portugal portal only.
+   */
+  async postMapVasLiftApi(): Promise<void> {
+    const urn = getApplicationUrn();
+    if (!urn?.trim()) {
+      logger.warn("Skip mapvas API: no urn; save applicants successfully first");
+      return;
+    }
+    const page = await this.getVfsPage();
+    await this.postMapVasLiftApiOnPage(page, urn);
+  }
+
+  /**
    * POST /appointment/schedule (after timeslot). Uses URN, allocationId from timeslot; stores response `URL` when set.
    */
   async postScheduleLiftApi(): Promise<void> {
@@ -892,36 +896,12 @@ export class BrowserService {
     await page.waitForTimeout(500);
     await ensureApplicantIpResolved(page);
     const body = buildSaveApplicantsBody();
-    logger.info({ url: SAVE_APPLICANTS_URL }, "Saving applicant via lift-api");
-    const beforeCfClearance = await this.getLiftApiCfClearanceValue(page);
+    logger.info({ url: SAVE_APPLICANTS_URL, payload: JSON.stringify(body) }, "Saving applicant via lift-api");
 
-    const first = await this.postLiftJsonFromPage(page, SAVE_APPLICANTS_URL, body);
-    console.log("[Applicants] HTTP", first.status, first.body.slice(0, 500));
-    if (first.status < 200 || first.status >= 300) {
-      // Cloudflare challenge: manual browser calls show a Turnstile iframe; fetch-only calls often return 403 HTML.
-      if (this.isCloudflareJustAMoment(first.status, first.body)) {
-        const mode = this.getCfChallengeRecoveryMode();
-        logger.warn({ status: first.status, mode }, "Cloudflare challenge detected. Recovering cf_clearance then retrying once...");
+    const res = await this.postLiftJsonFromPage(page, SAVE_APPLICANTS_URL, body);
+    logger.info({ status: res.status, responseBody: res.body.slice(0, 1000) }, "Applicants API response");
 
-        await this.recoverCfClearanceForLiftApi(page, mode);
-        await this.waitForLiftApiCfClearanceChange(page, beforeCfClearance);
-
-        const retry = await this.postLiftJsonFromPage(page, SAVE_APPLICANTS_URL, body);
-        console.log("[Applicants] Retry HTTP", retry.status, retry.body.slice(0, 500));
-        if (retry.status < 200 || retry.status >= 300) {
-          throw new Error(`Save applicants failed after retry HTTP ${retry.status}: ${retry.body.slice(0, 300)}`);
-        }
-
-        const parsedRetry = this.parseApplicantsResponseJson(retry.body);
-        if (parsedRetry.urn) setApplicationUrn(parsedRetry.urn);
-        logger.info({ urn: parsedRetry.urn }, "Applicants saved (retry)");
-        return;
-      }
-
-      throw new Error(`Save applicants failed HTTP ${first.status}: ${first.body.slice(0, 300)}`);
-    }
-
-    const parsed = this.parseApplicantsResponseJson(first.body);
+    const parsed = this.parseApplicantsResponseJson(res.body);
     if (parsed.urn) setApplicationUrn(parsed.urn);
     logger.info({ urn: parsed.urn }, "Applicants saved");
   }
@@ -930,15 +910,12 @@ export class BrowserService {
     const feesPayload = buildFeesBody(urn);
     logger.info({ url: FEES_URL }, "Calling lift-api fees");
     const res = await this.postLiftJsonFromPage(page, FEES_URL, feesPayload);
-    console.log("[Fees] HTTP", res.status, res.body.slice(0, 500));
-    if (res.status < 200 || res.status >= 300) {
-      throw new Error(`Fees failed HTTP ${res.status}: ${res.body.slice(0, 300)}`);
-    }
     try {
       const j = JSON.parse(res.body) as {
         error?: unknown;
         totalAmount?: unknown;
         totalamount?: unknown;
+        feeDetails?: Array<{ currency?: unknown }>;
       };
       if (j.error != null && j.error !== "") {
         throw new Error(`Fees API error: ${JSON.stringify(j.error)}`);
@@ -954,11 +931,33 @@ export class BrowserService {
       } else {
         logger.warn("Fees response has no totalAmount; nothing stored");
       }
+      if (j.feeDetails && j.feeDetails.length > 0 && typeof j.feeDetails[0]?.currency === "string" && j.feeDetails[0]?.currency.trim() !== "") {
+        setCurrency(j.feeDetails[0]?.currency);
+        logger.info({ currency: j.feeDetails[0]?.currency }, "Stored fees currency");
+      } else {
+        logger.warn("Fees response has no currency; nothing stored");
+      }
     } catch (e) {
       if (e instanceof Error && e.message.startsWith("Fees API error")) throw e;
       throw new Error("Fees: response is not JSON");
     }
     logger.info("Fees retrieved OK");
+  }
+
+  private async postMapVasLiftApiOnPage(page: Page, urn: string): Promise<void> {
+    const payload = buildMapVasBody(urn);
+    logger.info({ url: MAPVAS_URL }, "Calling lift-api mapvas");
+    const res = await this.postLiftJsonFromPage(page, MAPVAS_URL, payload);
+    try {
+      const j = JSON.parse(res.body) as { urn?: string; amount?: number; currency?: string; error?: unknown };
+      if (j.error != null && j.error !== "") {
+        throw new Error(`MapVas API error: ${JSON.stringify(j.error)}`);
+      }
+      logger.info({ urn: j.urn, amount: j.amount, currency: j.currency }, "MapVas response OK");
+    } catch (e) {
+      if (e instanceof Error && e.message.startsWith("MapVas API error")) throw e;
+      throw new Error("MapVas: response is not JSON");
+    }
   }
 
   private async postCalendarLiftApiOnPage(
@@ -969,10 +968,6 @@ export class BrowserService {
     const payload = buildCalendarBody(urn);
     logger.info({ url: CALENDAR_URL, fromDate: payload.fromDate }, "Calling lift-api calendar");
     const res = await this.postLiftJsonFromPage(page, CALENDAR_URL, payload);
-    console.log("[Calendar] HTTP", res.status, res.body.slice(0, 800));
-    if (res.status < 200 || res.status >= 300) {
-      throw new Error(`Calendar failed HTTP ${res.status}: ${res.body.slice(0, 300)}`);
-    }
     let j: { error?: unknown; calendars?: Array<{ date?: string; isWeekend?: boolean }> };
     try {
       j = JSON.parse(res.body) as typeof j;
@@ -1036,10 +1031,6 @@ export class BrowserService {
     const payload = buildTimeslotBody(urn, slotDateFromCalendar);
     logger.info({ url: TIMESLOT_URL, slotDate: payload.slotDate }, "Calling lift-api timeslot");
     const res = await this.postLiftJsonFromPage(page, TIMESLOT_URL, payload);
-    console.log("[Timeslot] HTTP", res.status, res.body.slice(0, 800));
-    if (res.status < 200 || res.status >= 300) {
-      throw new Error(`Timeslot failed HTTP ${res.status}: ${res.body.slice(0, 300)}`);
-    }
     let j: {
       error?: unknown;
       slots?: Array<{ allocationId?: string; slot?: string; type?: string }>;
@@ -1073,29 +1064,8 @@ export class BrowserService {
     const payload = buildScheduleBody(urn, allocationId);
     logger.info({ url: SCHEDULE_URL }, "Calling lift-api schedule");
 
-    // Sec-Fetch-* cannot be set from page fetch(); inject via route for schedule only.
-    const configuredSchedule = new URL(SCHEDULE_URL);
-    const matchScheduleLiftApiUrl = (u: URL): boolean =>
-      u.origin === configuredSchedule.origin && u.pathname === configuredSchedule.pathname;
-    await page.route(matchScheduleLiftApiUrl, async (route) => {
-      if (route.request().method() !== "POST") {
-        await route.continue();
-        return;
-      }
-      const headers = { ...route.request().headers(), "sec-fetch-site": "same-site" };
-      await route.continue({ headers });
-    });
-
-    let res: { status: number; body: string };
-    try {
-      res = await this.postLiftJsonFromPage(page, SCHEDULE_URL, payload);
-    } finally {
-      await page.unroute(matchScheduleLiftApiUrl);
-    }
-    console.log("[Schedule] HTTP", res.status, res.body.slice(0, 800));
-    if (res.status < 200 || res.status >= 300) {
-      throw new Error(`Schedule failed HTTP ${res.status}: ${res.body.slice(0, 300)}`);
-    }
+    const res = await this.postLiftJsonFromPage(page, SCHEDULE_URL, payload);
+    console.log("[Schedule] Final HTTP", res.status, res.body.slice(0, 800));
     let j: {
       error?: unknown;
       IsAppointmentBooked?: boolean;
@@ -1178,85 +1148,6 @@ export class BrowserService {
     logger.info({ redirectedTo: page.url() }, "Schedule redirect navigation completed");
   }
 
-  private isCloudflareJustAMoment(status: number, body: string): boolean {
-    if (status !== 403) return false;
-    const s = body.toLowerCase();
-    return s.includes("just a moment") || s.includes("cf-browser-verification") || s.includes("turnstile");
-  }
-
-  private getCfChallengeRecoveryMode(): "new_tab" | "same_tab" {
-    const raw = process.env.VFS_CF_CHALLENGE_RECOVERY_MODE ?? "new_tab";
-    const v = raw.toLowerCase().trim();
-    if (v === "same_tab" || v === "sometab" || v === "same") return "same_tab";
-    return "new_tab";
-  }
-
-  private async getLiftApiCfClearanceValue(page: Page): Promise<string | null> {
-    const cookies = await page.context().cookies(["https://lift-api.vfsglobal.com"]);
-    const cf = cookies.find((c) => c.name === "cf_clearance");
-    return cf?.value?.trim() ?? null;
-  }
-
-  private async waitForLiftApiCfClearanceChange(page: Page, before: string | null): Promise<void> {
-    const timeoutMs = 25_000;
-    const pollMs = 500;
-    const deadline = Date.now() + timeoutMs;
-    while (Date.now() < deadline) {
-      const now = await this.getLiftApiCfClearanceValue(page);
-      if (now && now !== before) return;
-      await page.waitForTimeout(pollMs);
-    }
-    logger.warn("cf_clearance did not change within timeout; retry may still fail.");
-  }
-
-  /**
-   * Trigger Cloudflare challenge in a real browser context so cf_clearance updates.
-   * mode=new_tab is safest (uses a temporary tab).
-   * mode=same_tab navigates current tab to the lift-api URL and then returns back.
-   */
-  private async recoverCfClearanceForLiftApi(page: Page, mode: "new_tab" | "same_tab"): Promise<void> {
-    const liftUrl = SAVE_APPLICANTS_URL;
-
-    if (mode === "new_tab") {
-      const tmp = await page.context().newPage();
-      try {
-        await tmp.goto(liftUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
-        await this.maybeSolveTurnstileInRecoveryPage(tmp);
-        await tmp.waitForTimeout(1500);
-      } finally {
-        await tmp.close().catch(() => { });
-      }
-      return;
-    }
-
-    const prevUrl = (() => {
-      try {
-        return page.url();
-      } catch {
-        return "";
-      }
-    })();
-
-    try {
-      await page.goto(liftUrl, { waitUntil: "domcontentloaded", timeout: 30_000 });
-      await this.maybeSolveTurnstileInRecoveryPage(page);
-      await page.waitForTimeout(1500);
-    } finally {
-      const restore = prevUrl || config.pollingPageUrl || "https://visa.vfsglobal.com/";
-      await page.goto(restore, { waitUntil: "domcontentloaded", timeout: 30_000 }).catch(() => { });
-    }
-  }
-
-  private async maybeSolveTurnstileInRecoveryPage(page: Page): Promise<void> {
-    if (config.capmonsterEnabled && config.capmonsterApiKey) {
-      // Solve if a Turnstile widget exists on the recovery page.
-      await this.solveAndInjectTurnstile(page, page.url());
-      return;
-    }
-    logger.info("Recovery page: please solve Turnstile in the browser, then press Enter in this terminal.");
-    await waitForEnter();
-  }
-
   private parseApplicantsResponseJson(body: string): { urn?: string; error?: unknown; applicantList?: unknown } {
     let parsed: { urn?: string; error?: unknown; applicantList?: unknown };
     try {
@@ -1301,9 +1192,7 @@ export class BrowserService {
   ): Promise<{ status: number; body: string }> {
     this.assertVfsPageLoggedInForLiftApi(page);
     const { origin, referer, route } = this.getLiftApiPageContextFromSource(page);
-    const clientSourceOverride: string | null = config.randomClientSource
-      ? generateRandomClientSource()
-      : config.liftApiClientSource?.trim() || getCapturedClientSource()?.trim() || null;
+    const clientSourceOverride: string | null = getCapturedClientSource()?.trim() || null;
     return page.evaluate(
       async (args: {
         url: string;

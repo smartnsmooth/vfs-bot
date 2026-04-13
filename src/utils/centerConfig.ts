@@ -3,7 +3,6 @@
  * Each instance can have up to 2 centers configured.
  */
 
-import { config } from "../config/config.js";
 import { getApplicantDetailsOverrides } from "./applicantDetails.store.js";
 
 export interface CenterConfig {
@@ -19,12 +18,10 @@ export interface CenterConfig {
 export function getConfiguredCenters(instanceId?: number): CenterConfig[] {
   const centers: CenterConfig[] = [];
   
-  // Get applicant details which may contain center configs
   const details = getApplicantDetailsOverrides(instanceId);
   
-  // Center 1 (required)
-  const vacCode1 = (details?.vacCode as string) || config.slotPayload.vacCode;
-  const visaCategory1 = (details?.selectedSubvisaCategory as string) || config.slotPayload.visaCategoryCode;
+  const vacCode1 = (details?.vacCode as string) || "";
+  const visaCategory1 = (details?.selectedSubvisaCategory as string) || "";
   
   if (vacCode1 && visaCategory1) {
     centers.push({

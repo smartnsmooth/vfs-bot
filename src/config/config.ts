@@ -1,4 +1,5 @@
 import { getSessionLoginCredentials } from "../utils/sessionLogin.store";
+import { getApplicantDetailsOverrides } from "../utils/applicantDetails.store";
 
 /** Current instance ID for cluster mode (used by loginUser getter) */
 let currentInstanceId: number | undefined;
@@ -9,6 +10,26 @@ export function setCurrentInstanceId(id: number | undefined): void {
 
 export function getCurrentInstanceId(): number | undefined {
   return currentInstanceId;
+}
+
+function resolvedFormDetails(): Record<string, unknown> | undefined {
+  if (currentInstanceId != null) {
+    const det = getApplicantDetailsOverrides(currentInstanceId);
+    if (det) return det;
+  }
+  return getApplicantDetailsOverrides(1) ?? getApplicantDetailsOverrides(0) ?? undefined;
+}
+
+function resolvedCountryCode(): string {
+  const det = resolvedFormDetails();
+  const fromForm = typeof det?.countryCode === "string" ? det.countryCode.trim().toLowerCase() : "";
+  return fromForm || "ind";
+}
+
+function resolvedMissionCode(): string {
+  const det = resolvedFormDetails();
+  const fromForm = typeof det?.missionCode === "string" ? det.missionCode.trim().toLowerCase() : "";
+  return fromForm || "bgr";
 }
 
 /** Sub-second polling (ms). */
@@ -46,22 +67,31 @@ export const config = {
   get turnstileDemoUrl(): string {
     return process.env.TURNSTILE_DEMO_URL ?? "https://2captcha.com/demo/cloudflare-turnstile";
   },
-  loginPageUrl: process.env.VFS_LOGIN_PAGE_URL ?? process.env.VFS_LOGIN_ENDPOINT ?? "https://visa.vfsglobal.com/ind/en/bgr/login",
+  get loginPageUrl(): string {
+    const det = resolvedFormDetails();
+    const formCountry = typeof det?.countryCode === "string" ? det.countryCode.trim().toLowerCase() : "";
+    const formMission = typeof det?.missionCode === "string" ? det.missionCode.trim().toLowerCase() : "";
+    if (formCountry && formMission) {
+      return `https://visa.vfsglobal.com/${formCountry}/en/${formMission}/login`;
+    }
+    return process.env.VFS_LOGIN_PAGE_URL ?? process.env.VFS_LOGIN_ENDPOINT
+      ?? `https://visa.vfsglobal.com/${resolvedCountryCode()}/en/${resolvedMissionCode()}/login`;
+  },
   slotEndpoint: process.env.VFS_SLOT_ENDPOINT ?? "https://lift-api.vfsglobal.com/appointment/CheckIsSlotAvailable",
-  /** Slot check + save applicants / calendar / timeslot / fees / schedule (same center & category). */
+  /** Base slot-check payload (center & visa category are set at runtime via the setup form). */
   slotPayload: {
-    countryCode: (process.env.VFS_SLOT_COUNTRY_CODE ?? process.env.VFS_SLOT_COUNTRY ?? "ind")
-      .trim()
-      .toLowerCase() || "ind",
+    get countryCode(): string {
+      return resolvedCountryCode();
+    },
     /** From setup form session when UI was used; otherwise `VFS_USERNAME`. */
     get loginUser() {
       return resolvedSlotPayloadLoginUser();
     },
-    missionCode: process.env.VFS_SLOT_MISSION_CODE ?? process.env.VFS_SLOT_MISSION ?? "bgr",
-    payCode: process.env.VFS_SLOT_PAY_CODE ?? "",
+    get missionCode(): string {
+      return resolvedMissionCode();
+    },
+    payCode: "",
     roleName: process.env.VFS_SLOT_ROLE_NAME ?? "Individual",
-    vacCode: process.env.VFS_SLOT_VAC_CODE ?? "NTDS",
-    visaCategoryCode: process.env.VFS_SLOT_VISA_CATEGORY_CODE ?? process.env.VFS_SLOT_VISA_CATEGORY ?? "CARLT",
   },
   pollingPageUrl: process.env.VFS_POLLING_PAGE_URL ?? "https://visa.vfsglobal.com/ind/en/bgr/application-detail",
 

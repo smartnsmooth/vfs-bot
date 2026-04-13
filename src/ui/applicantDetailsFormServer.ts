@@ -154,6 +154,12 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
   const out: Record<string, unknown> = {};
   const str = (k: string) => (typeof j[k] === "string" ? (j[k] as string).trim() : j[k]);
   const keys = [
+    "firstName",
+    "lastName",
+    "dateOfBirth",
+    "passportNumber",
+    "dialCode",
+    "contactNumber",
     "middleName",
     "passportExpirtyDate",
     "confirmPassportNumber",
@@ -164,6 +170,8 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
     "vacCode",
     "vacCode2",
     "selectedSubvisaCategory2",
+    "countryCode",
+    "missionCode",
   ] as const;
   for (const k of keys) {
     const v = str(k);
@@ -200,11 +208,6 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
 }
 
 function buildPageHtml(collectLogin: boolean): string {
-  const defaultNumInstances = Math.max(1, parseInt(process.env.VFS_BOT_INSTANCES ?? "1", 10) || 1);
-  const isMultiInstance = defaultNumInstances > 1;
-  const fastSkipCalendarUpTo =
-    parseInt(process.env.FAST_SKIP_CALENDAR_UP_TO_INSTANCE ?? "5", 10) || 5;
-
   /** Per-instance date range row in the applicant column. */
   const scheduleAllowedDatesBlock = `
   <div class="schedule-range-row" role="group" aria-label="Appointment date range">
@@ -214,21 +217,30 @@ function buildPageHtml(collectLogin: boolean): string {
     <input type="date" id="scheduleDateRangeEnd" name="scheduleDateRangeEnd" />
   </div>`;
 
-  const defaultPollIntervalSec = Math.max(1, Math.round(
-    (parseInt(process.env.FIXED_POLL_INTERVAL_MS ?? "60000", 10) || 60_000) / 1000
-  ));
+  const defaultPollIntervalSec = 60;
 
   const instanceSelectBlock = `
   <fieldset style="border:1px solid #38444d;border-radius:8px;padding:1rem 1rem 0.25rem;margin:0 0 1.25rem">
     <legend style="color:#8b98a5;font-size:0.9rem">Bot configuration</legend>
+    <label for="countryCode" style="margin-top:0.5rem">From country</label>
+    <select id="countryCode" name="countryCode">
+      <option value="ind">India</option>
+      <option value="egy">Egypt</option>
+      <option value="sau">Saudi Arabia</option>
+    </select>
+    <label for="missionCode" style="margin-top:0.75rem">To country</label>
+    <select id="missionCode" name="missionCode">
+      <option value="bgr">Bulgaria</option>
+      <option value="prt">Portugal</option>
+    </select>
     <label for="userPollInterval" style="margin-top:0.75rem">Poll interval (seconds)</label>
     <input type="number" id="userPollInterval" name="userPollInterval" min="1" value="${defaultPollIntervalSec}" />
     <label for="numInstances">Number of instances</label>
-    <input type="number" id="numInstances" name="numInstances" min="1" max="50" value="${defaultNumInstances}" />
+    <input type="number" id="numInstances" name="numInstances" min="1" max="50" value="1" />
     <div id="instanceSelectWrapper" style="display:block">
       <label for="instanceId" style="margin-top:0.75rem">Select instance to configure (each uses a different Chrome profile / IP)</label>
       <select id="instanceId" name="instanceId">
-        ${Array.from({ length: defaultNumInstances }, (_, i) => `<option value="${i + 1}">Instance ${i + 1}</option>`).join("\n        ")}
+        <option value="1">Instance 1</option>
       </select>
     </div>
   </fieldset>`;
@@ -253,8 +265,6 @@ function buildPageHtml(collectLogin: boolean): string {
   const title = collectLogin ? "VFS bot — login & applicant" : "VFS bot — applicant details";
 
   const collectLoginJs = collectLogin ? "true" : "false";
-  const isMultiInstanceJs = isMultiInstance ? "true" : "false";
-  const defaultNumInstancesJs = String(defaultNumInstances);
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -338,7 +348,38 @@ function buildPageHtml(collectLogin: boolean): string {
       </div>
       <div class="form-col form-col--details">
         <h2 class="col-heading">Applicant details</h2>
-        <p class="col-sub">Passport expiry, nationality, gender, and visa centre / category. Name, email, phone, DOB, and passport number come from the VFS login response after sign-in.</p>
+        <div id="manualApplicantFields" style="margin-bottom:1rem;display:none">
+          <div class="row2">
+            <div>
+              <label for="firstName">First name</label>
+              <input id="firstName" name="firstName" placeholder="John" />
+            </div>
+            <div>
+              <label for="lastName">Last name</label>
+              <input id="lastName" name="lastName" placeholder="Doe" />
+            </div>
+          </div>
+          <div class="row2">
+            <div>
+              <label for="dateOfBirth">Date of birth (DD/MM/YYYY)</label>
+              <input id="dateOfBirth" name="dateOfBirth" placeholder="15/06/1990" />
+            </div>
+            <div>
+              <label for="passportNumber">Passport number</label>
+              <input id="passportNumber" name="passportNumber" placeholder="A12345678" />
+            </div>
+          </div>
+          <div class="row2">
+            <div>
+              <label for="dialCode">Dial code</label>
+              <input id="dialCode" name="dialCode" placeholder="+20" />
+            </div>
+            <div>
+              <label for="contactNumber">Contact number</label>
+              <input id="contactNumber" name="contactNumber" placeholder="1012345678" />
+            </div>
+          </div>
+        </div>
         ${scheduleAllowedDatesBlock}
         <label for="passportExpirtyDate">Passport expiry (DD/MM/YYYY)</label>
         <input id="passportExpirtyDate" name="passportExpirtyDate" placeholder="23/04/2027" />
@@ -574,28 +615,10 @@ function buildPageHtml(collectLogin: boolean): string {
         <label for="vacCode">Visa Application Centre</label>
         <select id="vacCode" name="vacCode">
           <option value="">-- Select Centre --</option>
-          <option value="JAI">Bulgaria Visa Application Centre-Jaipur</option>
-          <option value="HYD">Bulgaria Visa Application Centre-Hyderabad</option>
-          <option value="JLD">Bulgaria Visa Application Centre-Jalandhar</option>
-          <option value="BLR">Bulgaria Visa Application Center ,Bangalore</option>
-          <option value="IXC">Bulgaria Visa Application Centre-Chandigarh</option>
-          <option value="PNQ">Bulgaria Visa Application Centre-Pune</option>
-          <option value="COK">Bulgaria Visa Application Centre-Cochin</option>
-          <option value="GOI">Bulgaria Visa Application Centre-Goa</option>
-          <option value="AMD">Bulgaria Visa Application Centre-Ahmedabad</option>
-          <option value="PUD">Bulgaria Visa Application Centre-Puducherry</option>
-          <option value="GUR">Bulgaria Visa Application Center ,Gurugram</option>
-          <option value="NDEL">Bulgaria Visa Application Center ,New Delhi</option>
-          <option value="BKC">Bulgaria Visa Application Center, Mumbai</option>
-          <option value="MAA">Bulgaria Visa Application Centre-Chennai</option>
-          <option value="CCU">Bulgarian visa application center-Kolkata-VAC</option>
         </select>
         <label for="selectedSubvisaCategory">Visa Category (Center 1)</label>
         <select id="selectedSubvisaCategory" name="selectedSubvisaCategory">
           <option value="">-- Select Category --</option>
-          <option value="LONGSTAY">Long Stay D visa</option>
-          <option value="SAW">Seasonal worker</option>
-          <option value="Busi">Business Visa</option>
         </select>
 
         <hr class="section-rule" />
@@ -605,37 +628,19 @@ function buildPageHtml(collectLogin: boolean): string {
         <label for="vacCode2">Visa Application Centre 2 (Optional)</label>
         <select id="vacCode2" name="vacCode2">
           <option value="">-- No Second Centre --</option>
-          <option value="JAI">Bulgaria Visa Application Centre-Jaipur</option>
-          <option value="HYD">Bulgaria Visa Application Centre-Hyderabad</option>
-          <option value="JLD">Bulgaria Visa Application Centre-Jalandhar</option>
-          <option value="BLR">Bulgaria Visa Application Center ,Bangalore</option>
-          <option value="IXC">Bulgaria Visa Application Centre-Chandigarh</option>
-          <option value="PNQ">Bulgaria Visa Application Centre-Pune</option>
-          <option value="COK">Bulgaria Visa Application Centre-Cochin</option>
-          <option value="GOI">Bulgaria Visa Application Centre-Goa</option>
-          <option value="AMD">Bulgaria Visa Application Centre-Ahmedabad</option>
-          <option value="PUD">Bulgaria Visa Application Centre-Puducherry</option>
-          <option value="GUR">Bulgaria Visa Application Center ,Gurugram</option>
-          <option value="NDEL">Bulgaria Visa Application Center ,New Delhi</option>
-          <option value="BKC">Bulgaria Visa Application Center, Mumbai</option>
-          <option value="MAA">Bulgaria Visa Application Centre-Chennai</option>
-          <option value="CCU">Bulgarian visa application center-Kolkata-VAC</option>
         </select>
         <label for="selectedSubvisaCategory2">Visa Category 2 (Optional)</label>
         <select id="selectedSubvisaCategory2" name="selectedSubvisaCategory2">
           <option value="">-- Select Category --</option>
-          <option value="LONGSTAY">Long Stay D visa</option>
-          <option value="SAW">Seasonal worker</option>
-          <option value="Busi">Business Visa</option>
         </select>
       </div>
     </div>
     <div class="form-actions">
-      <button type="submit" id="submitBtn">${isMultiInstance ? "Submit & Run All Instances" : "Submit & Run Bot"}</button>
+      <button type="submit" id="submitBtn">Submit &amp; Run</button>
     </div>
   </form>
   <p id="msg"></p>
-  ${buildApplicantFormPageScript(collectLoginJs, isMultiInstanceJs, defaultNumInstancesJs)}
+  ${buildApplicantFormPageScript(collectLoginJs)}
 </body>
 </html>`;
 }
@@ -838,10 +843,14 @@ export function runApplicantFormWithSubmitHandler(
           const fields = parseApplicantFields(rest);
           const { userPollInterval: upi, ...instanceFields } = fields;
 
-          // userPollInterval is global — save only to instance 0, never per-instance.
-          if (typeof upi === "number") {
+          // userPollInterval and countryCode/missionCode are global — also save to instance 0.
+          {
             const global0 = getApplicantDetailsOverrides(0) ?? {};
-            setApplicantDetailsOverrides({ ...global0, userPollInterval: upi }, 0);
+            let changed = false;
+            if (typeof upi === "number") { global0.userPollInterval = upi; changed = true; }
+            if (typeof instanceFields.countryCode === "string") { global0.countryCode = instanceFields.countryCode; changed = true; }
+            if (typeof instanceFields.missionCode === "string") { global0.missionCode = instanceFields.missionCode; changed = true; }
+            if (changed) setApplicantDetailsOverrides(global0, 0);
           }
           const id = instanceId ?? 0;
           setApplicantDetailsOverrides(instanceFields, id);
