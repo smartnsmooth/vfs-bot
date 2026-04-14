@@ -188,6 +188,12 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
     const v = parseInt(j.userPollInterval, 10);
     if (Number.isFinite(v) && v >= 1) out.userPollInterval = v;
   }
+  if (typeof j.postLoginPollDelay === "number" && Number.isFinite(j.postLoginPollDelay) && j.postLoginPollDelay >= 0) {
+    out.postLoginPollDelay = Math.floor(j.postLoginPollDelay);
+  } else if (typeof j.postLoginPollDelay === "string" && j.postLoginPollDelay.trim() !== "") {
+    const v = parseInt(j.postLoginPollDelay, 10);
+    if (Number.isFinite(v) && v >= 0) out.postLoginPollDelay = v;
+  }
   if ("skipPolling" in j) {
     out.skipPolling = j.skipPolling === true || j.skipPolling === "true" || j.skipPolling === "1";
   }
@@ -226,6 +232,8 @@ function buildPageHtml(collectLogin: boolean): string {
     </div>
     <label for="userPollInterval" style="margin-top:0.75rem">Poll interval (seconds)</label>
     <input type="number" id="userPollInterval" name="userPollInterval" min="1" value="${defaultPollIntervalSec}" />
+    <label for="postLoginPollDelay" style="margin-top:0.75rem">Post-login poll delay (seconds)</label>
+    <input type="number" id="postLoginPollDelay" name="postLoginPollDelay" min="0" value="30" />
     <label for="numInstances">Number of instances</label>
     <input type="number" id="numInstances" name="numInstances" min="1" max="50" value="1" />
     <div id="instanceSelectWrapper" style="display:block">
@@ -744,6 +752,9 @@ export function runApplicantFormWithSubmitHandler(
             if (globalDet && typeof globalDet.userPollInterval === "number") {
               defaults.userPollInterval = globalDet.userPollInterval;
             }
+            if (globalDet && typeof globalDet.postLoginPollDelay === "number") {
+              defaults.postLoginPollDelay = globalDet.postLoginPollDelay;
+            }
             if (globalDet && typeof globalDet.skipPolling === "boolean") {
               defaults.skipPolling = globalDet.skipPolling;
             }
@@ -819,12 +830,13 @@ export function runApplicantFormWithSubmitHandler(
             ...rest
           } = j;
           const fields = parseApplicantFields(rest);
-          const { userPollInterval: upi, skipPolling: sp, ...instanceFields } = fields;
+          const { userPollInterval: upi, skipPolling: sp, postLoginPollDelay: plpd, ...instanceFields } = fields;
 
           {
             const global0 = getApplicantDetailsOverrides(0) ?? {};
             let changed = false;
             if (typeof upi === "number") { global0.userPollInterval = upi; changed = true; }
+            if (typeof plpd === "number") { global0.postLoginPollDelay = plpd; changed = true; }
             if (typeof instanceFields.countryCode === "string") { global0.countryCode = instanceFields.countryCode; changed = true; }
             if (typeof instanceFields.missionCode === "string") { global0.missionCode = instanceFields.missionCode; changed = true; }
             if (typeof sp === "boolean") { global0.skipPolling = sp; changed = true; }

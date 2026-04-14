@@ -39,7 +39,7 @@ const polling = new PollingService();
 const browser = new BrowserService();
 const telegram = new TelegramService();
 
-const POST_LOGIN_POLL_DELAY_MS = 30_000;
+const DEFAULT_POST_LOGIN_POLL_DELAY_SEC = 30;
 const FAST_SKIP_CALENDAR_UP_TO_INSTANCE = Math.max(
   0,
   parseInt(process.env.FAST_SKIP_CALENDAR_UP_TO_INSTANCE ?? "5", 10) || 5
@@ -1139,20 +1139,21 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
 
   await browser.postFeesLiftApi();
 
-  const MAX_SCHEDULE_RETRIES_FROM_TIMESLOT = 3;
-  for (let schedAttempt = 1; schedAttempt <= MAX_SCHEDULE_RETRIES_FROM_TIMESLOT; schedAttempt++) {
+  const MAX_SCHEDULE_RETRIES_FROM_CALENDAR = 3;
+  for (let schedAttempt = 1; schedAttempt <= MAX_SCHEDULE_RETRIES_FROM_CALENDAR; schedAttempt++) {
     try {
       await browser.postScheduleLiftApi();
       break;
     } catch (schedErr) {
-      if (schedAttempt === MAX_SCHEDULE_RETRIES_FROM_TIMESLOT) throw schedErr;
+      if (schedAttempt === MAX_SCHEDULE_RETRIES_FROM_CALENDAR) throw schedErr;
       logger.warn(
-        { err: schedErr, attempt: schedAttempt, maxRetries: MAX_SCHEDULE_RETRIES_FROM_TIMESLOT, instanceId },
-        "Schedule failed — retrying from timeslot"
+        { err: schedErr, attempt: schedAttempt, maxRetries: MAX_SCHEDULE_RETRIES_FROM_CALENDAR, instanceId },
+        "Schedule failed — retrying from calendar"
       );
       await telegram
-        .alert("error", `Schedule failed (attempt ${schedAttempt}/${MAX_SCHEDULE_RETRIES_FROM_TIMESLOT}), retrying from timeslot`)
-        .catch(() => {});
+        .alert("error", `Schedule failed (attempt ${schedAttempt}/${MAX_SCHEDULE_RETRIES_FROM_CALENDAR}), retrying from calendar`)
+        .catch(() => { });
+      await browser.postCalendarLiftApi(calendarOpts);
       await browser.postTimeslotLiftApi();
       await browser.postFeesLiftApi();
     }
@@ -1266,8 +1267,8 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
     firstUrl = await browser.getFirstTabUrl();
     kind = classifyVfsFirstTabUrl(firstUrl);
     didLoginThisCycle = true;
-    await minimizeChromeWindow();
-    logger.info({ instanceId }, "[Chrome] Minimized browser after login");
+    // await minimizeChromeWindow();
+    // logger.info({ instanceId }, "[Chrome] Minimized browser after login");
   } else if (kind === "dashboard") {
     logger.info({ instanceId }, "On dashboard — skipping automated login");
   } else if (kind === "vfs_other") {
@@ -1289,8 +1290,14 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
   let slotFoundDuringPoll = false;
   if (!skipPolling) {
     if (didLoginThisCycle) {
-      // Dashboard: no auto "Start new booking" / center / category (handle in browser yourself).
-      await new Promise((r) => setTimeout(r, POST_LOGIN_POLL_DELAY_MS));
+      const globalDet0 = getApplicantDetailsOverrides(0);
+      const postLoginDelaySec =
+        globalDet0 && typeof globalDet0.postLoginPollDelay === "number" && globalDet0.postLoginPollDelay >= 0
+          ? globalDet0.postLoginPollDelay
+          : DEFAULT_POST_LOGIN_POLL_DELAY_SEC;
+      const postLoginDelayMs = postLoginDelaySec * 1000;
+      logger.info({ instanceId, postLoginDelayMs }, "Post-login base delay before polling");
+      await new Promise((r) => setTimeout(r, postLoginDelayMs));
       const fixedTiming = getFixedTimingForInstance(instanceId);
       logger.info(
         { instanceId, delayMs: fixedTiming.postLoginOffsetMs, mode: "fixed_by_instance" },
@@ -1352,8 +1359,8 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
         // Booking chain completed (schedule API called) — payment page is now open.
         instanceBookingActive = false;
         instanceOnPaymentPage = true;
-        await restoreChromeWindow();
-        logger.info({ instanceId }, "[Chrome] Restored browser for payment page");
+        // await restoreChromeWindow();
+        // logger.info({ instanceId }, "[Chrome] Restored browser for payment page");
         logger.info({ instanceId }, "[Booking] Complete — Chrome is on the payment page and will stay there permanently");
         return; // Leave Chrome on the payment page; do not fall through to cycle end.
       } catch (err) {
