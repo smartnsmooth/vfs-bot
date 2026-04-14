@@ -39,7 +39,7 @@ const polling = new PollingService();
 const browser = new BrowserService();
 const telegram = new TelegramService();
 
-const POST_LOGIN_POLL_DELAY_MS = 60_000;
+const POST_LOGIN_POLL_DELAY_MS = 30_000;
 const FAST_SKIP_CALENDAR_UP_TO_INSTANCE = Math.max(
   0,
   parseInt(process.env.FAST_SKIP_CALENDAR_UP_TO_INSTANCE ?? "5", 10) || 5
@@ -1132,7 +1132,25 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
   }
 
   await browser.postFeesLiftApi();
-  await browser.postScheduleLiftApi();
+
+  const MAX_SCHEDULE_RETRIES_FROM_TIMESLOT = 3;
+  for (let schedAttempt = 1; schedAttempt <= MAX_SCHEDULE_RETRIES_FROM_TIMESLOT; schedAttempt++) {
+    try {
+      await browser.postScheduleLiftApi();
+      break;
+    } catch (schedErr) {
+      if (schedAttempt === MAX_SCHEDULE_RETRIES_FROM_TIMESLOT) throw schedErr;
+      logger.warn(
+        { err: schedErr, attempt: schedAttempt, maxRetries: MAX_SCHEDULE_RETRIES_FROM_TIMESLOT, instanceId },
+        "Schedule failed — retrying from timeslot"
+      );
+      await telegram
+        .alert("error", `Schedule failed (attempt ${schedAttempt}/${MAX_SCHEDULE_RETRIES_FROM_TIMESLOT}), retrying from timeslot`)
+        .catch(() => {});
+      await browser.postTimeslotLiftApi();
+      await browser.postFeesLiftApi();
+    }
+  }
 }
 
 type SubmitMeta = { firstSubmit: boolean; instanceId?: number };

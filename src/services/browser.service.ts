@@ -21,7 +21,7 @@ import { logger } from "../utils/logger";
 import { ensureApplicantIpResolved } from "../utils/applicantIp";
 import { getAllocationId, setAllocationId } from "../utils/allocationId.store";
 import { getApplicationUrn, setApplicationUrn } from "../utils/applicationUrn.store";
-import { getSlotDate, setSlotDate } from "../utils/slotDate.store";
+import { getSlotDate, setSlotDate, getCalendarDatesCount, setCalendarDatesCount } from "../utils/slotDate.store";
 import { setTotalAmount, setCurrency } from "../utils/totalAmount.store";
 import {
   getCapturedClientSource,
@@ -989,6 +989,7 @@ export class BrowserService {
 
       const chosen = dates[chosenIdx]!;
       setSlotDate(chosen);
+      setCalendarDatesCount(dates.length);
       logger.info(
         { slotDate: chosen, chosenIdx, datesCount: dates.length, myId, totalInstances },
         "Stored sharded calendar date as slotDate"
@@ -1017,12 +1018,48 @@ export class BrowserService {
       if (e instanceof Error && e.message.startsWith("Timeslot API error")) throw e;
       throw new Error("Timeslot: response is not JSON");
     }
-    const alloc = j.slots?.[0]?.allocationId?.trim();
-    if (alloc) {
-      setAllocationId(alloc);
-      logger.info({ allocationIdPrefix: alloc.slice(0, 16) }, "Stored first slot allocationId");
+    const slots = j.slots ?? [];
+    if (slots.length === 0) {
+      logger.warn("Timeslot response has no slots");
     } else {
-      logger.warn("Timeslot response has no slots[0].allocationId");
+      const totalInstances = Math.max(1, parseInt(process.env.BOT_TOTAL_INSTANCES ?? "1", 10) || 1);
+      const myId = getCurrentInstanceId() ?? 1;
+      const myIdx = Math.max(0, Math.min(totalInstances - 1, myId - 1));
+
+      // Compute this instance's position *within its date group* so that
+      // instances sharing the same calendar date spread across timeslots.
+      // Uses the stored calendarDatesCount from the calendar sharding step;
+      // falls back to 1 (all instances on one date) when unknown.
+      const dateCount = Math.max(1, getCalendarDatesCount());
+      const dateBase = Math.floor(totalInstances / dateCount);
+      const dateRem = totalInstances % dateCount;
+
+      let groupStart = 0;
+      let groupSize = totalInstances;
+      let acc = 0;
+      for (let i = 0; i < dateCount; i++) {
+        const size = dateBase + (i < dateRem ? 1 : 0);
+        if (myIdx >= acc && myIdx < acc + size) {
+          groupStart = acc;
+          groupSize = size;
+          break;
+        }
+        acc += size;
+      }
+      const subIdx = myIdx - groupStart;
+
+      const chosenSlotIdx = subIdx % slots.length;
+      const chosen = slots[chosenSlotIdx];
+      const alloc = chosen?.allocationId?.trim();
+      if (alloc) {
+        setAllocationId(alloc);
+        logger.info(
+          { allocationIdPrefix: alloc.slice(0, 16), chosenSlotIdx, slotsCount: slots.length, myId, totalInstances, dateGroupSize: groupSize, subIdx },
+          "Stored sharded timeslot allocationId"
+        );
+      } else {
+        logger.warn({ chosenSlotIdx }, "Chosen timeslot slot has no allocationId");
+      }
     }
     logger.info("Timeslot retrieved OK");
 

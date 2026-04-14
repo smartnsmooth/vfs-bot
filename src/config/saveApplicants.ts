@@ -96,6 +96,10 @@ const SAVE_APPLICANTS_APPLICANT_KEY_ORDER: readonly string[] = [
   "Retryleft",
   "visaSubClass",
   "ipAddress",
+  "applicantImage",
+  "applicantImageData",
+  "countryCode",
+  "missionCode",
 ];
 
 function orderObjectKeys(obj: Record<string, unknown>, order: readonly string[]): Record<string, unknown> {
@@ -160,10 +164,6 @@ const APPLICANT_UI_ONLY_KEYS = [
   "vacCode",
   "vacCode2",
   "selectedSubvisaCategory2",
-  "applicantImage",
-  "applicantImageData",
-  "countryCode",
-  "missionCode",
 ] as const;
 
 /**
@@ -328,6 +328,10 @@ export function buildSaveApplicantsBodyFromEnv(): Record<string, unknown> {
     Retryleft: "",
     visaSubClass: null,
     ipAddress: getApplicantIpForPayload(),
+    applicantImage: "",
+    applicantImageData: "",
+    countryCode,
+    missionCode,
   };
 
   return normalizeSaveApplicantsBody({
