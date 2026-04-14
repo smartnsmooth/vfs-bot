@@ -5,16 +5,13 @@ import { logger } from "./logger";
 /**
  * Public IP for save-applicants (`ipAddress`):
  *
- * 1. **`VFS_APPLICANT_IP`** — optional fixed IP. Omit it when each instance/cycle should use a **different** egress:
- *    discovery runs after Chrome (re)launch (`clearApplicantIpCache` on spawn) and pins one value for that browser run.
- * 2. **`VFS_APPLICANT_PUBLIC_IP_URL`** — GET URL that returns a plain-text public IP (first line).
- *    Fetched **inside the browser tab** so it uses the same Chrome proxy path as VFS. Use your provider’s
- *    “what is my IP” endpoint if they offer one; there is no universal proxy-vendor API in this repo.
- * 3. **`VFS_USE_IPIFY`** — default `true`. Set to `false` to stop calling ipify/icanhazip (avoids extra
- *    connections that can rotate egress on some proxies). Pair with `VFS_APPLICANT_IP` or
- *    `VFS_APPLICANT_PUBLIC_IP_URL`.
+ * 1. **`VFS_APPLICANT_PUBLIC_IP_URL`** \u2014 GET URL that returns a plain-text public IP (first line).
+ *    Fetched **inside the browser tab** so it uses the same Chrome proxy path as VFS. Use your provider's
+ *    "what is my IP" endpoint if they offer one; there is no universal proxy-vendor API in this repo.
+ * 2. **`VFS_USE_IPIFY`** \u2014 default `true`. Set to `false` to stop calling ipify/icanhazip (avoids extra
+ *    connections that can rotate egress on some proxies). Pair with `VFS_APPLICANT_PUBLIC_IP_URL`.
  *
- * **Sticky egress (same IP for the whole Chrome run):** set `PROXY_URLS` with your vendor’s session token,
+ * **Sticky egress (same IP for the whole Chrome run):** set `PROXY_URLS` with your vendor's session token,
  * e.g. `...-session-{session}` and optional **`PROXY_STICKY_SESSION_ID`** (or rely on default `vfs-<instanceId>`).
  * See `resolveProxyForInstance` in `index.ts`.
  */
@@ -110,7 +107,7 @@ async function tryResolveApplicantIpFromBrowserPage(page: Page): Promise<string 
   const urls = publicIpLookupUrlList();
   if (urls.length === 0) {
     logger.info(
-      "Applicant IP: no in-tab lookup URLs (VFS_USE_IPIFY=false and no VFS_APPLICANT_PUBLIC_IP_URL) — set VFS_APPLICANT_IP or a provider URL"
+      "Applicant IP: no in-tab lookup URLs (VFS_USE_IPIFY=false and no VFS_APPLICANT_PUBLIC_IP_URL)"
     );
     return null;
   }
@@ -146,7 +143,7 @@ let cachedApplicantIp: string | null = null;
 
 /**
  * Clears the pinned applicant IP. Call when starting a **new** Chrome process (new egress), e.g. after
- * `ensureChromeWithDevTools` spawns Chrome or after credential-swap browser restart — not on every request.
+ * `ensureChromeWithDevTools` spawns Chrome or after credential-swap browser restart.
  */
 export function clearApplicantIpCache(): void {
   cachedApplicantIp = null;
@@ -156,11 +153,6 @@ export function clearApplicantIpCache(): void {
 export function getApplicantIpForPayload(): string {
   if (cachedApplicantIp) return cachedApplicantIp;
   return getLocalNetworkIpv4() || "127.0.0.1";
-}
-
-function envManualApplicantIp(): string | null {
-  const v = process.env.VFS_APPLICANT_IP?.trim();
-  return v ? v : null;
 }
 
 async function resolveApplicantIpFromNode(): Promise<string> {
@@ -176,14 +168,14 @@ async function resolveApplicantIpFromNode(): Promise<string> {
         cachedApplicantIp = ip;
         logger.info(
           { ip, via: url, source: "node" },
-          "Applicant IP resolved (Node fetch — may NOT match Chrome proxy egress; prefer in-tab lookup or VFS_APPLICANT_IP)"
+          "Applicant IP resolved (Node fetch)"
         );
         return cachedApplicantIp;
       }
     }
   } else {
     logger.warn(
-      "Applicant IP: Node fallback skipped public-IP URLs (VFS_USE_IPIFY=false and no VFS_APPLICANT_PUBLIC_IP_URL) — Node does not use Chrome’s proxy; set VFS_APPLICANT_IP"
+      "Applicant IP: Node fallback skipped public-IP URLs (VFS_USE_IPIFY=false and no VFS_APPLICANT_PUBLIC_IP_URL)"
     );
   }
 
@@ -201,20 +193,12 @@ async function resolveApplicantIpFromNode(): Promise<string> {
  * The first successful resolution is cached until {@link clearApplicantIpCache} (new Chrome launch / proxy rotation).
  * Avoids mismatches with session-bound APIs (save-applicants vs login).
  *
- * 1. `VFS_APPLICANT_IP` — fixed value, no lookup (recommended with rotating proxies).
- * 2. If `page` is set and cache empty — in-tab `fetch()` to custom and/or default lookup URLs
+ * 1. If `page` is set and cache empty \u2014 in-tab `fetch()` to custom and/or default lookup URLs
  *    (`VFS_APPLICANT_PUBLIC_IP_URL`, `VFS_USE_IPIFY`).
- * 3. Fallback — Node `fetch` to the same URL list (often wrong behind auth proxy), then local NIC.
+ * 2. Fallback \u2014 Node `fetch` to the same URL list (often wrong behind auth proxy), then local NIC.
  */
 export async function ensureApplicantIpResolved(page: Page | null): Promise<string> {
   if (cachedApplicantIp) {
-    return cachedApplicantIp;
-  }
-
-  const manual = envManualApplicantIp();
-  if (manual) {
-    cachedApplicantIp = manual;
-    logger.info({ ip: manual, source: "env" }, "Applicant IP from VFS_APPLICANT_IP");
     return cachedApplicantIp;
   }
 
@@ -229,7 +213,7 @@ export async function ensureApplicantIpResolved(page: Page | null): Promise<stri
       return cachedApplicantIp;
     }
     logger.warn(
-      "Applicant IP: in-page lookup failed — falling back to Node fetch (may not match extension proxy IP)"
+      "Applicant IP: in-page lookup failed \u2014 falling back to Node fetch (may not match extension proxy IP)"
     );
   }
 

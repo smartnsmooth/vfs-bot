@@ -6,8 +6,7 @@ import { getSlotCenterOverride } from "../utils/slotCenterOverride.store";
 import { getVfsLoginProfile } from "../utils/vfsLoginProfile.store.js";
 import { looksLikeEmailForVfsLogin } from "../types/vfsUserLogin.type.js";
 
-export const SAVE_APPLICANTS_URL =
-  process.env.VFS_SAVE_APPLICANTS_URL ?? "https://lift-api.vfsglobal.com/appointment/applicants";
+export const SAVE_APPLICANTS_URL = "https://lift-api.vfsglobal.com/appointment/applicants";
 
 /**
  * lift-api (ind/bgr) success capture: `JSON.stringify` key order must match for a stable POST body.
@@ -152,17 +151,6 @@ function mergeOverridesIntoBody(body: Record<string, unknown>, overrides: Record
   Object.assign(list[0] as object, overrides);
 }
 
-/**
- * After `VFS_APPLICANTS_JSON` / env template + UI merge: force only `applicantList[0].selectedSubvisaCategory`
- * to JSON `null` when `VFS_APPLICANT_SELECTED_SUBVISA_NULL=true` (or `1` / `yes`). Root fields unchanged.
- */
-function applyForcedApplicantNullFieldsFromEnv(body: Record<string, unknown>): void {
-  const raw = (process.env.VFS_APPLICANT_SELECTED_SUBVISA_NULL ?? "").trim().toLowerCase();
-  if (!/^true|1|yes$/.test(raw)) return;
-  const list = body.applicantList;
-  if (!Array.isArray(list) || list.length === 0 || typeof list[0] !== "object" || list[0] === null) return;
-  (list[0] as Record<string, unknown>).selectedSubvisaCategory = null;
-}
 
 /** Setup-form / bot-only fields merged into `applicantList[0]` — not part of lift-api save-applicants body. */
 const APPLICANT_UI_ONLY_KEYS = [
@@ -176,7 +164,10 @@ const APPLICANT_UI_ONLY_KEYS = [
   "applicantImageData",
   "countryCode",
   "missionCode",
+<<<<<<< HEAD
   "userPollInterval",
+=======
+>>>>>>> ae967060ca0807cd153713f34a93092658aed225
 ] as const;
 
 /**
@@ -195,6 +186,7 @@ function finalizeApplicantForLiftApiPost(body: Record<string, unknown>): void {
     a.visaSubClass = null;
   }
   a.selectedSubvisaCategory = null;
+<<<<<<< HEAD
   a.confirmPassportNumber = null;
   const em = a.emailId;
   if (typeof em === "string" && em.trim() !== "") {
@@ -208,6 +200,11 @@ function finalizeApplicantForLiftApiPost(body: Record<string, unknown>): void {
     a.applicantImageData = "";
     a.countryCode = "ind";
     a.missionCode = "bgr";
+=======
+  const em = a.emailId;
+  if (typeof em === "string" && em.trim() !== "") {
+    a.emailId = em.trim().toUpperCase();
+>>>>>>> ae967060ca0807cd153713f34a93092658aed225
   }
 }
 
@@ -270,12 +267,15 @@ function mergeVfsLoginProfileIntoSaveApplicantsBody(body: Record<string, unknown
   }
 }
 
+<<<<<<< HEAD
 /** Empty optional string from env → `null` (lift-api ind/bgr expects null, not ""). */
 function envTrimOrNull(key: string): string | null {
   const v = process.env[key]?.trim();
   return v ? v : null;
 }
 
+=======
+>>>>>>> ae967060ca0807cd153713f34a93092658aed225
 /** Default template body (no UI overrides). All personal fields come from the setup form at runtime. */
 export function buildSaveApplicantsBodyFromEnv(): Record<string, unknown> {
   const loginUser = getEffectiveLiftLoginUser();
@@ -377,7 +377,7 @@ export function buildSaveApplicantsBodyFromEnv(): Record<string, unknown> {
   });
 }
 
-/** Defaults for the post-login applicant form (from env / JSON template). */
+/** Defaults for the post-login applicant form. */
 export function getApplicantFormDefaults(): Record<string, string> {
   const body = buildSaveApplicantsBodyFromEnv();
   const list = body.applicantList as Record<string, unknown>[] | undefined;
@@ -401,7 +401,7 @@ export function getApplicantFormDefaults(): Record<string, string> {
 }
 
 /**
- * Full body: `VFS_APPLICANTS_JSON` or env template, merged with values from the applicant UI (if submitted).
+ * Full body: default template merged with values from the applicant UI (if submitted).
  * `loginUser` on the body and first applicant use {@link getEffectiveLiftLoginUser} when non-empty (setup UI or env).
  */
 export function buildSaveApplicantsBody(): Record<string, unknown> {

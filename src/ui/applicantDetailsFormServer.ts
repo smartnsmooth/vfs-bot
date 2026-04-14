@@ -10,20 +10,15 @@ import {
 } from "../utils/applicantDetails.store";
 import { getSessionLoginCredentials, setSessionLoginCredentials, getAllInstanceCredentials } from "../utils/sessionLogin.store";
 import { buildApplicantFormPageScript } from "./applicantDetailsFormClientScript";
-const UI_DISABLED = process.env.VFS_APPLICANT_UI === "false";
 
-export function isApplicantFormUiDisabled(): boolean {
-  return UI_DISABLED;
-}
+const APPLICANT_UI_PORT = 3847;
 
-export function applicantUiPort(): number {
-  const p = parseInt(process.env.VFS_APPLICANT_UI_PORT ?? "3847", 10);
-  return Number.isFinite(p) && p > 0 && p < 65536 ? p : 3847;
-}
+/** Actual bound port (updated by {@link bindApplicantFormServerToFreePort} when the default is busy). */
+let boundPort = APPLICANT_UI_PORT;
 
 /** Base URL for the local setup form (same host the browser uses for Submit → `/api/submit`). */
 export function getApplicantFormServerOrigin(): string {
-  return `http://127.0.0.1:${applicantUiPort()}`;
+  return `http://127.0.0.1:${boundPort}`;
 }
 
 /**
@@ -80,16 +75,6 @@ export async function postApplicantFormSubmitToLocalServer(body: Record<string, 
   }
 }
 
-/**
- * Returns the UI timeout in ms.  0 means "no timeout" (server stays up forever).
- * Default is 0 so the form server never auto-closes while the bot is running.
- */
-function applicantUiTimeoutMs(): number {
-  const raw = process.env.VFS_APPLICANT_UI_TIMEOUT_MS;
-  if (!raw) return 0; // no env var → run forever
-  const t = parseInt(raw, 10);
-  return Number.isFinite(t) && t > 0 ? t : 0;
-}
 
 function getLoginFormDefaults(): { vfsUsername: string } {
   return {
@@ -113,7 +98,6 @@ function readSecondCredentialAction(j: Record<string, unknown>): { username2: st
 }
 
 function openUrlInBrowser(url: string): void {
-  if (process.env.VFS_APPLICANT_UI_OPEN_BROWSER === "false") return;
   const platform = process.platform;
   const cmd =
     platform === "win32"
@@ -204,6 +188,9 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
     const v = parseInt(j.userPollInterval, 10);
     if (Number.isFinite(v) && v >= 1) out.userPollInterval = v;
   }
+  if ("skipPolling" in j) {
+    out.skipPolling = j.skipPolling === true || j.skipPolling === "true" || j.skipPolling === "1";
+  }
   return out;
 }
 
@@ -233,6 +220,13 @@ function buildPageHtml(collectLogin: boolean): string {
       <option value="bgr">Bulgaria</option>
       <option value="prt">Portugal</option>
     </select>
+<<<<<<< HEAD
+=======
+    <div style="display:flex;align-items:center;gap:0.5rem;margin-top:0.75rem">
+      <input type="checkbox" id="skipPolling" name="skipPolling" style="width:auto;margin:0" />
+      <label for="skipPolling" style="margin:0;cursor:pointer">Skip polling (Check this when you see 'Apologies for inconvenience' message)</label>
+    </div>
+>>>>>>> ae967060ca0807cd153713f34a93092658aed225
     <label for="userPollInterval" style="margin-top:0.75rem">Poll interval (seconds)</label>
     <input type="number" id="userPollInterval" name="userPollInterval" min="1" value="${defaultPollIntervalSec}" />
     <label for="numInstances">Number of instances</label>
@@ -655,10 +649,6 @@ export type ApplicantFormOptions = {
 
 export type FormSubmitInfo = { firstSubmit: boolean;[key: string]: unknown };
 
-function applicantUiPortFallbackAttempts(): number {
-  const n = parseInt(process.env.VFS_APPLICANT_UI_PORT_TRY ?? "20", 10);
-  return Number.isFinite(n) && n > 0 ? Math.min(100, n) : 20;
-}
 
 /** Try `server.listen(port)` once; rejects with `EADDRINUSE` when the port is taken. */
 function listenOnce(server: Server, port: number, host: string): Promise<void> {
@@ -677,10 +667,10 @@ function listenOnce(server: Server, port: number, host: string): Promise<void> {
 
 /**
  * Binds `server` on `preferredPort`, then `preferredPort+1`, … until a port is free or attempts exhausted.
- * Sets `process.env.VFS_APPLICANT_UI_PORT` to the bound port so {@link getApplicantFormServerOrigin} matches.
+ * Updates {@link boundPort} so {@link getApplicantFormServerOrigin} returns the correct URL.
  */
 async function bindApplicantFormServerToFreePort(server: Server, host: string, preferredPort: number): Promise<number> {
-  const maxTries = applicantUiPortFallbackAttempts();
+  const maxTries = 20;
   for (let i = 0; i < maxTries; i++) {
     const tryPort = preferredPort + i;
     if (tryPort > 65535) break;
@@ -689,10 +679,10 @@ async function bindApplicantFormServerToFreePort(server: Server, host: string, p
       if (i > 0) {
         logger.warn(
           { requestedPort: preferredPort, boundPort: tryPort },
-          "Applicant UI port was in use; using next free port (close the other bot/cluster or set VFS_APPLICANT_UI_PORT)"
+          "Setup form port was in use; using next free port"
         );
       }
-      process.env.VFS_APPLICANT_UI_PORT = String(tryPort);
+      boundPort = tryPort;
       return tryPort;
     } catch (e) {
       const err = e as NodeJS.ErrnoException;
@@ -703,7 +693,7 @@ async function bindApplicantFormServerToFreePort(server: Server, host: string, p
     }
   }
   throw new Error(
-    `Could not bind applicant UI: ports ${preferredPort}–${preferredPort + maxTries - 1} are in use. Stop the other process or set VFS_APPLICANT_UI_PORT to a free port.`
+    `Could not bind setup form: ports ${preferredPort}–${preferredPort + maxTries - 1} are in use. Stop the other process.`
   );
 }
 
@@ -717,26 +707,16 @@ export function runApplicantFormWithSubmitHandler(
 ): Promise<never> {
   const collectLogin = options?.collectLogin !== false;
 
-  if (UI_DISABLED) {
-    logger.info("Applicant UI disabled (VFS_APPLICANT_UI=false); using .env / VFS_APPLICANTS_JSON only");
-    return Promise.reject(new Error("Applicant form UI disabled; use run without form handler"));
-  }
-
-  const preferredPort = applicantUiPort();
+  const preferredPort = APPLICANT_UI_PORT;
   const host = "127.0.0.1";
 
   return new Promise<never>((_resolve, reject) => {
     let settled = false;
     let seenSubmit = false;
-    let timeoutId: ReturnType<typeof setTimeout> | undefined;
 
-    const clearTimer = (): void => {
-      if (timeoutId !== undefined) clearTimeout(timeoutId);
-    };
     const safeReject = (err: Error): void => {
       if (settled) return;
       settled = true;
-      clearTimer();
       reject(err);
     };
 
@@ -752,22 +732,23 @@ export function runApplicantFormWithSubmitHandler(
 
         if (req.method === "GET" && path === "/api/defaults") {
           try {
-            const numInstances = parseInt(process.env.VFS_BOT_INSTANCES ?? "1", 10) || 1;
             const defaults: Record<string, unknown> = { ...getApplicantFormDefaults() };
 
-            // Single-instance UX: the form has no instance selector, but data is still saved per instance ID.
-            // Prefer instance 1 (cluster) and fall back to instance 0.
-            if (numInstances <= 1) {
+            // Prefer instance 1 data, fall back to instance 0.
+            {
               const det1 = getApplicantDetailsOverrides(1);
               const det0 = getApplicantDetailsOverrides(0);
               const det = det1 ?? det0;
               if (det) Object.assign(defaults, det);
             }
 
-            // userPollInterval is a global setting stored under instance 0; surface it for all modes.
+            // Global settings stored under instance 0; surface them for all modes.
             const globalDet = getApplicantDetailsOverrides(0);
             if (globalDet && typeof globalDet.userPollInterval === "number") {
               defaults.userPollInterval = globalDet.userPollInterval;
+            }
+            if (globalDet && typeof globalDet.skipPolling === "boolean") {
+              defaults.skipPolling = globalDet.skipPolling;
             }
             const payload: Record<string, unknown> = { ok: true, defaults };
             if (collectLogin) {
@@ -841,15 +822,23 @@ export function runApplicantFormWithSubmitHandler(
             ...rest
           } = j;
           const fields = parseApplicantFields(rest);
-          const { userPollInterval: upi, ...instanceFields } = fields;
+          const { userPollInterval: upi, skipPolling: sp, ...instanceFields } = fields;
 
+<<<<<<< HEAD
           // userPollInterval and countryCode/missionCode are global — also save to instance 0.
+=======
+          // userPollInterval and skipPolling are global — save only to instance 0, never per-instance.
+>>>>>>> ae967060ca0807cd153713f34a93092658aed225
           {
             const global0 = getApplicantDetailsOverrides(0) ?? {};
             let changed = false;
             if (typeof upi === "number") { global0.userPollInterval = upi; changed = true; }
+<<<<<<< HEAD
             if (typeof instanceFields.countryCode === "string") { global0.countryCode = instanceFields.countryCode; changed = true; }
             if (typeof instanceFields.missionCode === "string") { global0.missionCode = instanceFields.missionCode; changed = true; }
+=======
+            if (typeof sp === "boolean") { global0.skipPolling = sp; changed = true; }
+>>>>>>> ae967060ca0807cd153713f34a93092658aed225
             if (changed) setApplicantDetailsOverrides(global0, 0);
           }
           const id = instanceId ?? 0;
@@ -869,99 +858,51 @@ export function runApplicantFormWithSubmitHandler(
             return;
           }
 
-          // Prefer the numInstances value the user set in the form; fall back to env.
           const submittedNumInstances =
             typeof j.numInstances === "number" && j.numInstances > 0
               ? Math.floor(j.numInstances)
-              : parseInt(process.env.VFS_BOT_INSTANCES ?? "1", 10) || 1;
+              : 1;
 
-          // In cluster / multi-instance mode, start ALL saved instances up to the chosen count.
-          if (submittedNumInstances > 1) {
-            const credentials = getAllInstanceCredentials();
-            const details = getAllInstanceApplicantDetails();
-            const allIds = new Set([...credentials.keys(), ...details.keys()]);
+          const credentials = getAllInstanceCredentials();
+          const details = getAllInstanceApplicantDetails();
+          const allIds = new Set([...credentials.keys(), ...details.keys()]);
 
-            if (allIds.size === 0) {
-              json(res, 400, { ok: false, error: "No saved instances. Use Save button first to save data for each instance." });
-              return;
-            }
-
-            let queued = 0;
-            for (const instanceId of allIds) {
-              // Instance 0 is a global/shared store slot, not a real bot instance
-              if (instanceId === 0) continue;
-              // Only submit for instances within the chosen count
-              if (instanceId > submittedNumInstances) {
-                continue;
-              }
-
-              const creds = credentials.get(instanceId);
-              const dets = details.get(instanceId);
-
-              if (creds && dets) {
-                void Promise.resolve(onSubmit({
-                  firstSubmit: !seenSubmit,
-                  instanceId,
-                  numInstances: submittedNumInstances,
-                  ...creds,
-                  ...dets
-                }))
-                  .then(() => undefined)
-                  .catch((err) => logger.error({ err, instanceId }, "Form onSubmit handler failed"));
-                queued++;
-              }
-            }
-
-            seenSubmit = true;
-            json(res, 200, { ok: true, firstSubmit: !seenSubmit, queued });
+          if (allIds.size === 0) {
+            json(res, 400, { ok: false, error: "No saved instances. Use Save button first to save data for each instance." });
             return;
           }
 
-          // Single instance mode (legacy)
-          const instanceId = typeof j.instanceId === "number" ? j.instanceId : undefined;
-
-          if (collectLogin) {
-            const vu = typeof j.vfsUsername === "string" ? j.vfsUsername.trim() : "";
-            const vp = typeof j.vfsPassword === "string" ? j.vfsPassword : "";
-            if (!vu || !vp) {
-              json(res, 400, { ok: false, error: "VFS username and password are required" });
-              return;
-            }
-            setSessionLoginCredentials(vu, vp, instanceId, readSecondCredentialAction(j));
+          const validInstanceIds: number[] = [];
+          for (const instanceId of allIds) {
+            if (instanceId === 0) continue;
+            if (instanceId > submittedNumInstances) continue;
+            const creds = credentials.get(instanceId);
+            const dets = details.get(instanceId);
+            if (creds && dets) validInstanceIds.push(instanceId);
           }
 
-          const {
-            vfsUsername: _u,
-            vfsPassword: _p,
-            vfsUsername2: _ux2,
-            vfsPassword2: _px2,
-            instanceId: _id,
-            ...rest
-          } = j;
-          const fields = parseApplicantFields(rest);
-          if (!fields.passportExpirtyDate || !fields.vacCode || !fields.selectedSubvisaCategory || !fields.nationalityCode) {
-            json(res, 400, {
-              ok: false,
-              error: "passport expiry, nationality, visa centre (VAC), and visa category are required",
-            });
+          const actualInstanceCount = validInstanceIds.length;
+          if (actualInstanceCount === 0) {
+            json(res, 400, { ok: false, error: "No instances have both credentials and details saved. Use Save button first." });
             return;
           }
-          const { userPollInterval: upi2, ...instanceFields2 } = fields;
 
-          // userPollInterval is global — save only to instance 0, never per-instance.
-          if (typeof upi2 === "number") {
-            const global0 = getApplicantDetailsOverrides(0) ?? {};
-            setApplicantDetailsOverrides({ ...global0, userPollInterval: upi2 }, 0);
+          let queued = 0;
+          for (const instanceId of validInstanceIds) {
+            void Promise.resolve(onSubmit({
+              firstSubmit: !seenSubmit,
+              instanceId,
+              numInstances: actualInstanceCount,
+              ...credentials.get(instanceId),
+              ...details.get(instanceId),
+            }))
+              .then(() => undefined)
+              .catch((err) => logger.error({ err, instanceId }, "Form onSubmit handler failed"));
+            queued++;
           }
-          const submitInstanceId = instanceId ?? 0;
-          setApplicantDetailsOverrides(instanceFields2, submitInstanceId);
-          const firstSubmit = !seenSubmit;
+
           seenSubmit = true;
-          json(res, 200, { ok: true, firstSubmit });
-          void Promise.resolve(onSubmit({ firstSubmit, instanceId, ...j }))
-            .then(() => undefined)
-            .catch((err) => logger.error({ err }, "Form onSubmit handler failed"));
-          logger.info({ firstSubmit, instanceId }, "Setup form submitted — onSubmit queued");
+          json(res, 200, { ok: true, firstSubmit: !seenSubmit, queued });
           return;
         }
 
@@ -987,17 +928,6 @@ export function runApplicantFormWithSubmitHandler(
         });
         console.log("\n  >>> Bot setup form: " + url + "\n");
         openUrlInBrowser(url);
-        const uiTimeoutMs = applicantUiTimeoutMs();
-        if (uiTimeoutMs > 0) {
-          timeoutId = setTimeout(() => {
-            server.close(() => { });
-            safeReject(
-              new Error(
-                `Applicant UI timed out after ${uiTimeoutMs}ms. Submit the form or set VFS_APPLICANT_UI=false to skip.`
-              )
-            );
-          }, uiTimeoutMs);
-        }
       } catch (err) {
         server.close(() => { });
         safeReject(err instanceof Error ? err : new Error(String(err)));
@@ -1011,7 +941,6 @@ export function runApplicantFormWithSubmitHandler(
  * Prefer {@link runApplicantFormWithSubmitHandler} for submit-driven bot runs.
  */
 export function openApplicantDetailsFormAndWait(options?: ApplicantFormOptions): Promise<void> {
-  if (UI_DISABLED) return Promise.resolve();
   return new Promise((resolve, reject) => {
     let settled = false;
     void runApplicantFormWithSubmitHandler(async ({ firstSubmit }) => {

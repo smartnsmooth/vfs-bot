@@ -302,6 +302,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       }
       const genderEl = document.getElementById("gender");
       if (genderEl) genderEl.value = "1";
+      const skipEl = document.getElementById("skipPolling");
+      if (skipEl) skipEl.checked = false;
       applyInstanceScheduleRangeToForm({});
       return;
     }
@@ -343,7 +345,12 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     }
 
     if (inst.details) {
+<<<<<<< HEAD
       const skipDetailIds = { numInstances: true, instanceId: true, vfsUsername2: true, vfsPassword2: true, countryCode: true, missionCode: true };
+=======
+      const skipDetailIds = { numInstances: true, instanceId: true, vfsUsername2: true, vfsPassword2: true, skipPolling: true, countryCode: true, missionCode: true };
+      // Restore countryCode first, then rebuild mission options, then restore missionCode.
+>>>>>>> ae967060ca0807cd153713f34a93092658aed225
       const ccEl = document.getElementById("countryCode");
       if (ccEl && inst.details.countryCode) ccEl.value = String(inst.details.countryCode);
       updateMissionOptions();
@@ -359,6 +366,10 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
         const el = document.getElementById(k);
         if (el) el.value = inst.details[k] == null ? "" : String(inst.details[k]);
       }
+<<<<<<< HEAD
+=======
+      // Restore center selections, then rebuild per-center categories, then restore category selections.
+>>>>>>> ae967060ca0807cd153713f34a93092658aed225
       var vc1El = document.getElementById("vacCode");
       if (vc1El && inst.details.vacCode) vc1El.value = String(inst.details.vacCode);
       updateCategoryOptions("vacCode", "selectedSubvisaCategory");
@@ -371,6 +382,14 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       if (sc2El && inst.details.selectedSubvisaCategory2) sc2El.value = String(inst.details.selectedSubvisaCategory2);
     }
     applyInstanceScheduleRangeToForm(inst.details || {});
+
+    // skipPolling is global (instance 0); apply from whichever source has it.
+    const globalInst = data.instances["0"];
+    const skipEl = document.getElementById("skipPolling");
+    if (skipEl) {
+      const src = (globalInst && globalInst.details) || (inst && inst.details) || {};
+      skipEl.checked = !!src.skipPolling;
+    }
 
     if (showAlert) {
       alert("Loaded saved data for Instance " + instanceId);
@@ -400,6 +419,10 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       scheduleDateRangeEnd: String(fd.get("scheduleDateRangeEnd") ?? "").trim(),
       numInstances: getNumInstances(),
       userPollInterval: parseInt(String(fd.get("userPollInterval") || "60"), 10) || 60,
+<<<<<<< HEAD
+=======
+      skipPolling: !!fd.get("skipPolling"),
+>>>>>>> ae967060ca0807cd153713f34a93092658aed225
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
     };
     if (collectLogin) {
@@ -562,6 +585,10 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       scheduleDateRangeEnd: String(fd.get("scheduleDateRangeEnd") ?? "").trim(),
       numInstances: getNumInstances(),
       userPollInterval: parseInt(String(fd.get("userPollInterval") || "60"), 10) || 60,
+<<<<<<< HEAD
+=======
+      skipPolling: !!fd.get("skipPolling"),
+>>>>>>> ae967060ca0807cd153713f34a93092658aed225
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
     };
     if (collectLogin) {

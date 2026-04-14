@@ -1,7 +1,6 @@
 /**
- * `clientsource` header observed on a real browser request to
+ * `clientsource` header captured from a real browser request to
  * https://lift-api.vfsglobal.com/... (any path that sends the header).
- * Used when VFS_CLIENTSOURCE is not set.
  */
 
 let captured: string | null = null;
@@ -34,9 +33,9 @@ export function clearCapturedClientSource(): void {
 
 /**
  * Resolves when {@link setCapturedClientSource} stores a non-empty value, or immediately if already set.
- * Rejects after `timeoutMs` if still empty.
+ * Waits indefinitely — the bot must not proceed without a captured clientsource.
  */
-export function waitForClientSourceCapture(timeoutMs: number, signal?: AbortSignal): Promise<string> {
+export function waitForClientSourceCapture(signal?: AbortSignal): Promise<string> {
   if (captured) return Promise.resolve(captured);
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -44,34 +43,22 @@ export function waitForClientSourceCapture(timeoutMs: number, signal?: AbortSign
     const finish = (v: string) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
       const i = waiters.indexOf(onCaptured);
       if (i >= 0) waiters.splice(i, 1);
       resolve(v);
     };
 
-    const fail = (err: Error) => {
+    const onAbort = () => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
       const i = waiters.indexOf(onCaptured);
       if (i >= 0) waiters.splice(i, 1);
-      reject(err);
+      reject(new Error("waitForClientSourceCapture aborted"));
     };
 
-    const onAbort = () => fail(new Error("waitForClientSourceCapture aborted"));
-
     const onCaptured = (v: string) => finish(v);
-
-    const timer = setTimeout(() => {
-      fail(
-        new Error(
-          `clientsource not captured within ${timeoutMs}ms. Set VFS_CLIENTSOURCE or use the portal so a lift-api request with clientsource runs (e.g. refresh dashboard).`
-        )
-      );
-    }, timeoutMs);
 
     waiters.push(onCaptured);
     signal?.addEventListener("abort", onAbort, { once: true });

@@ -12,6 +12,7 @@ export function getCurrentInstanceId(): number | undefined {
   return currentInstanceId;
 }
 
+<<<<<<< HEAD
 function resolvedFormDetails(): Record<string, unknown> | undefined {
   if (currentInstanceId != null) {
     const det = getApplicantDetailsOverrides(currentInstanceId);
@@ -34,10 +35,19 @@ function resolvedMissionCode(): string {
 
 /** Sub-second polling (ms). */
 const POLLING_INTERVAL_MS = parseInt(process.env.POLLING_INTERVAL_MS ?? "30000", 10);
+=======
+function resolvedCountryCode(): string {
+  const det = getApplicantDetailsOverrides(currentInstanceId ?? 1) ?? getApplicantDetailsOverrides(0);
+  const fromForm = typeof det?.countryCode === "string" ? det.countryCode.trim().toLowerCase() : "";
+  return fromForm || "ind";
+}
+>>>>>>> ae967060ca0807cd153713f34a93092658aed225
 
-/** Min/max for random polling interval (ms). */
-const POLLING_INTERVAL_MIN_MS = parseInt(process.env.POLLING_INTERVAL_MIN_MS ?? "20000", 10);
-const POLLING_INTERVAL_MAX_MS = parseInt(process.env.POLLING_INTERVAL_MAX_MS ?? "60000", 10);
+function resolvedMissionCode(): string {
+  const det = getApplicantDetailsOverrides(currentInstanceId ?? 1) ?? getApplicantDetailsOverrides(0);
+  const fromForm = typeof det?.missionCode === "string" ? det.missionCode.trim().toLowerCase() : "";
+  return fromForm || "bgr";
+}
 
 /** `loginUser` for slot / lift-api: setup form (session) first, then `VFS_USERNAME`. */
 function envSlotLoginUser(): string {
@@ -68,6 +78,7 @@ export const config = {
     return process.env.TURNSTILE_DEMO_URL ?? "https://2captcha.com/demo/cloudflare-turnstile";
   },
   get loginPageUrl(): string {
+<<<<<<< HEAD
     const det = resolvedFormDetails();
     const formCountry = typeof det?.countryCode === "string" ? det.countryCode.trim().toLowerCase() : "";
     const formMission = typeof det?.missionCode === "string" ? det.missionCode.trim().toLowerCase() : "";
@@ -76,6 +87,11 @@ export const config = {
     }
     return process.env.VFS_LOGIN_PAGE_URL ?? process.env.VFS_LOGIN_ENDPOINT
       ?? `https://visa.vfsglobal.com/${resolvedCountryCode()}/en/${resolvedMissionCode()}/login`;
+=======
+    const explicit = process.env.VFS_LOGIN_PAGE_URL ?? process.env.VFS_LOGIN_ENDPOINT;
+    if (explicit) return explicit;
+    return `https://visa.vfsglobal.com/${resolvedCountryCode()}/en/${resolvedMissionCode()}/login`;
+>>>>>>> ae967060ca0807cd153713f34a93092658aed225
   },
   slotEndpoint: process.env.VFS_SLOT_ENDPOINT ?? "https://lift-api.vfsglobal.com/appointment/CheckIsSlotAvailable",
   /** Base slot-check payload (center & visa category are set at runtime via the setup form). */
@@ -90,15 +106,12 @@ export const config = {
     get missionCode(): string {
       return resolvedMissionCode();
     },
+<<<<<<< HEAD
     payCode: "",
+=======
+>>>>>>> ae967060ca0807cd153713f34a93092658aed225
     roleName: process.env.VFS_SLOT_ROLE_NAME ?? "Individual",
   },
-  pollingPageUrl: process.env.VFS_POLLING_PAGE_URL ?? "https://visa.vfsglobal.com/ind/en/bgr/application-detail",
-
-  pollingIntervalMs: Math.max(5000, Math.min(60000, POLLING_INTERVAL_MS)),
-  pollingIntervalMinMs: Math.max(5000, POLLING_INTERVAL_MIN_MS),
-  pollingIntervalMaxMs: Math.max(POLLING_INTERVAL_MIN_MS, Math.min(120000, POLLING_INTERVAL_MAX_MS)),
-
   /** `POLL_LIMIT`: 0 = infinite; else stop after this many `checkSlotsInBrowser` calls. */
   pollLimit,
 
@@ -119,25 +132,8 @@ export const config = {
   capmonsterApiKey: process.env.CAPMONSTER_API_KEY ?? "",
   capmonsterApiUrl: process.env.CAPMONSTER_API_URL ?? "https://api.capmonster.cloud",
 
-  // Default to on; set ENABLE_POLLING=false to disable slot polling.
-  pollingEnabled: process.env.ENABLE_POLLING !== "false",
-
   // When true: log in then stop immediately — no polling, no booking.  Useful for testing login / Turnstile.
   loginOnly: process.env.VFS_LOGIN_ONLY === "true" || process.env.VFS_LOGIN_ONLY === "1",
-
-  /**
-   * Optional: manual `clientsource` header for lift-api.
-   * When set, overrides captured value and page storage.
-   * When empty, the bot uses a value captured from any lift-api browser request that sends
-   * `clientsource` (see BrowserService sniffer), then storage in fetch.
-   */
-  liftApiClientSource: (process.env.VFS_CLIENTSOURCE ?? "").trim(),
-
-  /**
-   * When true, a fresh 256-byte random base64 token is generated for every lift-api request
-   * instead of reusing the captured/static clientsource.  Keeps each request fingerprint unique.
-   */
-  randomClientSource: process.env.VFS_RANDOM_CLIENTSOURCE === "true" || process.env.VFS_RANDOM_CLIENTSOURCE === "1",
 
   /**
    * After this many poll rounds, log out and re-login so the VFS session is refreshed.
@@ -163,9 +159,20 @@ export const config = {
    * When true, OTP is read via https://api.mail.tm (see /domains for hostnames — not limited to “@mail.tm”).
    * `VFS_USERNAME` / `VFS_PASSWORD` must match that mail.tm-created mailbox.
    */
+  /** Chrome window width in pixels for grid layout. 0 = auto (screen width / columns). */
+  chromeWindowWidth: Math.max(0, parseInt(process.env.CHROME_WINDOW_WIDTH ?? "0", 10) || 0),
+  /** Chrome window height in pixels for grid layout. 0 = auto (screen height / rows). */
+  chromeWindowHeight: Math.max(0, parseInt(process.env.CHROME_WINDOW_HEIGHT ?? "0", 10) || 0),
+  /** Fixed number of columns for the browser grid. 0 = auto (ceil(sqrt(totalInstances)) capped at 5). */
+  chromeGridColumns: Math.max(0, parseInt(process.env.CHROME_GRID_COLUMNS ?? "0", 10) || 0),
+  /** Screen width for grid calculation. 0 = auto-detect via PowerShell (fallback 1920). */
+  screenWidth: Math.max(0, parseInt(process.env.SCREEN_WIDTH ?? "0", 10) || 0),
+  /** Screen height for grid calculation. 0 = auto-detect via PowerShell (fallback 1040 = 1080 - taskbar). */
+  screenHeight: Math.max(0, parseInt(process.env.SCREEN_HEIGHT ?? "0", 10) || 0),
+
   mailTmOtpEnabled: process.env.ENABLE_MAIL_TM_OTP === "true",
   /** Max time to poll mail.tm after OTP step appears. */
-  mailTmOtpTimeoutMs: Math.max(30_000, Number.isFinite(MAIL_TM_OTP_TIMEOUT_MS) ? MAIL_TM_OTP_TIMEOUT_MS : 120_000),
+  mailTmOtpTimeoutMs: Math.max(300_000, Number.isFinite(MAIL_TM_OTP_TIMEOUT_MS) ? MAIL_TM_OTP_TIMEOUT_MS : 120_000),
   /** Interval between mail.tm message polls. */
   mailTmPollIntervalMs: Math.max(2_000, Number.isFinite(MAIL_TM_POLL_MS) ? MAIL_TM_POLL_MS : 4_000),
   /**

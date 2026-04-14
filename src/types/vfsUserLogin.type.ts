@@ -36,7 +36,7 @@ export interface VfsUserLoginResponse {
   passwordExpiryDaysLeftTA?: number;
   isEmbassyUser?: boolean;
   IsLoginCapturePassportOCREnabled?: boolean;
-  error?: unknown;
+  error?: { code?: number; description?: string; type?: string } | unknown;
 }
 
 export function parseVfsUserLoginResponseBody(body: string): VfsUserLoginResponse | null {

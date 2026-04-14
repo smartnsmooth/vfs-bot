@@ -137,7 +137,7 @@ The bot automatically matches the submitted data to the correct instance:
 
 ### Single Instance Mode
 
-If `VFS_BOT_INSTANCES=1` or you use `npm run dev` (not cluster), the form works as before with no instance selector.
+If you use `npm run dev` (not cluster), the form works as before with no instance selector.
 
 ## Benefits
 
