@@ -16,6 +16,7 @@ import { buildCalendarBody, CALENDAR_URL } from "../config/calendar";
 import { buildScheduleBody, SCHEDULE_URL } from "../config/schedule";
 import { buildTimeslotBody, TIMESLOT_URL } from "../config/timeslot";
 import { buildFeesBody, FEES_URL } from "../config/fees";
+import { buildMapVasBody, MAPVAS_URL } from "../config/mapvas";
 import { buildSaveApplicantsBody, SAVE_APPLICANTS_URL } from "../config/saveApplicants";
 import { logger } from "../utils/logger";
 import { ensureApplicantIpResolved } from "../utils/applicantIp";
@@ -847,6 +848,19 @@ export class BrowserService {
   }
 
   /**
+   * POST /vas/mapvas (after timeslot, before fees). Egypt→Portugal portal only.
+   */
+  async postMapVasLiftApi(): Promise<void> {
+    const urn = getApplicationUrn();
+    if (!urn?.trim()) {
+      logger.warn("Skip mapvas API: no urn; save applicants successfully first");
+      return;
+    }
+    const page = await this.getVfsPage();
+    await this.postMapVasLiftApiOnPage(page, urn);
+  }
+
+  /**
    * POST /appointment/schedule (after timeslot). Uses URN, allocationId from timeslot; stores response `URL` when set.
    */
   async postScheduleLiftApi(): Promise<void> {
@@ -885,9 +899,10 @@ export class BrowserService {
     await page.waitForTimeout(500);
     await ensureApplicantIpResolved(page);
     const body = buildSaveApplicantsBody();
-    logger.info({ url: SAVE_APPLICANTS_URL }, "Saving applicant via lift-api");
+    logger.info({ url: SAVE_APPLICANTS_URL, payload: JSON.stringify(body) }, "Saving applicant via lift-api");
 
     const res = await this.postLiftJsonFromPage(page, SAVE_APPLICANTS_URL, body);
+    logger.info({ status: res.status, responseBody: res.body.slice(0, 1000) }, "Applicants API response");
 
     const parsed = this.parseApplicantsResponseJson(res.body);
     if (parsed.urn) setApplicationUrn(parsed.urn);
@@ -930,6 +945,22 @@ export class BrowserService {
       throw new Error("Fees: response is not JSON");
     }
     logger.info("Fees retrieved OK");
+  }
+
+  private async postMapVasLiftApiOnPage(page: Page, urn: string): Promise<void> {
+    const payload = buildMapVasBody(urn);
+    logger.info({ url: MAPVAS_URL }, "Calling lift-api mapvas");
+    const res = await this.postLiftJsonFromPage(page, MAPVAS_URL, payload);
+    try {
+      const j = JSON.parse(res.body) as { urn?: string; amount?: number; currency?: string; error?: unknown };
+      if (j.error != null && j.error !== "") {
+        throw new Error(`MapVas API error: ${JSON.stringify(j.error)}`);
+      }
+      logger.info({ urn: j.urn, amount: j.amount, currency: j.currency }, "MapVas response OK");
+    } catch (e) {
+      if (e instanceof Error && e.message.startsWith("MapVas API error")) throw e;
+      throw new Error("MapVas: response is not JSON");
+    }
   }
 
   private async postCalendarLiftApiOnPage(

@@ -346,7 +346,6 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
 
     if (inst.details) {
       const skipDetailIds = { numInstances: true, instanceId: true, vfsUsername2: true, vfsPassword2: true, skipPolling: true, countryCode: true, missionCode: true };
-      // Restore countryCode first, then rebuild mission options, then restore missionCode.
       const ccEl = document.getElementById("countryCode");
       if (ccEl && inst.details.countryCode) ccEl.value = String(inst.details.countryCode);
       updateMissionOptions();
@@ -362,7 +361,6 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
         const el = document.getElementById(k);
         if (el) el.value = inst.details[k] == null ? "" : String(inst.details[k]);
       }
-      // Restore center selections, then rebuild per-center categories, then restore category selections.
       var vc1El = document.getElementById("vacCode");
       if (vc1El && inst.details.vacCode) vc1El.value = String(inst.details.vacCode);
       updateCategoryOptions("vacCode", "selectedSubvisaCategory");

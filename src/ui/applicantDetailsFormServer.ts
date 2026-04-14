@@ -821,11 +821,12 @@ export function runApplicantFormWithSubmitHandler(
           const fields = parseApplicantFields(rest);
           const { userPollInterval: upi, skipPolling: sp, ...instanceFields } = fields;
 
-          // userPollInterval and skipPolling are global — save only to instance 0, never per-instance.
           {
             const global0 = getApplicantDetailsOverrides(0) ?? {};
             let changed = false;
             if (typeof upi === "number") { global0.userPollInterval = upi; changed = true; }
+            if (typeof instanceFields.countryCode === "string") { global0.countryCode = instanceFields.countryCode; changed = true; }
+            if (typeof instanceFields.missionCode === "string") { global0.missionCode = instanceFields.missionCode; changed = true; }
             if (typeof sp === "boolean") { global0.skipPolling = sp; changed = true; }
             if (changed) setApplicantDetailsOverrides(global0, 0);
           }

@@ -12,14 +12,22 @@ export function getCurrentInstanceId(): number | undefined {
   return currentInstanceId;
 }
 
+function resolvedFormDetails(): Record<string, unknown> | undefined {
+  if (currentInstanceId != null) {
+    const det = getApplicantDetailsOverrides(currentInstanceId);
+    if (det) return det;
+  }
+  return getApplicantDetailsOverrides(1) ?? getApplicantDetailsOverrides(0) ?? undefined;
+}
+
 function resolvedCountryCode(): string {
-  const det = getApplicantDetailsOverrides(currentInstanceId ?? 1) ?? getApplicantDetailsOverrides(0);
+  const det = resolvedFormDetails();
   const fromForm = typeof det?.countryCode === "string" ? det.countryCode.trim().toLowerCase() : "";
   return fromForm || "ind";
 }
 
 function resolvedMissionCode(): string {
-  const det = getApplicantDetailsOverrides(currentInstanceId ?? 1) ?? getApplicantDetailsOverrides(0);
+  const det = resolvedFormDetails();
   const fromForm = typeof det?.missionCode === "string" ? det.missionCode.trim().toLowerCase() : "";
   return fromForm || "bgr";
 }
@@ -53,9 +61,14 @@ export const config = {
     return process.env.TURNSTILE_DEMO_URL ?? "https://2captcha.com/demo/cloudflare-turnstile";
   },
   get loginPageUrl(): string {
-    const explicit = process.env.VFS_LOGIN_PAGE_URL ?? process.env.VFS_LOGIN_ENDPOINT;
-    if (explicit) return explicit;
-    return `https://visa.vfsglobal.com/${resolvedCountryCode()}/en/${resolvedMissionCode()}/login`;
+    const det = resolvedFormDetails();
+    const formCountry = typeof det?.countryCode === "string" ? det.countryCode.trim().toLowerCase() : "";
+    const formMission = typeof det?.missionCode === "string" ? det.missionCode.trim().toLowerCase() : "";
+    if (formCountry && formMission) {
+      return `https://visa.vfsglobal.com/${formCountry}/en/${formMission}/login`;
+    }
+    return process.env.VFS_LOGIN_PAGE_URL ?? process.env.VFS_LOGIN_ENDPOINT
+      ?? `https://visa.vfsglobal.com/${resolvedCountryCode()}/en/${resolvedMissionCode()}/login`;
   },
   slotEndpoint: process.env.VFS_SLOT_ENDPOINT ?? "https://lift-api.vfsglobal.com/appointment/CheckIsSlotAvailable",
   /** Base slot-check payload (center & visa category are set at runtime via the setup form). */
@@ -70,6 +83,7 @@ export const config = {
     get missionCode(): string {
       return resolvedMissionCode();
     },
+    payCode: "",
     roleName: process.env.VFS_SLOT_ROLE_NAME ?? "Individual",
   },
   /** `POLL_LIMIT`: 0 = infinite; else stop after this many `checkSlotsInBrowser` calls. */

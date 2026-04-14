@@ -164,6 +164,7 @@ const APPLICANT_UI_ONLY_KEYS = [
   "vacCode",
   "vacCode2",
   "selectedSubvisaCategory2",
+  "userPollInterval",
 ] as const;
 
 /**
@@ -182,9 +183,19 @@ function finalizeApplicantForLiftApiPost(body: Record<string, unknown>): void {
     a.visaSubClass = null;
   }
   a.selectedSubvisaCategory = null;
+  a.confirmPassportNumber = null;
   const em = a.emailId;
   if (typeof em === "string" && em.trim() !== "") {
     a.emailId = em.trim().toUpperCase();
+  }
+
+  const rc = typeof body.countryCode === "string" ? body.countryCode.trim().toLowerCase() : "";
+  const rm = typeof body.missionCode === "string" ? body.missionCode.trim().toLowerCase() : "";
+  if (rc === "ind" && rm === "bgr") {
+    a.applicantImage = "";
+    a.applicantImageData = "";
+    a.countryCode = "ind";
+    a.missionCode = "bgr";
   }
 }
 

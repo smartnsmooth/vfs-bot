@@ -1131,6 +1131,12 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
     }
   }
 
+  const isEgyptPortugal =
+    config.slotPayload.countryCode === "egy" && config.slotPayload.missionCode === "prt";
+  if (isEgyptPortugal) {
+    await browser.postMapVasLiftApi();
+  }
+
   await browser.postFeesLiftApi();
 
   const MAX_SCHEDULE_RETRIES_FROM_TIMESLOT = 3;
