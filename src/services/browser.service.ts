@@ -11,7 +11,13 @@ function isTargetClosedError(e: unknown): boolean {
   );
 }
 import { config, getCurrentInstanceId } from "../config/config";
-import { calendarApiDateInAllowedSet, NoDatesInScheduleRangeError } from "../utils/scheduleAllowedDates.js";
+import {
+  calendarApiDateMatchesConstraint,
+  NoDatesInScheduleRangeError,
+  scheduleConstraintIsActive,
+  scheduleConstraintLogValue,
+  type ScheduleDateConstraint,
+} from "../utils/scheduleAllowedDates.js";
 import { buildCalendarBody, CALENDAR_URL } from "../config/calendar";
 import { buildScheduleBody, SCHEDULE_URL } from "../config/schedule";
 import { buildTimeslotBody, TIMESLOT_URL } from "../config/timeslot";
@@ -819,7 +825,7 @@ export class BrowserService {
    * POST /appointment/calendar (call from index after fees).
    * Uses stored URN and same VFS tab / headers as other lift-api calls.
    */
-  async postCalendarLiftApi(opts?: { allowedDates?: Set<string> }): Promise<void> {
+  async postCalendarLiftApi(opts?: { scheduleConstraint?: ScheduleDateConstraint }): Promise<void> {
     const urn = getApplicationUrn();
     if (!urn?.trim()) {
       logger.warn("Skip calendar API: no urn in memory; save applicants successfully first");
@@ -966,7 +972,7 @@ export class BrowserService {
   private async postCalendarLiftApiOnPage(
     page: Page,
     urn: string,
-    opts?: { allowedDates?: Set<string> }
+    opts?: { scheduleConstraint?: ScheduleDateConstraint }
   ): Promise<void> {
     const payload = buildCalendarBody(urn);
     logger.info({ url: CALENDAR_URL, fromDate: payload.fromDate }, "Calling lift-api calendar");
@@ -982,13 +988,13 @@ export class BrowserService {
       throw new Error("Calendar: response is not JSON");
     }
     let dates = (j.calendars ?? []).map((c) => String(c?.date ?? "").trim()).filter(Boolean);
-    const allowed = opts?.allowedDates;
-    if (allowed && allowed.size > 0) {
+    const constraint = opts?.scheduleConstraint;
+    if (constraint && scheduleConstraintIsActive(constraint)) {
       const before = dates.length;
-      dates = dates.filter((d) => calendarApiDateInAllowedSet(d, allowed));
+      dates = dates.filter((d) => calendarApiDateMatchesConstraint(d, constraint));
       logger.info(
-        { beforeCount: before, afterCount: dates.length, allowedDates: [...allowed] },
-        "Calendar dates filtered by allowed schedule dates"
+        { beforeCount: before, afterCount: dates.length, ...scheduleConstraintLogValue(constraint) },
+        "Calendar dates filtered by schedule constraint"
       );
       if (dates.length === 0) {
         throw new NoDatesInScheduleRangeError();

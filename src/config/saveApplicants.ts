@@ -158,7 +158,6 @@ function mergeOverridesIntoBody(body: Record<string, unknown>, overrides: Record
 
 /** Setup-form / bot-only fields merged into `applicantList[0]` — not part of lift-api save-applicants body. */
 const APPLICANT_UI_ONLY_KEYS = [
-  "scheduleAllowedDates",
   "scheduleDateRangeStart",
   "scheduleDateRangeEnd",
   "vacCode",

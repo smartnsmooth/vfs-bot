@@ -172,11 +172,6 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
     const v = j.scheduleDateRangeEnd;
     if (typeof v === "string" && v.trim() !== "") out.scheduleDateRangeEnd = v.trim();
   }
-  if ("scheduleAllowedDates" in j) {
-    const v = j.scheduleAllowedDates;
-    out.scheduleAllowedDates =
-      typeof v === "string" ? v : Array.isArray(v) ? v.map((x) => String(x)).join("\n") : "";
-  }
   if (typeof j.gender === "number" && Number.isFinite(j.gender)) {
     out.gender = j.gender;
   } else if (typeof j.gender === "string" && j.gender.trim() !== "") {
@@ -202,7 +197,7 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
 
 function buildPageHtml(collectLogin: boolean): string {
   /** Per-instance date range row in the applicant column. */
-  const scheduleAllowedDatesBlock = `
+  const scheduleDateRangeRow = `
   <div class="schedule-range-row" role="group" aria-label="Appointment date range">
     <label for="scheduleDateRangeStart">From</label>
     <input type="date" id="scheduleDateRangeStart" name="scheduleDateRangeStart" />
@@ -379,7 +374,7 @@ function buildPageHtml(collectLogin: boolean): string {
             </div>
           </div>
         </div>
-        ${scheduleAllowedDatesBlock}
+        ${scheduleDateRangeRow}
         <label for="passportExpirtyDate">Passport expiry (DD/MM/YYYY)</label>
         <input id="passportExpirtyDate" name="passportExpirtyDate" placeholder="23/04/2027" />
         <label for="nationalityCode">Nationality</label>

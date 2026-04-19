@@ -28,9 +28,11 @@ import {
 import { setSlotCenterOverride, clearSlotCenterOverride } from "./utils/slotCenterOverride.store";
 import { setSlotDate, clearSlotDate } from "./utils/slotDate.store";
 import {
-  getScheduleAllowedDates,
-  isPollingSlotInAllowedSet,
+  isPollingSlotInConstraint,
   NoDatesInScheduleRangeError,
+  resolveScheduleDateConstraint,
+  scheduleConstraintIsActive,
+  scheduleConstraintLogValue,
 } from "./utils/scheduleAllowedDates.js";
 import { clearApplicantIpCache } from "./utils/applicantIp";
 import { clearChromeSessionDataBeforeLaunch, resolveChromeProfileFolderName } from "./utils/chromeProfileSessionClean";
@@ -849,9 +851,9 @@ async function runPollLoop(
         }
 
         const currentUrl = await browser.getFirstTabUrl();
-        if (!/\/(applications|dashboard|home)/i.test(currentUrl)) {
-          logger.error({ instanceId, currentUrl }, "Browser is not on the dashboard page. Stopping polling.");
-          await telegram.alert("error", `Not on dashboard page (${currentUrl || "unknown"}). Polling stopped.`).catch(() => { });
+        if (!/\/(applications|dashboard|home|application-detail|your-details)/i.test(currentUrl)) {
+          logger.error({ instanceId, currentUrl }, "Browser is not on a supported VFS page for polling. Stopping polling.");
+          await telegram.alert("error", `Not on a supported VFS page for polling (${currentUrl || "unknown"}). Polling stopped.`).catch(() => { });
           return false;
         }
 
@@ -1058,19 +1060,18 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
     }
   }
   const fastSkipCalendar = (instanceId ?? 1) <= FAST_SKIP_CALENDAR_UP_TO_INSTANCE;
-  const allowed = getScheduleAllowedDates(instanceId);
-  const calendarOpts =
-    allowed && allowed.size > 0 ? { allowedDates: allowed } : undefined;
+  const scheduleConstraint = resolveScheduleDateConstraint(instanceId);
+  const hasScheduleFilter = scheduleConstraintIsActive(scheduleConstraint);
+  const calendarOpts = hasScheduleFilter ? { scheduleConstraint } : undefined;
   // Use the live slot state; fall back to the snapshot taken when booking started in case
   // a failing sibling instance deleted slot-state.json while this booking is in progress.
   const liveState = isSlotFoundByAnyInstance();
   const shared = liveState.found ? liveState : (slotStateCache ?? liveState);
-  const pollingHitAllowed =
-    allowed && allowed.size > 0 ? isPollingSlotInAllowedSet(shared.slot, allowed) : false;
+  const pollingHitAllowed = hasScheduleFilter ? isPollingSlotInConstraint(shared.slot, scheduleConstraint) : false;
 
   let usedCalendarForTimeslot = false;
 
-  if (!allowed || allowed.size === 0) {
+  if (!hasScheduleFilter) {
     if (fastSkipCalendar) {
       const derived = deriveCalendarDateFromPollingRaw(shared.slot?.rawDate ?? shared.slot?.date);
       if (derived) {
@@ -1100,13 +1101,13 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
           instanceId,
           derivedSlotDate: derived,
           source: "polling.earliestSlotLists",
-          allowedDates: [...allowed],
+          ...scheduleConstraintLogValue(scheduleConstraint),
         },
         "Fast mode (date on allow-list): skipping calendar API and using polling date for timeslot"
       );
     } else {
       logger.warn(
-        { instanceId, raw: shared.slot?.rawDate, date: shared.slot?.date, allowedDates: [...allowed] },
+        { instanceId, raw: shared.slot?.rawDate, date: shared.slot?.date, ...scheduleConstraintLogValue(scheduleConstraint) },
         "Fast mode: could not derive slotDate from polling; falling back to filtered calendar API"
       );
       await browser.postCalendarLiftApi(calendarOpts);
@@ -1385,17 +1386,26 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
           err instanceof NoDatesInScheduleRangeError ||
           (err instanceof Error && (err as Error & { code?: string }).code === "NO_DATES_IN_RANGE");
         if (noDates) {
+          const range = resolveScheduleDateConstraint(instanceId);
+          const startDate = range.kind === "range" ? (range.start ?? "…") : "…";
+          const endDate = range.kind === "range" ? (range.end ?? "…") : "…";
+          const msg = `no slot from ${startDate} to ${endDate}`;
           logger.warn(
-            { instanceId },
-            "No calendar dates match allowed schedule dates — clearing slot state and restarting polling"
+            { instanceId, ...scheduleConstraintLogValue(range) },
+            "No calendar dates match schedule date range — clearing slot state and stopping bot cycle"
           );
-        } else {
-          // Any other booking error: log, notify, clear state, restart polling instead of stopping.
-          logger.error({ err, instanceId }, "Booking chain error — clearing slot state and restarting poll");
-          await telegram
-            .alert("error", `Booking error (instance ${instanceId ?? 1}), restarting poll: ${err instanceof Error ? err.message : String(err)}`)
-            .catch(() => { });
+          await telegram.alert("no_slot_found", msg).catch(() => { });
+          clearSlotState();
+          clearSlotCenterOverride();
+          clearSlotDate();
+          break;
         }
+
+        // Any other booking error: log, notify, clear state, restart polling instead of stopping.
+        logger.error({ err, instanceId }, "Booking chain error — clearing slot state and restarting poll");
+        await telegram
+          .alert("error", `Booking error (instance ${instanceId ?? 1}), restarting poll: ${err instanceof Error ? err.message : String(err)}`)
+          .catch(() => { });
         clearSlotState();
         clearSlotCenterOverride();
         clearSlotDate();

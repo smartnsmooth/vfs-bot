@@ -357,7 +357,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       for (let ki = 0; ki < keys.length; ki++) {
         const k = keys[ki];
         if (skipDetailIds[k] || skipCenterCatIds[k]) continue;
-        if (k === "scheduleDateRangeStart" || k === "scheduleDateRangeEnd" || k === "scheduleAllowedDates") continue;
+        if (k === "scheduleDateRangeStart" || k === "scheduleDateRangeEnd") continue;
         const el = document.getElementById(k);
         if (el) el.value = inst.details[k] == null ? "" : String(inst.details[k]);
       }
