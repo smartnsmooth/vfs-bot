@@ -18,7 +18,7 @@ import {
   scheduleConstraintLogValue,
   type ScheduleDateConstraint,
 } from "../utils/scheduleAllowedDates.js";
-import { buildCalendarBody, CALENDAR_URL } from "../config/calendar";
+import { buildCalendarBody, CALENDAR_URL, firstDayOfNextMonthFromDdMmYyyy } from "../config/calendar";
 import { buildScheduleBody, SCHEDULE_URL } from "../config/schedule";
 import { buildTimeslotBody, TIMESLOT_URL } from "../config/timeslot";
 import { buildFeesBody, FEES_URL } from "../config/fees";
@@ -802,6 +802,11 @@ export class BrowserService {
 
   /** Call when a slot is found (uses current VFS tab). */
   async saveApplicantsViaLiftApi(): Promise<void> {
+    const existingUrn = getApplicationUrn();
+    if (existingUrn?.trim()) {
+      logger.info({ urn: existingUrn }, "Skip save applicants: URN already in memory");
+      return;
+    }
     await this.waitForLiftClientSourceIfNeeded();
     const page = await this.getVfsPage();
     await this.saveApplicantsViaLiftApiOnPage(page);
@@ -974,12 +979,28 @@ export class BrowserService {
     urn: string,
     opts?: { scheduleConstraint?: ScheduleDateConstraint }
   ): Promise<void> {
-    const payload = buildCalendarBody(urn);
+    type CalJson = { error?: unknown; calendars?: Array<{ date?: string; isWeekend?: boolean }> | null };
+    const isCalendar1035FullSlot = (e: unknown): boolean =>
+      e != null && typeof e === "object" && (e as { code?: unknown }).code === 1035;
+
+    let payload: Record<string, unknown> = buildCalendarBody(urn);
     logger.info({ url: CALENDAR_URL, fromDate: payload.fromDate }, "Calling lift-api calendar");
-    const res = await this.postLiftJsonFromPage(page, CALENDAR_URL, payload);
-    let j: { error?: unknown; calendars?: Array<{ date?: string; isWeekend?: boolean }> };
+    let res = await this.postLiftJsonFromPage(page, CALENDAR_URL, payload);
+    let j: CalJson;
     try {
-      j = JSON.parse(res.body) as typeof j;
+      j = JSON.parse(res.body) as CalJson;
+      if (isCalendar1035FullSlot(j.error)) {
+        const prevFrom = String(payload.fromDate ?? "");
+        const retryFrom = firstDayOfNextMonthFromDdMmYyyy(prevFrom);
+        logger.warn(
+          { previousFrom: prevFrom, retryFrom },
+          "Calendar API 1035 (slot full) — retrying with first day of next month for fromDate"
+        );
+        payload = buildCalendarBody(urn, { fromDate: retryFrom });
+        logger.info({ url: CALENDAR_URL, fromDate: payload.fromDate }, "Calling lift-api calendar (retry)");
+        res = await this.postLiftJsonFromPage(page, CALENDAR_URL, payload);
+        j = JSON.parse(res.body) as CalJson;
+      }
       if (j.error != null && j.error !== "") {
         throw new Error(`Calendar API error: ${JSON.stringify(j.error)}`);
       }
