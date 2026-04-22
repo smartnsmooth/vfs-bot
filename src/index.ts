@@ -979,6 +979,20 @@ function isSaveApplicants422(err: unknown): boolean {
   return err instanceof Error && err.message.includes("Save applicants API error:") && err.message.includes("422");
 }
 
+/** Save applicants returned VFS "no slots" (code 10673) — separate from HTTP 422 invalid request. */
+function isSaveApplicants10673(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const prefix = "Save applicants API error: ";
+  const m = err.message;
+  if (!m.startsWith(prefix)) return false;
+  try {
+    const j = JSON.parse(m.slice(prefix.length)) as { code?: number | string };
+    return j.code === 10673 || String(j.code) === "10673";
+  } catch {
+    return m.includes("10673");
+  }
+}
+
 /** Final save-applicants failure — do not restart polling after this. */
 function isSaveApplicantsFailure(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
@@ -1037,28 +1051,98 @@ function deriveCalendarDateFromPollingRaw(raw?: string): string | null {
 }
 
 /**
+ * Same session refresh as periodic poll relogin: logout, optional Chrome restart + proxy rotation, login, prepare polling.
+ * Save-applicants 10673 recovery always kills Chrome and respawns so `ensureChromeWithDevTools` runs session clean + proxy bump (same as two-account hard swap), even with a single VFS account.
+ */
+async function performPollStyleRelogin(instanceId?: number, context?: string): Promise<void> {
+  const pollReloginInterval = config.pollReloginInterval;
+  const ctx = context ?? "poll-relogin";
+  const is10673Recovery = ctx === "save-applicants-10673";
+  const hardSwap = config.credentialSwapBrowserRestart && hasSecondCredentials(instanceId);
+  /** Full restart: two-account swap path, or 10673 path (close browser → clear cookies/storage/cache on next launch → new IP via PROXY_URLS rotation). */
+  const fullChromeRestart = hardSwap || is10673Recovery;
+
+  if (fullChromeRestart) {
+    logger.info(
+      { instanceId, pollReloginInterval, ctx, hardSwap, is10673Recovery },
+      is10673Recovery && !hardSwap
+        ? "[Relogin] 10673 recovery: logout → close Chrome → clear session on respawn → login (same account)"
+        : "[Relogin] Two accounts: logout → close Chrome → rotate PROXY_URLS → new Chrome → login (next credential)"
+    );
+    await browser.logoutVfsAndOpenLoginFirstTab().catch(() => {
+      /* tab may already be gone */
+    });
+    clearApplicantIpCache();
+    await relaunchChromeAfterCredentialSwapLogout();
+    await performVfsLoginFromStore(instanceId);
+    await browser.resolveApplicantIpForPayload();
+  } else {
+    logger.info(
+      { instanceId, pollReloginInterval, ctx },
+      "[Relogin] Logout (best-effort) → login page → next credential (if two are configured) → fresh session"
+    );
+    await browser.logoutVfsAndOpenLoginFirstTab();
+    await performVfsLoginFromStore(instanceId);
+  }
+  await browser.preparePollingAfterLogin({ skipDashboardNavigate: true });
+}
+
+/**
  * Try save-applicants; on 422 "Invalid request", retry by re-polling then re-calling save.
- * This mimics the manual re-submit flow (which consistently succeeds).
+ * On 10673 ("no appointment slots"), retry up to `VFS_POLL_RELOGIN_INTERVAL` times at poll interval, then poll-style relogin + slot poll, forever until save succeeds.
  */
 async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: SlotFoundState): Promise<void> {
-  for (let attempt = 1; attempt <= MAX_SAVE_APPLICANTS_RETRIES; attempt++) {
-    try {
-      await browser.saveApplicantsViaLiftApi();
-      break;
-    } catch (err) {
-      if (!isSaveApplicants422(err) || attempt === MAX_SAVE_APPLICANTS_RETRIES) throw err;
-      logger.warn(
-        { attempt, maxRetries: MAX_SAVE_APPLICANTS_RETRIES, instanceId },
-        "Save applicants returned 422 — retrying after re-poll"
-      );
-      await browser.preparePollingAfterLogin({ skipDashboardNavigate: true });
-      const stillAvailable = await runPollLoop(instanceId);
-      if (!stillAvailable) {
-        logger.warn({ instanceId }, "Slot no longer available on retry poll — aborting booking chain");
-        return;
+  const pollIntervalMs = getFixedTimingForInstance(instanceId).pollIntervalMs;
+  const phase1Attempts = Math.max(1, config.pollReloginInterval);
+
+  applicants10673Recovery: while (true) {
+    for (let phase1Idx = 0; phase1Idx < phase1Attempts; phase1Idx++) {
+      let saw10673ThisPhase = false;
+      for (let attempt = 1; attempt <= MAX_SAVE_APPLICANTS_RETRIES; attempt++) {
+        try {
+          await browser.saveApplicantsViaLiftApi();
+          break applicants10673Recovery;
+        } catch (err) {
+          if (isSaveApplicants10673(err)) {
+            saw10673ThisPhase = true;
+            logger.warn(
+              {
+                instanceId,
+                phase1Round: phase1Idx + 1,
+                phase1Attempts,
+                err: err instanceof Error ? err.message : String(err),
+              },
+              "Save applicants returned 10673 (no appointment slots in response) — phase-1 retry or relogin"
+            );
+            break;
+          }
+          if (!isSaveApplicants422(err) || attempt === MAX_SAVE_APPLICANTS_RETRIES) throw err;
+          logger.warn(
+            { attempt, maxRetries: MAX_SAVE_APPLICANTS_RETRIES, instanceId },
+            "Save applicants returned 422 — retrying after re-poll"
+          );
+          await browser.preparePollingAfterLogin({ skipDashboardNavigate: true });
+          const stillAvailable = await runPollLoop(instanceId);
+          if (!stillAvailable) {
+            logger.warn({ instanceId }, "Slot no longer available on retry poll — aborting booking chain");
+            return;
+          }
+        }
+      }
+      if (saw10673ThisPhase && phase1Idx < phase1Attempts - 1) {
+        logger.info({ instanceId, delayMs: pollIntervalMs, phase1Round: phase1Idx + 1 }, "10673 — waiting poll interval before next save applicants attempt");
+        await new Promise((r) => setTimeout(r, pollIntervalMs));
       }
     }
+
+    logger.info(
+      { instanceId, phase1Attempts },
+      "Save applicants still 10673 after phase-1 retries — poll-style relogin, slot poll, then retry save applicants"
+    );
+    await performPollStyleRelogin(instanceId, "save-applicants-10673");
+    await runPollLoop(instanceId);
   }
+
   const fastSkipCalendar = (instanceId ?? 1) <= FAST_SKIP_CALENDAR_UP_TO_INSTANCE;
   const scheduleConstraint = resolveScheduleDateConstraint(instanceId);
   const hasScheduleFilter = scheduleConstraintIsActive(scheduleConstraint);
@@ -1286,69 +1370,39 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
     return;
   }
 
-  const skipPolling = !!(getApplicantDetailsOverrides(0)?.skipPolling);
-
   let slotFoundDuringPoll = false;
-  if (!skipPolling) {
-    if (didLoginThisCycle) {
-      const globalDet0 = getApplicantDetailsOverrides(0);
-      const postLoginDelaySec =
-        globalDet0 && typeof globalDet0.postLoginPollDelay === "number" && globalDet0.postLoginPollDelay >= 0
-          ? globalDet0.postLoginPollDelay
-          : DEFAULT_POST_LOGIN_POLL_DELAY_SEC;
-      const postLoginDelayMs = postLoginDelaySec * 1000;
-      logger.info({ instanceId, postLoginDelayMs }, "Post-login base delay before polling");
-      await new Promise((r) => setTimeout(r, postLoginDelayMs));
-      const fixedTiming = getFixedTimingForInstance(instanceId);
-      logger.info(
-        { instanceId, delayMs: fixedTiming.postLoginOffsetMs, mode: "fixed_by_instance" },
-        "Post-login fixed delay before polling (after base delay)"
-      );
-      await new Promise((r) => setTimeout(r, fixedTiming.postLoginOffsetMs));
-    }
-    await telegram.notify("VFS bot run: polling for slots.").catch(() => { });
-    logger.info({ skipDashboardNavigate, instanceId }, "Starting slot polling");
-    await browser.preparePollingAfterLogin({ skipDashboardNavigate });
-
-    // Build the periodic relogin callback when the interval is enabled.
-    const pollReloginInterval = config.pollReloginInterval;
-    const onPollRelogin = pollReloginInterval > 0
-      ? async () => {
-        const hardSwap = config.credentialSwapBrowserRestart && hasSecondCredentials(instanceId);
-        if (hardSwap) {
-          logger.info(
-            { instanceId, pollReloginInterval },
-            "[Relogin] Two accounts: logout → close Chrome → rotate PROXY_URLS → new Chrome → login (next credential)"
-          );
-          await browser.logoutVfsAndOpenLoginFirstTab().catch(() => {
-            /* tab may already be gone */
-          });
-          clearApplicantIpCache();
-          await relaunchChromeAfterCredentialSwapLogout();
-          await performVfsLoginFromStore(instanceId);
-          await browser.resolveApplicantIpForPayload();
-        } else {
-          logger.info(
-            { instanceId, pollReloginInterval },
-            "[Relogin] Logout (best-effort) → login page → next credential (if two are configured) → fresh session"
-          );
-          await browser.logoutVfsAndOpenLoginFirstTab();
-          await performVfsLoginFromStore(instanceId);
-        }
-        await browser.preparePollingAfterLogin({ skipDashboardNavigate: true });
-      }
-      : undefined;
-
-    slotFoundDuringPoll = await runPollLoop(instanceId, {
-      reloginAfter: pollReloginInterval > 0 ? pollReloginInterval : undefined,
-      onRelogin: onPollRelogin,
-    });
+  if (didLoginThisCycle) {
+    const globalDet0 = getApplicantDetailsOverrides(0);
+    const postLoginDelaySec =
+      globalDet0 && typeof globalDet0.postLoginPollDelay === "number" && globalDet0.postLoginPollDelay >= 0
+        ? globalDet0.postLoginPollDelay
+        : DEFAULT_POST_LOGIN_POLL_DELAY_SEC;
+    const postLoginDelayMs = postLoginDelaySec * 1000;
+    logger.info({ instanceId, postLoginDelayMs }, "Post-login base delay before polling");
+    await new Promise((r) => setTimeout(r, postLoginDelayMs));
+    const fixedTiming = getFixedTimingForInstance(instanceId);
+    logger.info(
+      { instanceId, delayMs: fixedTiming.postLoginOffsetMs, mode: "fixed_by_instance" },
+      "Post-login fixed delay before polling (after base delay)"
+    );
+    await new Promise((r) => setTimeout(r, fixedTiming.postLoginOffsetMs));
   }
+  await telegram.notify("VFS bot run: polling for slots.").catch(() => { });
+  logger.info({ skipDashboardNavigate, instanceId }, "Starting slot polling");
+  await browser.preparePollingAfterLogin({ skipDashboardNavigate });
 
-  const runBookingChain = skipPolling || slotFoundDuringPoll;
+  // Build the periodic relogin callback when the interval is enabled.
+  const pollReloginInterval = config.pollReloginInterval;
+  const onPollRelogin =
+    pollReloginInterval > 0 ? () => performPollStyleRelogin(instanceId, "poll-interval") : undefined;
 
-  if (runBookingChain) {
-    let pollHits = slotFoundDuringPoll;
+  slotFoundDuringPoll = await runPollLoop(instanceId, {
+    reloginAfter: pollReloginInterval > 0 ? pollReloginInterval : undefined,
+    onRelogin: onPollRelogin,
+  });
+
+  if (slotFoundDuringPoll) {
+    let pollHits: boolean = slotFoundDuringPoll;
     while (true) {
       // Snapshot slot state before booking starts so sibling failures that delete
       // slot-state.json do not break this instance's calendar / timeslot lookup.
@@ -1409,9 +1463,6 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
         clearSlotState();
         clearSlotCenterOverride();
         clearSlotDate();
-        if (skipPolling) {
-          throw err;
-        }
         await browser.preparePollingAfterLogin({ skipDashboardNavigate: true });
         pollHits = await runPollLoop(instanceId);
         if (!pollHits) {

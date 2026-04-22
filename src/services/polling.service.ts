@@ -81,6 +81,29 @@ export class PollingService {
       if (status !== 200) {
         return { slot: null, response: data };
       }
+      // Special case: error code 1036 ("Services will be back shortly") is emitted by the
+      // VFS API when slots actually exist but the API temporarily refuses to enumerate them.
+      // Treat this as a slot-available signal so the instance breaks out of polling and
+      // proceeds to the calendar step (which will re-resolve the real date).
+      if (isSlotsAvailableErrorCode(data.error?.code)) {
+        const syntheticSlot: Slot = {
+          id: `svc-unavailable-1036_${Date.now()}`,
+          center: "",
+          date: "",
+          time: "00:00:00",
+        };
+        logger.info(
+          { errorCode: data.error?.code, centerCode: options.centerCode, visaCategoryCode: options.visaCategoryCode },
+          "Slot API returned code 1036 — treating as slot-available signal; proceeding to calendar"
+        );
+        return {
+          slot: syntheticSlot,
+          response: data,
+          centerNumber: options?.centerNumber,
+          centerCode: options?.centerCode,
+          visaCategoryCode: options?.visaCategoryCode,
+        };
+      }
       const apiError = normalizeApiError(data);
       if (apiError) {
         return {
@@ -114,6 +137,17 @@ export class PollingService {
       };
     }
   }
+}
+
+/**
+ * VFS API error codes that actually indicate slots exist but the enumeration endpoint
+ * is temporarily degraded. When seen, polling should stop and booking should advance
+ * to the calendar step (the calendar endpoint tends to succeed even when 1036 fires).
+ */
+const SLOTS_AVAILABLE_ERROR_CODES: ReadonlySet<number> = new Set([1036]);
+
+function isSlotsAvailableErrorCode(code: number | undefined | null): boolean {
+  return typeof code === "number" && SLOTS_AVAILABLE_ERROR_CODES.has(code);
 }
 
 function normalizeApiError(data: CheckIsSlotAvailableResponse & { code?: string | number }): { message: string; unauthorized: boolean; rateLimited: boolean } | null {

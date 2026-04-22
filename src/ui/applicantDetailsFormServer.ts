@@ -189,9 +189,6 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
     const v = parseInt(j.postLoginPollDelay, 10);
     if (Number.isFinite(v) && v >= 0) out.postLoginPollDelay = v;
   }
-  if ("skipPolling" in j) {
-    out.skipPolling = j.skipPolling === true || j.skipPolling === "true" || j.skipPolling === "1";
-  }
   return out;
 }
 
@@ -221,10 +218,6 @@ function buildPageHtml(collectLogin: boolean): string {
       <option value="bgr">Bulgaria</option>
       <option value="prt">Portugal</option>
     </select>
-    <div style="display:flex;align-items:center;gap:0.5rem;margin-top:0.75rem">
-      <input type="checkbox" id="skipPolling" name="skipPolling" style="width:auto;margin:0" />
-      <label for="skipPolling" style="margin:0;cursor:pointer">Skip polling (Check this when you see 'Apologies for inconvenience' message)</label>
-    </div>
     <label for="userPollInterval" style="margin-top:0.75rem">Poll interval (seconds)</label>
     <input type="number" id="userPollInterval" name="userPollInterval" min="1" value="${defaultPollIntervalSec}" />
     <label for="postLoginPollDelay" style="margin-top:0.75rem">Post-login poll delay (seconds)</label>
@@ -750,9 +743,6 @@ export function runApplicantFormWithSubmitHandler(
             if (globalDet && typeof globalDet.postLoginPollDelay === "number") {
               defaults.postLoginPollDelay = globalDet.postLoginPollDelay;
             }
-            if (globalDet && typeof globalDet.skipPolling === "boolean") {
-              defaults.skipPolling = globalDet.skipPolling;
-            }
             const payload: Record<string, unknown> = { ok: true, defaults };
             if (collectLogin) {
               const base = getLoginFormDefaults();
@@ -825,7 +815,7 @@ export function runApplicantFormWithSubmitHandler(
             ...rest
           } = j;
           const fields = parseApplicantFields(rest);
-          const { userPollInterval: upi, skipPolling: sp, postLoginPollDelay: plpd, ...instanceFields } = fields;
+          const { userPollInterval: upi, postLoginPollDelay: plpd, ...instanceFields } = fields;
 
           {
             const global0 = getApplicantDetailsOverrides(0) ?? {};
@@ -834,7 +824,6 @@ export function runApplicantFormWithSubmitHandler(
             if (typeof plpd === "number") { global0.postLoginPollDelay = plpd; changed = true; }
             if (typeof instanceFields.countryCode === "string") { global0.countryCode = instanceFields.countryCode; changed = true; }
             if (typeof instanceFields.missionCode === "string") { global0.missionCode = instanceFields.missionCode; changed = true; }
-            if (typeof sp === "boolean") { global0.skipPolling = sp; changed = true; }
             if (changed) setApplicantDetailsOverrides(global0, 0);
           }
           const id = instanceId ?? 0;

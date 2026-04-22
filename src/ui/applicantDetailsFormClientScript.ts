@@ -302,8 +302,6 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       }
       const genderEl = document.getElementById("gender");
       if (genderEl) genderEl.value = "1";
-      const skipEl = document.getElementById("skipPolling");
-      if (skipEl) skipEl.checked = false;
       applyInstanceScheduleRangeToForm({});
       return;
     }
@@ -345,7 +343,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     }
 
     if (inst.details) {
-      const skipDetailIds = { numInstances: true, instanceId: true, vfsUsername2: true, vfsPassword2: true, skipPolling: true, countryCode: true, missionCode: true };
+      const skipDetailIds = { numInstances: true, instanceId: true, vfsUsername2: true, vfsPassword2: true, countryCode: true, missionCode: true };
       const ccEl = document.getElementById("countryCode");
       if (ccEl && inst.details.countryCode) ccEl.value = String(inst.details.countryCode);
       updateMissionOptions();
@@ -374,13 +372,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     }
     applyInstanceScheduleRangeToForm(inst.details || {});
 
-    // skipPolling and postLoginPollDelay are global (instance 0); apply from whichever source has it.
+    // postLoginPollDelay is global (instance 0); apply from whichever source has it.
     const globalInst = data.instances["0"];
-    const skipEl = document.getElementById("skipPolling");
-    if (skipEl) {
-      const src = (globalInst && globalInst.details) || (inst && inst.details) || {};
-      skipEl.checked = !!src.skipPolling;
-    }
     const plpdEl = document.getElementById("postLoginPollDelay");
     if (plpdEl) {
       const src = (globalInst && globalInst.details) || (inst && inst.details) || {};
@@ -416,7 +409,6 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       numInstances: getNumInstances(),
       userPollInterval: parseInt(String(fd.get("userPollInterval") || "60"), 10) || 60,
       postLoginPollDelay: parseInt(String(fd.get("postLoginPollDelay") || "30"), 10),
-      skipPolling: !!fd.get("skipPolling"),
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
     };
     if (!Number.isFinite(body.postLoginPollDelay) || body.postLoginPollDelay < 0) body.postLoginPollDelay = 30;
@@ -581,7 +573,6 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       numInstances: getNumInstances(),
       userPollInterval: parseInt(String(fd.get("userPollInterval") || "60"), 10) || 60,
       postLoginPollDelay: parseInt(String(fd.get("postLoginPollDelay") || "30"), 10),
-      skipPolling: !!fd.get("skipPolling"),
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
     };
     if (!Number.isFinite(body.postLoginPollDelay) || body.postLoginPollDelay < 0) body.postLoginPollDelay = 30;
