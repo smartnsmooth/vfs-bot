@@ -2,10 +2,14 @@ import dotenv from "dotenv";
 dotenv.config({ override: true });
 import { spawn, ChildProcess } from "node:child_process";
 import { logger } from "./utils/logger";
-import { runApplicantFormWithSubmitHandler } from "./ui/applicantDetailsFormServer";
+import { runApplicantFormWithSubmitHandler, closeApplicantFormServer } from "./ui/applicantDetailsFormServer";
 import { setSessionLoginCredentials } from "./utils/sessionLogin.store";
 import { setApplicantDetailsOverrides } from "./utils/applicantDetails.store";
 import { TelegramService } from "./services/telegram.service";
+import {
+  killChromeTreeByCdpPortRange,
+  killChromeTreeByCdpPortRangeSync,
+} from "./utils/killChromeByCdpPort";
 
 /** How many bot instances are currently running. Set by ensureInstances(). */
 let currentNumInstances = 0;
@@ -196,18 +200,51 @@ async function main(): Promise<void> {
   });
 }
 
+let isClusterShuttingDown = false;
+
+function getInstancePortRangeCount(): number {
+  // Cover every instance we might have spawned — at minimum what we track,
+  // and at least 1 so SIGHUP-before-Submit still cleans up a pre-launched Chrome.
+  return Math.max(1, instances.length, currentNumInstances);
+}
+
 function shutdown(): void {
-  logger.info("Shutting down cluster");
-  for (const inst of instances) {
-    if (inst.process) {
-      inst.process.kill("SIGTERM");
+  if (isClusterShuttingDown) return;
+  isClusterShuttingDown = true;
+  const portCount = getInstancePortRangeCount();
+  logger.info({ instances: portCount, basePort: BASE_DEBUGGING_PORT }, "Shutting down cluster — closing Chrome windows and child processes");
+  void (async () => {
+    try {
+      await closeApplicantFormServer();
+      // Kill Chrome trees for every instance port first (covers detached Chrome).
+      await killChromeTreeByCdpPortRange(BASE_DEBUGGING_PORT, portCount);
+      for (const inst of instances) {
+        if (inst.process && !inst.process.killed) {
+          inst.process.kill("SIGTERM");
+        }
+      }
+    } finally {
+      process.exit(0);
     }
-  }
-  process.exit(0);
+  })();
 }
 
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+process.on("SIGHUP", shutdown);
+if (process.platform === "win32") {
+  process.on("SIGBREAK", shutdown);
+}
+
+// Last-chance SYNCHRONOUS cleanup. Guarantees Chrome is killed even if the
+// async shutdown above is cut short (abrupt terminal close on Windows).
+process.on("exit", () => {
+  try {
+    killChromeTreeByCdpPortRangeSync(BASE_DEBUGGING_PORT, getInstancePortRangeCount());
+  } catch {
+    /* best effort */
+  }
+});
 
 main().catch((err) => {
   logger.error({ err }, "Cluster startup failed");

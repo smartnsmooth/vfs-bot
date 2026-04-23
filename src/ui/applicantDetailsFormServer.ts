@@ -16,6 +16,21 @@ const APPLICANT_UI_PORT = 3847;
 /** Actual bound port (updated by {@link bindApplicantFormServerToFreePort} when the default is busy). */
 let boundPort = APPLICANT_UI_PORT;
 
+let applicantFormHttpServer: Server | null = null;
+
+/** Stops the local setup form HTTP server if it is running. Safe to call multiple times. */
+export function closeApplicantFormServer(): Promise<void> {
+  return new Promise((resolve) => {
+    const s = applicantFormHttpServer;
+    if (!s) {
+      resolve();
+      return;
+    }
+    applicantFormHttpServer = null;
+    s.close(() => resolve());
+  });
+}
+
 /** Base URL for the local setup form (same host the browser uses for Submit → `/api/submit`). */
 export function getApplicantFormServerOrigin(): string {
   return `http://127.0.0.1:${boundPort}`;
@@ -906,8 +921,10 @@ export function runApplicantFormWithSubmitHandler(
     void (async () => {
       try {
         const boundPort = await bindApplicantFormServerToFreePort(server, host, preferredPort);
+        applicantFormHttpServer = server;
         const url = `http://${host}:${boundPort}/`;
         server.on("error", (err) => {
+          applicantFormHttpServer = null;
           server.close(() => { });
           safeReject(err);
         });

@@ -15,6 +15,7 @@ import { BrowserService } from "./services/browser.service";
 import { TelegramService } from "./services/telegram.service";
 import {
   runApplicantFormWithSubmitHandler,
+  closeApplicantFormServer,
 } from "./ui/applicantDetailsFormServer";
 import { getSessionLoginCredentials, reloadSessionCredentialsFromDisk } from "./utils/sessionLogin.store";
 import { reloadApplicantDetailsFromDisk, getApplicantDetailsOverrides } from "./utils/applicantDetails.store";
@@ -36,6 +37,7 @@ import {
 } from "./utils/scheduleAllowedDates.js";
 import { clearApplicantIpCache } from "./utils/applicantIp";
 import { clearChromeSessionDataBeforeLaunch, resolveChromeProfileFolderName } from "./utils/chromeProfileSessionClean";
+import { killChromeTreeByCdpPort, killChromeTreeByCdpPortSync } from "./utils/killChromeByCdpPort";
 
 const polling = new PollingService();
 const browser = new BrowserService();
@@ -1530,8 +1532,13 @@ async function start(): Promise<void> {
   });
 }
 
+let isShuttingDown = false;
+
 function shutdown(): void {
-  logger.info("Shutting down");
+  if (isShuttingDown) return;
+  isShuttingDown = true;
+  const debugPort = getRemoteDebuggingPort();
+  logger.info({ debugPort }, "Shutting down — closing Chrome and setup form");
   const closeTunnel = async () => {
     if (!activeAnonymizedProxyUrl) return;
     try {
@@ -1545,7 +1552,9 @@ function shutdown(): void {
   void Promise.resolve()
     .then(async () => {
       await closeTunnel();
+      await closeApplicantFormServer();
       await browser.close();
+      await killChromeTreeByCdpPort(debugPort);
     })
     .finally(() => {
       process.exit(0);
@@ -1554,6 +1563,22 @@ function shutdown(): void {
 
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+// Windows: console window close is surfaced as SIGHUP (short window to clean up before hard kill).
+process.on("SIGHUP", shutdown);
+if (process.platform === "win32") {
+  process.on("SIGBREAK", shutdown);
+}
+
+// Last-chance SYNCHRONOUS cleanup. Runs even on abrupt exits. Chrome is
+// spawned detached so async shutdown is not guaranteed to complete — this
+// guarantees the Chrome tree is killed before Node leaves.
+process.on("exit", () => {
+  try {
+    killChromeTreeByCdpPortSync(getRemoteDebuggingPort());
+  } catch {
+    /* best effort */
+  }
+});
 
 start().catch((err) => {
   logger.fatal({ err }, "Start failed");
