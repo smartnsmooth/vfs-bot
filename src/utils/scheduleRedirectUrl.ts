@@ -18,6 +18,6 @@ export function buildScheduleRedirectUrl(r: ScheduleResponseWithRedirect): strin
   if (hasPayLoadInUrl) return baseUrl;
   if (!payLoad) return baseUrl;
 
-  return `${baseUrl}${baseUrl.includes("?") ? "&" : "?"}payLoad=${encodeURIComponent(payLoad)}`;
-  // return `${baseUrl}${baseUrl.includes("?") ? "&" : "?"}payLoad=${payLoad}`;
+  // return `${baseUrl}${baseUrl.includes("?") ? "&" : "?"}payLoad=${encodeURIComponent(payLoad)}`;
+  return `${baseUrl}${baseUrl.includes("?") ? "&" : "?"}payLoad=${payLoad}`;
 }

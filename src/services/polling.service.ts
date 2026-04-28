@@ -12,6 +12,7 @@ export interface PollResult {
   visaCategoryCode?: string;
   unauthorized?: boolean;  // true when API returns 401 — polling must stop
   rateLimited?: boolean;   // true when API returns 429 — polling must stop
+  forbidden?: boolean;     // true when API returns 403 — needs full browser restart + IP rotation
 }
 
 /**
@@ -48,12 +49,27 @@ export class PollingService {
                 ? "401 Unauthorized. Keep a tab on visa.vfsglobal.com open and stay logged in."
                 : status === 429
                   ? "429 Too Many Requests. Rate limited by VFS API."
-                  : `API returned non-JSON (status ${status}).`,
+                  : status === 403
+                    ? "403 Forbidden. IP/session blocked by Cloudflare or VFS."
+                    : `API returned non-JSON (status ${status}).`,
               type: "Error",
             },
           },
           unauthorized: status === 401,
           rateLimited: status === 429,
+          forbidden: status === 403,
+        };
+      }
+      if (status === 403) {
+        logger.warn({ status, url, bodySnippet: body.slice(0, 200) }, "403 Forbidden from slot API — need browser restart + IP rotation");
+        return {
+          slot: null,
+          forbidden: true,
+          response: {
+            earliestDate: null,
+            earliestSlotLists: [],
+            error: { code: -1, description: "403 Forbidden. IP/session blocked by Cloudflare or VFS.", type: "Error" },
+          },
         };
       }
       if (status === 401) {
@@ -110,6 +126,7 @@ export class PollingService {
           slot: null,
           unauthorized: apiError.unauthorized,
           rateLimited: apiError.rateLimited,
+          forbidden: apiError.forbidden,
           response: {
             earliestDate: null,
             earliestSlotLists: [],
@@ -150,7 +167,7 @@ function isSlotsAvailableErrorCode(code: number | undefined | null): boolean {
   return typeof code === "number" && SLOTS_AVAILABLE_ERROR_CODES.has(code);
 }
 
-function normalizeApiError(data: CheckIsSlotAvailableResponse & { code?: string | number }): { message: string; unauthorized: boolean; rateLimited: boolean } | null {
+function normalizeApiError(data: CheckIsSlotAvailableResponse & { code?: string | number }): { message: string; unauthorized: boolean; rateLimited: boolean; forbidden: boolean } | null {
   if (data.earliestSlotLists != null && Array.isArray(data.earliestSlotLists)) return null;
   const code = data.code ?? data.error?.code;
   const desc = (data as { description?: string }).description ?? data.error?.description;
@@ -159,7 +176,8 @@ function normalizeApiError(data: CheckIsSlotAvailableResponse & { code?: string 
     const codeStr = String(code);
     const unauthorized = codeStr.startsWith("401");
     const rateLimited = codeStr.startsWith("429");
-    return msg ? { message: `${msg}. Check center/category in setup form.`, unauthorized, rateLimited } : null;
+    const forbidden = codeStr.startsWith("403");
+    return msg ? { message: `${msg}. Check center/category in setup form.`, unauthorized, rateLimited, forbidden } : null;
   }
   return null;
 }

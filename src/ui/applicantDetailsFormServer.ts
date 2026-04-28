@@ -204,6 +204,17 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
     const v = parseInt(j.postLoginPollDelay, 10);
     if (Number.isFinite(v) && v >= 0) out.postLoginPollDelay = v;
   }
+  if (j.sentinelMode === true || j.sentinelMode === "true" || j.sentinelMode === "on") {
+    out.sentinelMode = true;
+  } else if (j.sentinelMode === false || j.sentinelMode === "false" || j.sentinelMode === "" || j.sentinelMode === undefined) {
+    out.sentinelMode = false;
+  }
+  if (typeof j.sentinelCount === "number" && Number.isFinite(j.sentinelCount) && j.sentinelCount >= 1) {
+    out.sentinelCount = Math.floor(j.sentinelCount);
+  } else if (typeof j.sentinelCount === "string" && j.sentinelCount.trim() !== "") {
+    const v = parseInt(j.sentinelCount, 10);
+    if (Number.isFinite(v) && v >= 1) out.sentinelCount = v;
+  }
   return out;
 }
 
@@ -239,6 +250,15 @@ function buildPageHtml(collectLogin: boolean): string {
     <input type="number" id="postLoginPollDelay" name="postLoginPollDelay" min="0" value="30" />
     <label for="numInstances">Number of instances</label>
     <input type="number" id="numInstances" name="numInstances" min="1" max="50" value="1" />
+    <div style="margin-top:0.75rem;display:flex;align-items:center;gap:0.5rem">
+      <input type="checkbox" id="sentinelMode" name="sentinelMode" style="width:auto;margin:0" />
+      <label for="sentinelMode" style="margin:0;cursor:pointer">Sentinel mode</label>
+    </div>
+    <div id="sentinelCountWrapper" style="display:none;margin-top:0.5rem">
+      <label for="sentinelCount">Sentinel count (active pollers)</label>
+      <input type="number" id="sentinelCount" name="sentinelCount" min="1" max="20" value="4" />
+      <p class="hint" style="margin:0.25rem 0 0;font-size:0.8rem;color:#8b98a5">First N bots poll actively; remaining bots stay idle until a slot is found, then all burst-poll simultaneously.</p>
+    </div>
     <div id="instanceSelectWrapper" style="display:block">
       <label for="instanceId" style="margin-top:0.75rem">Select instance to configure (each uses a different Chrome profile / IP)</label>
       <select id="instanceId" name="instanceId">
@@ -322,8 +342,9 @@ function buildPageHtml(collectLogin: boolean): string {
     }
     .picker-row { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; margin-top: 0.25rem; }
     .picker-row input[type="date"] { margin-top: 0; max-width: 11rem; flex: 1 1 auto; min-width: 0; }
-    .form-actions { margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid #38444d; }
-    button[type="submit"] { margin-top: 0; }
+    .form-actions { margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid #38444d; display: flex; gap: 0.75rem; align-items: center; }
+    button[type="submit"] { margin-top: 0; flex: 1; }
+    #forceBookBtn { margin-top: 0; flex: 1; background: #f5a623; color: #15202b; font-weight: 700; }
     button { width: 100%; padding: 0.65rem; border: none; border-radius: 8px;
       background: #1d9bf0; color: #fff; font-weight: 600; cursor: pointer; font-size: 1rem; }
     button:hover { filter: brightness(1.08); }
@@ -639,6 +660,7 @@ function buildPageHtml(collectLogin: boolean): string {
     </div>
     <div class="form-actions">
       <button type="submit" id="submitBtn">Submit &amp; Run</button>
+      <button type="button" id="forceBookBtn">Book Slot</button>
     </div>
   </form>
   <p id="msg"></p>
@@ -653,6 +675,8 @@ export type ApplicantFormOptions = {
    * Use false for e.g. slot-found flow when already logged in (applicant fields only).
    */
   collectLogin?: boolean;
+  /** Called when user clicks "Book Slot" — triggers force-booking on all instances. */
+  onForceBook?: () => { ok: boolean; error?: string; queued?: number };
 };
 
 export type FormSubmitInfo = { firstSubmit: boolean;[key: string]: unknown };
@@ -758,6 +782,12 @@ export function runApplicantFormWithSubmitHandler(
             if (globalDet && typeof globalDet.postLoginPollDelay === "number") {
               defaults.postLoginPollDelay = globalDet.postLoginPollDelay;
             }
+            if (globalDet && typeof globalDet.sentinelMode === "boolean") {
+              defaults.sentinelMode = globalDet.sentinelMode;
+            }
+            if (globalDet && typeof globalDet.sentinelCount === "number") {
+              defaults.sentinelCount = globalDet.sentinelCount;
+            }
             const payload: Record<string, unknown> = { ok: true, defaults };
             if (collectLogin) {
               const base = getLoginFormDefaults();
@@ -830,13 +860,15 @@ export function runApplicantFormWithSubmitHandler(
             ...rest
           } = j;
           const fields = parseApplicantFields(rest);
-          const { userPollInterval: upi, postLoginPollDelay: plpd, ...instanceFields } = fields;
+          const { userPollInterval: upi, postLoginPollDelay: plpd, sentinelMode: sm, sentinelCount: sc, ...instanceFields } = fields;
 
           {
             const global0 = getApplicantDetailsOverrides(0) ?? {};
             let changed = false;
             if (typeof upi === "number") { global0.userPollInterval = upi; changed = true; }
             if (typeof plpd === "number") { global0.postLoginPollDelay = plpd; changed = true; }
+            if (typeof sm === "boolean") { global0.sentinelMode = sm; changed = true; }
+            if (typeof sc === "number") { global0.sentinelCount = sc; changed = true; }
             if (typeof instanceFields.countryCode === "string") { global0.countryCode = instanceFields.countryCode; changed = true; }
             if (typeof instanceFields.missionCode === "string") { global0.missionCode = instanceFields.missionCode; changed = true; }
             if (changed) setApplicantDetailsOverrides(global0, 0);
@@ -903,6 +935,16 @@ export function runApplicantFormWithSubmitHandler(
 
           seenSubmit = true;
           json(res, 200, { ok: true, firstSubmit: !seenSubmit, queued });
+          return;
+        }
+
+        if (req.method === "POST" && path === "/api/force-book") {
+          if (!options?.onForceBook) {
+            json(res, 400, { ok: false, error: "Force-book not available in this mode." });
+            return;
+          }
+          const result = options.onForceBook();
+          json(res, result.ok ? 200 : 409, result);
           return;
         }
 

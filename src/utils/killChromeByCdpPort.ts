@@ -61,8 +61,8 @@ export async function killChromeTreeByCdpPort(port: number): Promise<void> {
   try {
     const { cmd } = buildKillCommand(port);
     await execAsync(cmd, { timeout: 8_000, windowsHide: true });
-  } catch (err) {
-    logger.warn({ err, port }, "[shutdown] killChromeTreeByCdpPort failed");
+  } catch {
+    // Best effort — Chrome may already be gone (killed by another process/instance during shutdown race).
   }
 }
 

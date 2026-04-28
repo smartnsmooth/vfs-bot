@@ -53,13 +53,6 @@ const MAIL_TM_POLL_MS = parseInt(process.env.MAIL_TM_POLL_MS ?? "4000", 10);
 const MAIL_TM_POST_SIGNIN_DELAY_MS = parseInt(process.env.MAIL_TM_POST_SIGNIN_DELAY_MS ?? "2500", 10);
 
 export const config = {
-  /** If true, UI Submit opens Turnstile demo page and runs CapMonster injection (no VFS flow). */
-  get turnstileDemoMode(): boolean {
-    return process.env.TURNSTILE_DEMO_MODE === "true";
-  },
-  get turnstileDemoUrl(): string {
-    return process.env.TURNSTILE_DEMO_URL ?? "https://2captcha.com/demo/cloudflare-turnstile";
-  },
   get loginPageUrl(): string {
     const det = resolvedFormDetails();
     const formCountry = typeof det?.countryCode === "string" ? det.countryCode.trim().toLowerCase() : "";
@@ -101,10 +94,6 @@ export const config = {
   get browserCdpUrl(): string {
     return process.env.BROWSER_CDP_URL ?? "http://localhost:9222";
   },
-
-  capmonsterEnabled: process.env.ENABLE_CAPMONSTER === "true",
-  capmonsterApiKey: process.env.CAPMONSTER_API_KEY ?? "",
-  capmonsterApiUrl: process.env.CAPMONSTER_API_URL ?? "https://api.capmonster.cloud",
 
   // When true: log in then stop immediately — no polling, no booking.  Useful for testing login / Turnstile.
   loginOnly: process.env.VFS_LOGIN_ONLY === "true" || process.env.VFS_LOGIN_ONLY === "1",
@@ -164,7 +153,4 @@ export const config = {
 
 if (config.telegramEnabled && (!config.telegramToken || !config.telegramChatId)) {
   throw new Error("TELEGRAM_TOKEN and TELEGRAM_CHAT_ID required when ENABLE_TELEGRAM is true");
-}
-if (config.capmonsterEnabled && !config.capmonsterApiKey) {
-  throw new Error("CAPMONSTER_API_KEY required when ENABLE_CAPMONSTER is true");
 }

@@ -11,7 +11,7 @@ import { config, setCurrentInstanceId } from "./config/config";
 import { classifyVfsFirstTabUrl } from "./flows/vfsTabUrl";
 import { logger } from "./utils/logger";
 import { PollingService } from "./services/polling.service";
-import { BrowserService } from "./services/browser.service";
+import { BrowserService, VfsForbiddenError } from "./services/browser.service";
 import { TelegramService } from "./services/telegram.service";
 import {
   runApplicantFormWithSubmitHandler,
@@ -29,6 +29,22 @@ import {
 import { setSlotCenterOverride, clearSlotCenterOverride } from "./utils/slotCenterOverride.store";
 import { setSlotDate, clearSlotDate } from "./utils/slotDate.store";
 import {
+  resolveSentinelConfig,
+  getInstanceRole,
+  broadcastActivationSignal,
+  readActivationSignal,
+  clearActivationSignal,
+  createActivationWatcher,
+  getCurrentRole,
+  demoteSentinelAndPromoteStandby,
+  markInstanceStopped,
+  readRoleAssignments,
+  clearRoleAssignments,
+  createRoleChangeWatcher,
+  type BotRole,
+  type SlotSignal,
+} from "./utils/sentinelState";
+import {
   isPollingSlotInConstraint,
   NoDatesInScheduleRangeError,
   resolveScheduleDateConstraint,
@@ -37,7 +53,7 @@ import {
 } from "./utils/scheduleAllowedDates.js";
 import { clearApplicantIpCache } from "./utils/applicantIp";
 import { clearChromeSessionDataBeforeLaunch, resolveChromeProfileFolderName } from "./utils/chromeProfileSessionClean";
-import { killChromeTreeByCdpPort, killChromeTreeByCdpPortSync } from "./utils/killChromeByCdpPort";
+import { killChromeTreeByCdpPortSync } from "./utils/killChromeByCdpPort";
 
 const polling = new PollingService();
 const browser = new BrowserService();
@@ -49,6 +65,29 @@ const FAST_SKIP_CALENDAR_UP_TO_INSTANCE = Math.max(
   parseInt(process.env.FAST_SKIP_CALENDAR_UP_TO_INSTANCE ?? "5", 10) || 5
 );
 const DEFAULT_POLL_INTERVAL_SEC = 60;
+
+/** Standby bots ping the browser tab every 3 minutes to keep the VFS session alive while idle. */
+const STANDBY_KEEPALIVE_INTERVAL_MS = 180_000;
+
+/**
+ * Read sentinel mode settings from setup UI (global overrides, instance 0).
+ * Falls back to env var for backward compatibility.
+ */
+function isSentinelModeEnabled(): boolean {
+  const globalDet = getApplicantDetailsOverrides(0);
+  if (globalDet && typeof globalDet.sentinelMode === "boolean") {
+    return globalDet.sentinelMode;
+  }
+  return /^true|1|yes$/i.test((process.env.SENTINEL_MODE ?? "").trim());
+}
+
+function getSentinelCountFromUI(): number | undefined {
+  const globalDet = getApplicantDetailsOverrides(0);
+  if (globalDet && typeof globalDet.sentinelCount === "number" && globalDet.sentinelCount >= 1) {
+    return globalDet.sentinelCount;
+  }
+  return undefined;
+}
 type ProxyChainModule = {
   anonymizeProxy(proxyUrl: string): Promise<string>;
   closeAnonymizedProxy(url: string, closeConnections?: boolean): Promise<void>;
@@ -189,6 +228,7 @@ const instanceQueues = new Map<number, Promise<void>>();
  */
 let instanceBookingActive = false;
 let instanceOnPaymentPage = false;
+let instanceStopped = false;
 
 /** Which credential slot (0 = primary, 1 = secondary) to use for the *next* login. Rotates after each successful login when a second pair is configured. */
 const pendingCredentialSlotByInstance = new Map<number, 0 | 1>();
@@ -776,13 +816,20 @@ function restoreChromeWindow(): Promise<void> {
 /**
  * If another instance wrote `slot-state.json`, adopt their center/category and treat polling as a hit.
  * Must run after each slot check (and between centers): peers can mark the file while this instance is in-flight.
+ *
+ * `watcherCache` — optional cached state from the slot-found watcher.  The file may already
+ * be deleted (peer cleared it after a failed booking) but the watcher captured the state
+ * before deletion.  We check the file first; if empty, fall back to the cache.
  */
-async function checkPeerFoundSlotAndJoinBooking(instanceId?: number): Promise<boolean> {
+async function checkPeerFoundSlotAndJoinBooking(instanceId?: number, watcherCache?: SlotFoundState | null): Promise<boolean> {
   // Never interrupt this instance if it is already booking or has reached the payment page.
   if (instanceBookingActive || instanceOnPaymentPage) {
     return false;
   }
-  const sharedState = isSlotFoundByAnyInstance();
+  let sharedState = isSlotFoundByAnyInstance();
+  if (!sharedState.found && watcherCache?.found) {
+    sharedState = watcherCache;
+  }
   if (!sharedState.found || sharedState.foundBy === instanceId) {
     return false;
   }
@@ -831,7 +878,7 @@ async function runPollLoop(
       }
 
       // Instant wake: if any other instance already marked slot found, stop immediately.
-      if (await checkPeerFoundSlotAndJoinBooking(instanceId)) {
+      if (await checkPeerFoundSlotAndJoinBooking(instanceId, slotWatcher.cachedState())) {
         return true;
       }
 
@@ -848,7 +895,7 @@ async function runPollLoop(
         // Round-robin: check one center per poll round, alternating each iteration.
         const center = centers[completed % centers.length]!;
 
-        if (await checkPeerFoundSlotAndJoinBooking(instanceId)) {
+        if (await checkPeerFoundSlotAndJoinBooking(instanceId, slotWatcher.cachedState())) {
           return true;
         }
 
@@ -864,13 +911,22 @@ async function runPollLoop(
           `Checking Center ${center.centerNumber}`
         );
 
-        const { slot, response, centerNumber, centerCode, visaCategoryCode, unauthorized, rateLimited } = await polling.checkSlotsInBrowser(browser, {
+        const { slot, response, centerNumber, centerCode, visaCategoryCode, unauthorized, rateLimited, forbidden } = await polling.checkSlotsInBrowser(browser, {
           centerCode: center.vacCode,
           visaCategoryCode: center.visaCategoryCode,
           centerNumber: center.centerNumber,
         });
 
         console.log(`[Poll Center ${center.centerNumber}]`, JSON.stringify(response, null, 2));
+
+        if (forbidden) {
+          logger.error({ instanceId }, "403 Forbidden — IP/session blocked. Restarting browser with IP rotation...");
+          await telegram.alert("error", `Bot ${instanceId ?? "?"} got 403 Forbidden during polling. Restarting browser + rotating IP...`).catch(() => { });
+          await performPollStyleRelogin(instanceId, "403-forbidden-recovery");
+          logger.info({ instanceId }, "[403 Recovery] Browser restarted, IP rotated, re-logged in — resuming polling");
+          await telegram.alert("info", `Bot ${instanceId ?? "?"} recovered from 403 — polling resumed.`).catch(() => { });
+          continue;
+        }
 
         if (unauthorized) {
           logger.error({ instanceId }, "401 Unauthorized — session expired or invalid. Stopping polling. Please re-login on the VFS tab.");
@@ -890,6 +946,11 @@ async function runPollLoop(
           markSlotFound(instanceId ?? 0, centerCode!, visaCategoryCode!, slot);
           setSlotCenterOverride(centerCode!, visaCategoryCode!);
 
+          // Sentinel mode: broadcast activation signal to wake all standby bots for burst polling.
+          if (isSentinelModeEnabled()) {
+            broadcastActivationSignal(instanceId ?? 0, centerCode!, visaCategoryCode!, slot);
+          }
+
           await telegram.alert("slot_found", `Slot (Center ${centerNumber}): ${slot.center || "—"} ${slot.date} ${slot.time}`, { slotId: slot.id, centerNumber }).catch(() => { });
           logger.info(
             { instanceId, centerNumber, centerCode, visaCategoryCode, slot },
@@ -898,7 +959,7 @@ async function runPollLoop(
           break;
         }
 
-        if (await checkPeerFoundSlotAndJoinBooking(instanceId)) {
+        if (await checkPeerFoundSlotAndJoinBooking(instanceId, slotWatcher.cachedState())) {
           return true;
         }
 
@@ -956,7 +1017,7 @@ async function runPollLoop(
         return false;
       }
 
-      if (woke === "slot" && (await checkPeerFoundSlotAndJoinBooking(instanceId))) {
+      if (woke === "slot" && (await checkPeerFoundSlotAndJoinBooking(instanceId, slotWatcher.cachedState()))) {
         logger.info({ instanceId }, "Woken by slot-state file change — stopping poll loop immediately");
         return true;
       }
@@ -1059,34 +1120,72 @@ function deriveCalendarDateFromPollingRaw(raw?: string): string | null {
 async function performPollStyleRelogin(instanceId?: number, context?: string): Promise<void> {
   const pollReloginInterval = config.pollReloginInterval;
   const ctx = context ?? "poll-relogin";
-  const is10673Recovery = ctx === "save-applicants-10673";
-  const hardSwap = config.credentialSwapBrowserRestart && hasSecondCredentials(instanceId);
-  /** Full restart: two-account swap path, or 10673 path (close browser → clear cookies/storage/cache on next launch → new IP via PROXY_URLS rotation). */
-  const fullChromeRestart = hardSwap || is10673Recovery;
 
-  if (fullChromeRestart) {
-    logger.info(
-      { instanceId, pollReloginInterval, ctx, hardSwap, is10673Recovery },
-      is10673Recovery && !hardSwap
-        ? "[Relogin] 10673 recovery: logout → close Chrome → clear session on respawn → login (same account)"
-        : "[Relogin] Two accounts: logout → close Chrome → rotate PROXY_URLS → new Chrome → login (next credential)"
-    );
-    await browser.logoutVfsAndOpenLoginFirstTab().catch(() => {
-      /* tab may already be gone */
-    });
-    clearApplicantIpCache();
-    await relaunchChromeAfterCredentialSwapLogout();
-    await performVfsLoginFromStore(instanceId);
-    await browser.resolveApplicantIpForPayload();
-  } else {
-    logger.info(
-      { instanceId, pollReloginInterval, ctx },
-      "[Relogin] Logout (best-effort) → login page → next credential (if two are configured) → fresh session"
-    );
-    await browser.logoutVfsAndOpenLoginFirstTab();
-    await performVfsLoginFromStore(instanceId);
-  }
+  logger.info(
+    { instanceId, pollReloginInterval, ctx },
+    "[Relogin] Logout → close Chrome → clear cache/cookies → rotate IP → new Chrome → login"
+  );
+  await browser.logoutVfsAndOpenLoginFirstTab().catch(() => {
+    /* tab may already be gone */
+  });
+  clearApplicantIpCache();
+  await relaunchChromeAfterCredentialSwapLogout();
+  await performVfsLoginFromStore(instanceId);
+  await browser.resolveApplicantIpForPayload();
   await browser.preparePollingAfterLogin({ skipDashboardNavigate: true });
+}
+
+const MAX_FORBIDDEN_RETRIES = 3;
+
+/**
+ * Open login page with 403 recovery: if the page returns 403 Forbidden, close browser,
+ * clear cache/cookies, rotate IP, open a new browser and retry.
+ */
+async function openLoginWithForbiddenRecovery(instanceId?: number): Promise<void> {
+  for (let attempt = 1; attempt <= MAX_FORBIDDEN_RETRIES; attempt++) {
+    try {
+      await browser.openLoginInFirstTab();
+      return;
+    } catch (err) {
+      if (err instanceof VfsForbiddenError) {
+        logger.error({ instanceId, attempt, maxRetries: MAX_FORBIDDEN_RETRIES }, "403 Forbidden on login page — restarting browser + rotating IP");
+        await telegram.alert("error", `Bot ${instanceId ?? "?"} got 403 on login page (attempt ${attempt}/${MAX_FORBIDDEN_RETRIES}). Restarting browser + rotating IP...`).catch(() => { });
+        clearApplicantIpCache();
+        await relaunchChromeAfterCredentialSwapLogout();
+        if (attempt === MAX_FORBIDDEN_RETRIES) {
+          throw new Error(`Login page still 403 after ${MAX_FORBIDDEN_RETRIES} browser restarts — giving up.`);
+        }
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+/**
+ * Login with 403 recovery: if VFS returns 403 at any point during login, close browser,
+ * clear cache/cookies, rotate IP, open new browser, and retry from login page open.
+ */
+async function loginWithForbiddenRecovery(instanceId?: number): Promise<void> {
+  for (let attempt = 1; attempt <= MAX_FORBIDDEN_RETRIES; attempt++) {
+    try {
+      await performVfsLoginFromStore(instanceId);
+      return;
+    } catch (err) {
+      if (err instanceof VfsForbiddenError) {
+        logger.error({ instanceId, attempt, maxRetries: MAX_FORBIDDEN_RETRIES }, "403 Forbidden during login — restarting browser + rotating IP");
+        await telegram.alert("error", `Bot ${instanceId ?? "?"} got 403 during login (attempt ${attempt}/${MAX_FORBIDDEN_RETRIES}). Restarting browser + rotating IP...`).catch(() => { });
+        clearApplicantIpCache();
+        await relaunchChromeAfterCredentialSwapLogout();
+        if (attempt === MAX_FORBIDDEN_RETRIES) {
+          throw new Error(`Login still 403 after ${MAX_FORBIDDEN_RETRIES} browser restarts — giving up.`);
+        }
+        await browser.openLoginInFirstTab();
+        continue;
+      }
+      throw err;
+    }
+  }
 }
 
 /**
@@ -1284,6 +1383,85 @@ async function performVfsLoginFromStore(instanceId?: number): Promise<void> {
  * Optional: `VFS_CLEAR_APPLICANT_IP_CACHE_EACH_CYCLE=true` re-resolves IP every cycle (only safe if you also get a
  * fresh VFS session that cycle, e.g. relogin or new browser).
  */
+/**
+ * Standby idle loop: bot stays logged in, maintains session via periodic lightweight pings,
+ * and watches for activation signal from a sentinel bot. Returns the activation signal when triggered.
+ */
+type StandbyWakeReason =
+  | { reason: "activated"; signal: SlotSignal }
+  | { reason: "promoted" }
+  | null;
+
+async function runStandbyIdleLoop(instanceId: number): Promise<StandbyWakeReason> {
+  logger.info({ instanceId, role: "standby" as BotRole, keepaliveIntervalMs: STANDBY_KEEPALIVE_INTERVAL_MS }, "[Sentinel] Entering standby idle state — waiting for activation signal or promotion");
+
+  const activationWatcher = createActivationWatcher(instanceId);
+  const roleWatcher = createRoleChangeWatcher(instanceId);
+  const myAbortSeq = pollingAbortSeq;
+
+  try {
+    while (true) {
+      if (pollingAbortSeq !== myAbortSeq) break;
+
+      const woke = await Promise.race([
+        new Promise<"keepalive">((r) => setTimeout(() => r("keepalive"), STANDBY_KEEPALIVE_INTERVAL_MS)),
+        activationWatcher.wait().then(() => "activated" as const),
+        roleWatcher.wait().then(() => "promoted" as const),
+        waitForPollingAbort(myAbortSeq).then(() => "abort" as const),
+      ]);
+
+      if (woke === "abort") {
+        logger.info({ instanceId }, "[Sentinel/Standby] Aborted idle loop (config updated)");
+        return null;
+      }
+
+      if (woke === "activated") {
+        const signal = readActivationSignal();
+        logger.info(
+          { instanceId, activatedBy: signal.activatedBy, centerCode: signal.centerCode },
+          "[Sentinel/Standby] ACTIVATION SIGNAL RECEIVED — proceeding to booking"
+        );
+        return { reason: "activated", signal };
+      }
+
+      if (woke === "promoted") {
+        logger.info({ instanceId }, "[Sentinel/Standby] PROMOTED TO SENTINEL — switching to active polling");
+        return { reason: "promoted" };
+      }
+
+      // Keepalive: hit CheckIsSlotAvailable to refresh the VFS server-side session.
+      try {
+        const { getConfiguredCenters } = await import("./utils/centerConfig.js");
+        const centers = getConfiguredCenters(instanceId);
+        if (centers.length > 0) {
+          const center = centers[0]!;
+          const keepaliveResult = await polling.checkSlotsInBrowser(browser, {
+            centerCode: center.vacCode,
+            visaCategoryCode: center.visaCategoryCode,
+            centerNumber: center.centerNumber,
+          });
+          if (keepaliveResult.forbidden) {
+            logger.error({ instanceId }, "[Sentinel/Standby] 403 Forbidden on keepalive — restarting browser + rotating IP");
+            await telegram.alert("error", `Bot ${instanceId ?? "?"} got 403 on keepalive. Restarting browser + rotating IP...`).catch(() => { });
+            await performPollStyleRelogin(instanceId, "403-forbidden-keepalive-recovery");
+            logger.info({ instanceId }, "[Sentinel/Standby] Recovered from 403 — resuming standby");
+          } else {
+            logger.debug({ instanceId, centerCode: center.vacCode }, "[Sentinel/Standby] Session keepalive — slot check sent");
+          }
+        }
+      } catch (err) {
+        logger.warn({ err, instanceId }, "[Sentinel/Standby] Keepalive slot check failed — session may have expired");
+      }
+    }
+  } finally {
+    activationWatcher.dispose();
+    roleWatcher.dispose();
+  }
+
+  return null;
+}
+
+
 async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
   // Reload .env changes for submit-driven runs (so toggles like TURNSTILE_DEMO_MODE take effect
   // without restarting). In cluster mode the parent sets instance-specific env vars
@@ -1330,32 +1508,69 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
   // (no tab yet), the post-login resolve retries.
   await browser.resolveApplicantIpForPayload();
 
-  if (config.turnstileDemoMode) {
-    await browser.openUrlInFirstTab(config.turnstileDemoUrl);
-    await browser.solveTurnstileOnFirstTabDemoPage();
-    logger.info("[Demo] Done (TURNSTILE_DEMO_MODE=true).");
-    return;
-  }
-
   let firstUrl = await browser.getFirstTabUrl();
 
   let kind = classifyVfsFirstTabUrl(firstUrl);
 
   if (kind === "blank") {
-    await browser.openLoginInFirstTab();
+    await openLoginWithForbiddenRecovery(instanceId);
     console.log("[Chrome] Opened login page (was blank)");
     firstUrl = await browser.getFirstTabUrl();
     kind = classifyVfsFirstTabUrl(firstUrl);
   }
 
+  // Resolve sentinel role early so login failures can trigger demotion.
+  const totalInstances = parseInt(process.env.BOT_TOTAL_INSTANCES ?? "1", 10) || 1;
+  const sentinelModeActive = isSentinelModeEnabled();
+  const uiSentinelCount = getSentinelCountFromUI();
+  let myRole: BotRole = sentinelModeActive ? getCurrentRole(instanceId ?? 1, totalInstances, uiSentinelCount) : "sentinel";
+
   let didLoginThisCycle = false;
   if (kind === "login") {
-    await performVfsLoginFromStore(instanceId);
-    firstUrl = await browser.getFirstTabUrl();
-    kind = classifyVfsFirstTabUrl(firstUrl);
-    didLoginThisCycle = true;
-    // await minimizeChromeWindow();
-    // logger.info({ instanceId }, "[Chrome] Minimized browser after login");
+    try {
+      await loginWithForbiddenRecovery(instanceId);
+      firstUrl = await browser.getFirstTabUrl();
+      kind = classifyVfsFirstTabUrl(firstUrl);
+      didLoginThisCycle = true;
+    } catch (loginErr) {
+      const reason = loginErr instanceof Error ? loginErr.message : String(loginErr);
+      logger.error({ err: loginErr, instanceId }, "[Login] Login failed — instance stopping");
+      instanceStopped = true;
+
+      if (sentinelModeActive) {
+        // Mark stopped first so concurrent demoters never promote this instance.
+        markInstanceStopped(instanceId ?? 1, totalInstances, uiSentinelCount);
+
+        if (myRole === "sentinel") {
+          const promoted = demoteSentinelAndPromoteStandby(instanceId ?? 1, totalInstances, uiSentinelCount);
+          const rolesNow = readRoleAssignments();
+          const activeSentinels = rolesNow?.sentinelIds?.filter((id) => !(rolesNow.stoppedIds ?? []).includes(id)) ?? [];
+          const stoppedList = rolesNow?.stoppedIds ?? [];
+          if (promoted != null) {
+            logger.info({ instanceId, promoted }, "[Sentinel] Demoted failed sentinel, promoted standby");
+            await telegram
+              .alert("error", `Bot ${instanceId} login failed — stopped.\nReason: ${reason}\nBot ${instanceId} → stopped, Bot ${promoted} → sentinel.\nActive sentinels: [${activeSentinels.join(", ")}] | Stopped: [${stoppedList.join(", ")}]`)
+              .catch(() => { });
+          } else {
+            await telegram
+              .alert("error", `Bot ${instanceId} login failed — stopped.\nReason: ${reason}\nNo eligible standby to promote.\nActive sentinels: [${activeSentinels.join(", ")}] | Stopped: [${stoppedList.join(", ")}]`)
+              .catch(() => { });
+          }
+        } else {
+          const rolesNow = readRoleAssignments();
+          const activeSentinels = rolesNow?.sentinelIds?.filter((id) => !(rolesNow.stoppedIds ?? []).includes(id)) ?? [];
+          const stoppedList = rolesNow?.stoppedIds ?? [];
+          await telegram
+            .alert("error", `Bot ${instanceId ?? "?"} login failed — stopped.\nReason: ${reason}\nActive sentinels: [${activeSentinels.join(", ")}] | Stopped: [${stoppedList.join(", ")}]`)
+            .catch(() => { });
+        }
+      } else {
+        await telegram
+          .alert("error", `Bot ${instanceId ?? "?"} login failed — stopped.\nReason: ${reason}`)
+          .catch(() => { });
+      }
+      return;
+    }
   } else if (kind === "dashboard") {
     logger.info({ instanceId }, "On dashboard — skipping automated login");
   } else if (kind === "vfs_other") {
@@ -1370,6 +1585,30 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
   if (config.loginOnly) {
     logger.info({ instanceId }, "[LoginOnly] VFS_LOGIN_ONLY=true — stopping after login, no polling or booking");
     return;
+  }
+
+  if (sentinelModeActive) {
+    // Re-read role after login in case demotion happened during login (concurrent failures).
+    myRole = getCurrentRole(instanceId ?? 1, totalInstances, uiSentinelCount);
+
+    const sentinelCfg = resolveSentinelConfig(totalInstances, uiSentinelCount);
+    const dynamic = readRoleAssignments();
+    logger.info(
+      {
+        instanceId,
+        role: myRole,
+        sentinelIds: dynamic?.sentinelIds ?? sentinelCfg.sentinelIds,
+        standbyIds: dynamic?.standbyIds ?? sentinelCfg.standbyIds,
+        stoppedIds: dynamic?.stoppedIds ?? [],
+        sentinelCount: sentinelCfg.sentinelCount,
+      },
+      "[Sentinel] Mode enabled — role assigned"
+    );
+
+    if (meta.firstSubmit) {
+      clearActivationSignal();
+      clearRoleAssignments();
+    }
   }
 
   let slotFoundDuringPoll = false;
@@ -1389,19 +1628,141 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
     );
     await new Promise((r) => setTimeout(r, fixedTiming.postLoginOffsetMs));
   }
-  await telegram.notify("VFS bot run: polling for slots.").catch(() => { });
-  logger.info({ skipDashboardNavigate, instanceId }, "Starting slot polling");
+
   await browser.preparePollingAfterLogin({ skipDashboardNavigate });
 
-  // Build the periodic relogin callback when the interval is enabled.
-  const pollReloginInterval = config.pollReloginInterval;
-  const onPollRelogin =
-    pollReloginInterval > 0 ? () => performPollStyleRelogin(instanceId, "poll-interval") : undefined;
+  if (myRole === "standby") {
+    // STANDBY BOT: stay idle, maintain session, wait for activation signal from sentinel or promotion.
+    await telegram.notify(`[Standby] Bot ${instanceId} logged in and idle — waiting for sentinel signal.`).catch(() => { });
+    logger.info({ instanceId }, "[Sentinel/Standby] Entering idle state — session active, polling disabled");
 
-  slotFoundDuringPoll = await runPollLoop(instanceId, {
-    reloginAfter: pollReloginInterval > 0 ? pollReloginInterval : undefined,
-    onRelogin: onPollRelogin,
-  });
+    const wakeResult = await runStandbyIdleLoop(instanceId ?? 1);
+
+    if (!wakeResult) {
+      logger.info({ instanceId }, "[Sentinel/Standby] Idle loop ended without activation — stopping");
+      return;
+    }
+
+    if (wakeResult.reason === "promoted") {
+      // Promoted to sentinel — switch to active polling.
+      myRole = "sentinel";
+      await telegram.notify(`[Sentinel] Bot ${instanceId} PROMOTED to sentinel — starting active polling`).catch(() => { });
+      logger.info({ instanceId }, "[Sentinel/Standby] Promoted to sentinel — starting runPollLoop");
+
+      const pollReloginInterval = config.pollReloginInterval;
+      const onPollRelogin =
+        pollReloginInterval > 0 ? () => performPollStyleRelogin(instanceId, "poll-interval") : undefined;
+
+      slotFoundDuringPoll = await runPollLoop(instanceId, {
+        reloginAfter: pollReloginInterval > 0 ? pollReloginInterval : undefined,
+        onRelogin: onPollRelogin,
+      });
+    } else {
+      // Activation received: align center/category from signal and go straight to booking.
+      const signal = wakeResult.signal;
+      if (signal.centerCode && signal.visaCategoryCode) {
+        setSlotCenterOverride(signal.centerCode, signal.visaCategoryCode);
+      }
+      markSlotFound(instanceId ?? 0, signal.centerCode ?? "", signal.visaCategoryCode ?? "", signal.slot);
+
+      await telegram.notify(`[Standby] Bot ${instanceId} ACTIVATED — proceeding to booking`).catch(() => { });
+      logger.info({ instanceId, activatedBy: signal.activatedBy, centerCode: signal.centerCode }, "[Sentinel/Standby] Slot confirmed by sentinel — skipping poll, going straight to booking");
+      slotFoundDuringPoll = true;
+    }
+  } else {
+    // SENTINEL BOT (or sentinel mode disabled): active polling as normal.
+
+    // Before starting the poll loop, check if another sentinel already found a
+    // slot while this instance was in the post-login delay.  The activation
+    // signal file persists even after slot-state.json is cleared.
+    if (sentinelModeActive) {
+      const preSignal = readActivationSignal();
+      const preSlot = isSlotFoundByAnyInstance();
+      if (preSignal.activated && preSignal.activatedBy !== instanceId) {
+        logger.info(
+          { instanceId, activatedBy: preSignal.activatedBy, centerCode: preSignal.centerCode },
+          "[Sentinel] Another sentinel already found a slot before poll loop — joining booking"
+        );
+        if (preSignal.centerCode && preSignal.visaCategoryCode) {
+          setSlotCenterOverride(preSignal.centerCode, preSignal.visaCategoryCode);
+        }
+        markSlotFound(instanceId ?? 0, preSignal.centerCode ?? "", preSignal.visaCategoryCode ?? "", preSignal.slot);
+        slotFoundDuringPoll = true;
+      } else if (preSlot.found && preSlot.foundBy !== instanceId) {
+        logger.info(
+          { instanceId, foundBy: preSlot.foundBy, centerCode: preSlot.centerCode },
+          "[Sentinel] Slot already found by peer before poll loop — joining booking"
+        );
+        if (preSlot.centerCode && preSlot.visaCategoryCode) {
+          setSlotCenterOverride(preSlot.centerCode, preSlot.visaCategoryCode);
+        }
+        slotFoundDuringPoll = true;
+      }
+    }
+
+    if (!slotFoundDuringPoll) {
+      await telegram.notify("VFS bot run: polling for slots.").catch(() => { });
+      logger.info({ skipDashboardNavigate, instanceId, role: myRole }, "Starting slot polling");
+
+      const pollReloginInterval = config.pollReloginInterval;
+      const onPollRelogin =
+        pollReloginInterval > 0 ? () => performPollStyleRelogin(instanceId, "poll-interval") : undefined;
+
+      slotFoundDuringPoll = await runPollLoop(instanceId, {
+        reloginAfter: pollReloginInterval > 0 ? pollReloginInterval : undefined,
+        onRelogin: onPollRelogin,
+      });
+    }
+
+    // Sentinel got blocked (429/401/login failure) — demote to standby, promote a standby to sentinel.
+    if (!slotFoundDuringPoll && sentinelModeActive) {
+      logger.info({ instanceId }, "[Sentinel] Polling failed — demoting this sentinel to standby and promoting a standby bot");
+      await telegram.notify(`[Sentinel] Bot ${instanceId} blocked — demoting to standby, promoting replacement`).catch(() => { });
+
+      const promoted = demoteSentinelAndPromoteStandby(instanceId ?? 1, totalInstances, uiSentinelCount);
+      if (promoted != null) {
+        logger.info({ instanceId, promoted }, "[Sentinel] Promoted standby bot to sentinel");
+      }
+
+      // Logout, clear cache/cookies, restart Chrome, re-login as standby.
+      await browser.logoutVfsAndOpenLoginFirstTab().catch(() => { });
+      clearApplicantIpCache();
+      await relaunchChromeAfterCredentialSwapLogout();
+      await performVfsLoginFromStore(instanceId);
+      await browser.resolveApplicantIpForPayload();
+      await browser.preparePollingAfterLogin({ skipDashboardNavigate: true });
+
+      // Now enter standby idle loop.
+      myRole = "standby";
+      logger.info({ instanceId }, "[Sentinel] Demoted — entering standby idle state");
+      await telegram.notify(`[Standby] Bot ${instanceId} re-logged in and idle after demotion`).catch(() => { });
+
+      const wakeResult = await runStandbyIdleLoop(instanceId ?? 1);
+
+      if (wakeResult?.reason === "activated") {
+        const signal = wakeResult.signal;
+        if (signal.centerCode && signal.visaCategoryCode) {
+          setSlotCenterOverride(signal.centerCode, signal.visaCategoryCode);
+        }
+        markSlotFound(instanceId ?? 0, signal.centerCode ?? "", signal.visaCategoryCode ?? "", signal.slot);
+        await telegram.notify(`[Standby] Bot ${instanceId} ACTIVATED — proceeding to booking`).catch(() => { });
+        slotFoundDuringPoll = true;
+      } else if (wakeResult?.reason === "promoted") {
+        // Re-promoted to sentinel after recovery — start polling again.
+        myRole = "sentinel";
+        await telegram.notify(`[Sentinel] Bot ${instanceId} RE-PROMOTED to sentinel — resuming active polling`).catch(() => { });
+
+        const pollReloginInterval2 = config.pollReloginInterval;
+        const onPollRelogin2 =
+          pollReloginInterval2 > 0 ? () => performPollStyleRelogin(instanceId, "poll-interval") : undefined;
+
+        slotFoundDuringPoll = await runPollLoop(instanceId, {
+          reloginAfter: pollReloginInterval2 > 0 ? pollReloginInterval2 : undefined,
+          onRelogin: onPollRelogin2,
+        });
+      }
+    }
+  }
 
   if (slotFoundDuringPoll) {
     let pollHits: boolean = slotFoundDuringPoll;
@@ -1495,24 +1856,50 @@ async function start(): Promise<void> {
     if (process.send) {
       let ipcChain: Promise<void> = Promise.resolve();
       process.on("message", (msg: any) => {
-        ipcChain = ipcChain.then(async () => {
-          if (msg?.instanceId !== myInstanceId) return;
+        if (msg?.instanceId !== myInstanceId) return;
 
-          if (msg?.type === "config-updated") {
-            syncInstanceStoresFromDisk();
-            requestPollingAbort("config-updated", myInstanceId);
+        // force-book must run immediately (not queued behind run-bot-cycle)
+        // so it can write slot-state.json while the poll loop is active.
+        if (msg?.type === "force-book") {
+          if (instanceStopped) {
+            logger.info({ instanceId: myInstanceId }, "[ForceBook] Ignored — instance is stopped (login failed)");
             return;
           }
+          if (instanceBookingActive || instanceOnPaymentPage) {
+            logger.info({ instanceId: myInstanceId }, "[ForceBook] Ignored — already booking or on payment page");
+            return;
+          }
+          logger.info({ instanceId: myInstanceId }, "[ForceBook] Manual booking triggered — writing slot-state to wake all loops");
+          const syntheticSlot = {
+            id: `force-book_${Date.now()}`,
+            center: "",
+            date: "",
+            time: "00:00:00",
+          };
+          markSlotFound(0, "", "", syntheticSlot);
+          broadcastActivationSignal(0, "", "", syntheticSlot);
+          telegram.alert("info", `Bot ${myInstanceId} — manual Book Slot triggered. Entering booking cycle...`).catch(() => { });
+          return;
+        }
 
+        // config-updated should also run immediately to abort polling without waiting for the chain.
+        if (msg?.type === "config-updated") {
+          syncInstanceStoresFromDisk();
+          requestPollingAbort("config-updated", myInstanceId);
+          return;
+        }
+
+        ipcChain = ipcChain.then(async () => {
           if (msg?.type === "run-bot-cycle") {
             syncInstanceStoresFromDisk();
             try {
               await runOneBotCycle({ firstSubmit: true, instanceId: myInstanceId });
               process.send?.({ type: "bot-cycle-complete", instanceId: myInstanceId });
             } catch (err) {
+              const reason = err instanceof Error ? err.message : String(err);
               logger.error({ err, instanceId: myInstanceId }, "Bot cycle failed — stopped");
               await telegram
-                .alert("error", `Bot ${myInstanceId} is stopped.`)
+                .alert("error", `Bot ${myInstanceId} is stopped.\nReason: ${reason}`)
                 .catch(() => { });
             }
           }
@@ -1529,6 +1916,24 @@ async function start(): Promise<void> {
   await runApplicantFormWithSubmitHandler((info) => {
     const instanceId = typeof info.instanceId === "number" ? info.instanceId : undefined;
     enqueueSubmitTask(() => runOneBotCycle({ firstSubmit: info.firstSubmit, instanceId }));
+  }, {
+    onForceBook: () => {
+      if (instanceStopped) {
+        return { ok: false, error: "Instance is stopped (login failed). Cannot book." };
+      }
+      if (instanceBookingActive || instanceOnPaymentPage) {
+        return { ok: false, error: "Booking already in progress." };
+      }
+      const slotState = isSlotFoundByAnyInstance();
+      if (slotState.found) {
+        return { ok: false, error: "Booking already in progress — a slot was found." };
+      }
+      logger.info("[ForceBook] Manual booking triggered (single-instance mode)");
+      const syntheticSlot = { id: `force-book_${Date.now()}`, center: "", date: "", time: "00:00:00" };
+      markSlotFound(0, "", "", syntheticSlot);
+      broadcastActivationSignal(0, "", "", syntheticSlot);
+      return { ok: true, queued: 1 };
+    },
   });
 }
 
@@ -1539,6 +1944,11 @@ function shutdown(): void {
   isShuttingDown = true;
   const debugPort = getRemoteDebuggingPort();
   logger.info({ debugPort }, "Shutting down — closing Chrome and setup form");
+
+  // Synchronous Chrome kill — completes immediately, no lingering PowerShell processes
+  // that could kill newly launched Chrome on restart.
+  killChromeTreeByCdpPortSync(debugPort);
+
   const closeTunnel = async () => {
     if (!activeAnonymizedProxyUrl) return;
     try {
@@ -1554,7 +1964,6 @@ function shutdown(): void {
       await closeTunnel();
       await closeApplicantFormServer();
       await browser.close();
-      await killChromeTreeByCdpPort(debugPort);
     })
     .finally(() => {
       process.exit(0);

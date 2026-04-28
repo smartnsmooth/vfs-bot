@@ -169,3 +169,60 @@ Result: All 5 instances now booking the same slot in parallel!
 - ✅ No complex coordination needed
 
 The VFS booking system is first-come-first-served, so having 5 simultaneous attempts greatly increases your odds!
+
+---
+
+## Sentinel/Standby Mode (Advanced)
+
+For large clusters (15-20 bots), enable **Sentinel Mode** to minimize server requests while maximizing booking speed.
+
+### Concept
+
+- **Sentinel Bots (3-4):** Actively poll for available slots at normal intervals.
+- **Standby Bots (15-16):** Log in, maintain session, but stay idle (no polling requests).
+- **Activation:** When any sentinel finds a slot, all standby bots immediately switch to aggressive burst polling.
+
+### Configuration
+
+Enable from the **setup UI**:
+1. Check the **"Sentinel mode"** checkbox
+2. Set the **"Sentinel count"** (how many bots actively poll — default 4)
+
+No env vars needed.
+
+### How It Works
+
+```
+Setup: 20 instances, SENTINEL_COUNT=4
+
+Instances 1-4:  SENTINEL  → Active polling (normal intervals)
+Instances 5-20: STANDBY   → Logged in, idle, session maintained
+
+T+0s:   Sentinels 1-4 begin polling
+T+0s:   Standby 5-20 enter idle loop (session keepalive every 5 min)
+T+120s: Sentinel 2 finds a slot!
+        → Writes slot-state.json (existing mechanism)
+        → Writes sentinel-signal.json (activation broadcast)
+T+120s: Standby 5-20 detect sentinel-signal.json via fs.watch
+        → ALL wake up instantly
+        → All go straight to booking chain (saveApplicants → calendar → timeslot → fees → schedule)
+
+Result: 4 sentinels + 16 standby = 20 bots all racing to book!
+```
+
+### Benefits Over Default Mode
+
+| | Default (all poll) | Sentinel Mode |
+|---|---|---|
+| Requests/minute | High (20 bots × normal interval) | Low (4 sentinels only) |
+| Detection speed | Same | Same (sentinels cover it) |
+| Booking speed | All already polling | All 20 go to booking instantly |
+| Rate-limit risk | Higher | Lower (fewer active pollers) |
+| Session expiry risk | Lower (constant activity) | Mitigated by keepalive pings |
+
+### State Files
+
+- `slot-state.json` — Standard slot-found broadcast (unchanged)
+- `sentinel-signal.json` — Activation signal for standby bots (new)
+
+Both are cleared on each fresh "Submit & Run" cycle.

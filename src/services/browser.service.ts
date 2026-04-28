@@ -1,5 +1,21 @@
 import { chromium, Browser, BrowserContext, Page } from "playwright";
 
+/** Thrown when a VFS page or API returns HTTP 403 Forbidden — caller should restart browser + rotate IP. */
+export class VfsForbiddenError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "VfsForbiddenError";
+  }
+}
+
+/** Thrown when VFS login API returns 429 Too Many Requests — caller should restart browser + rotate IP + demote sentinel. */
+export class VfsLoginRateLimitedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "VfsLoginRateLimitedError";
+  }
+}
+
 /** Returns true when the error is Playwright's "Target closed" family of errors. */
 function isTargetClosedError(e: unknown): boolean {
   if (!(e instanceof Error)) return false;
@@ -48,7 +64,6 @@ import {
   waitForOtpFromMailTm,
 } from "./mailTm.service";
 import { TelegramService } from "./telegram.service";
-import { TurnstileService, type TurnstileSolveOptions } from "./turnstile.service";
 import type { VfsUserLoginResponse } from "../types/vfsUserLogin.type.js";
 import {
   flattenVfsLoginResponseForProfile,
@@ -107,26 +122,16 @@ function readClientSourceHeader(headers: Record<string, string>): string | undef
 
 export class BrowserService {
   private browser: Browser | null = null;
-  private turnstile: TurnstileService | null = null;
   /** Avoid duplicate `request` listeners on the same CDP context. */
   private readonly clientSourceSnifferAttached = new WeakSet<BrowserContext>();
   /** Sitekey captured from network interception */
   private capturedTurnstileSitekey: string | null = null;
-  /** Managed Turnstile metadata captured from network/DOM (best-effort). */
-  private capturedTurnstileAction: string | null = null;
-  private capturedTurnstileCData: string | null = null;
   /** Set when the bot performs the second Sign In after OTP (auto flow); see {@link getLastPostOtpLoginResponse}. */
   private lastPostOtpLoginResponse: PostOtpLoginCapture | null = null;
 
   /** Response body from the login API call after OTP submit (empty until a login completes that path). */
   getLastPostOtpLoginResponse(): PostOtpLoginCapture | null {
     return this.lastPostOtpLoginResponse;
-  }
-
-  private getTurnstile(): TurnstileService | null {
-    if (!config.capmonsterEnabled || !config.capmonsterApiKey) return null;
-    if (!this.turnstile) this.turnstile = new TurnstileService();
-    return this.turnstile;
   }
 
   private async ensureBrowser(): Promise<Browser> {
@@ -152,139 +157,6 @@ export class BrowserService {
     return null;
   }
 
-  private async getFirstTabPage(): Promise<Page> {
-    const browser = await this.ensureBrowser();
-    const ctx = browser.contexts()[0];
-    if (!ctx) throw new Error("No browser context");
-    return ctx.pages()[0] ?? (await ctx.newPage());
-  }
-
-  async openUrlInFirstTab(url: string): Promise<void> {
-    const page = await this.getFirstTabPage();
-    await page.bringToFront().catch(() => { });
-    logger.info({ url }, "[Demo] Navigating first tab");
-    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 120_000 });
-  }
-
-  async solveTurnstileOnFirstTabDemoPage(): Promise<void> {
-    const page = await this.getFirstTabPage();
-    await page.bringToFront().catch(() => { });
-    const u = page.url();
-    logger.info({ url: u }, "[Demo] Turnstile demo flow starting");
-
-    // 1) Wait until Turnstile widget is present and confirm it's not already solved.
-    const pre = await page
-      .evaluate(async () => {
-        const read = (): { hasWidget: boolean; token: string; turnstileResponse: string } => {
-          const widget =
-            !!document.querySelector("[data-sitekey]") ||
-            !!document.querySelector('iframe[src*="turnstile" i], iframe[src*="challenges.cloudflare" i]');
-          const token =
-            (
-              document.querySelector<HTMLInputElement | HTMLTextAreaElement>('[name="cf-turnstile-response"]')
-                ?.value ?? ""
-            ).trim();
-          const turnstileResponse =
-            (window as any)?.turnstile?.getResponse
-              ? String((window as any).turnstile.getResponse() ?? "").trim()
-              : "";
-          return { hasWidget: widget, token, turnstileResponse };
-        };
-
-        // Wait up to ~15s for widget to appear.
-        const deadline = Date.now() + 15_000;
-        while (Date.now() < deadline) {
-          const r = read();
-          if (r.hasWidget) return r;
-          await new Promise((r) => setTimeout(r, 250));
-        }
-        return read();
-      })
-      .catch(() => ({ hasWidget: false, token: "", turnstileResponse: "" }));
-
-    const preReason = !pre.hasWidget
-      ? "no_widget_detected"
-      : pre.token
-        ? "token_field_non_empty"
-        : pre.turnstileResponse
-          ? "turnstile.getResponse_non_empty"
-          : "no_token_detected_yet";
-    logger.info(
-      {
-        step: 1,
-        hasWidget: pre.hasWidget,
-        tokenLen: pre.token.length,
-        tokenPrefix: pre.token.slice(0, 30),
-        turnstileGetResponseLen: pre.turnstileResponse.length,
-        preReason,
-      },
-      "[Demo] Step 1: pre-check Turnstile status"
-    );
-
-    if (!pre.hasWidget) {
-      throw new Error("[Demo] Turnstile widget not detected on the page (cannot run demo solve)");
-    }
-    const preLooksSolved = !!(pre.token || pre.turnstileResponse);
-    if (preLooksSolved) {
-      logger.info("[Demo] Turnstile already looks solved (skipping CapMonster solve)");
-    } else {
-      // 2) Solve with CapMonster and inject token.
-      logger.info("[Demo] Step 2: solving via CapMonster + injecting token");
-      await this.solveAndInjectTurnstile(page, u);
-    }
-
-    // 3) Verify it’s actually accepted by the demo page: click "Check" and read post-state.
-    logger.info("[Demo] Step 3: verifying via demo 'Check' button");
-    try {
-      const checkBtn = page.getByRole("button", { name: /^check$/i }).first();
-      if (await checkBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
-        await checkBtn.click({ timeout: 5000 });
-      }
-    } catch {
-      /* ignore */
-    }
-    await page.waitForTimeout(800);
-
-    const post = await page
-      .evaluate(() => {
-        const val = (sel: string) =>
-          (document.querySelector<HTMLInputElement>(sel)?.value ??
-            document.querySelector<HTMLTextAreaElement>(sel)?.value ??
-            "")
-            .trim();
-        const token = val('[name="cf-turnstile-response"]') || val('[name="g-recaptcha-response"]');
-        const getResp =
-          (window as any)?.turnstile?.getResponse
-            ? String((window as any).turnstile.getResponse() ?? "").trim()
-            : "";
-        const text = document.body?.innerText?.toLowerCase?.() ?? "";
-        const okText = text.includes("success") || text.includes("passed") || text.includes("verified");
-        const ok = okText || token.length > 100 || getResp.length > 100;
-        const reason = okText
-          ? "page_text_success"
-          : token.length > 100
-            ? "token_length_gt_100"
-            : getResp.length > 100
-              ? "turnstile.getResponse_length_gt_100"
-              : token.length > 0
-                ? "token_present_but_unconfirmed"
-                : getResp.length > 0
-                  ? "turnstile.getResponse_present_but_unconfirmed"
-                  : "no_success_signal";
-        return {
-          resolved: ok,
-          tokenLen: token.length,
-          tokenPrefix: token.slice(0, 30),
-          turnstileGetResponseLen: getResp.length,
-          okText,
-          reason,
-        };
-      })
-      .catch(() => ({ resolved: false, tokenLen: 0, tokenPrefix: "", turnstileGetResponseLen: 0, okText: false }));
-
-    logger.info({ step: 3, ...post }, "[Demo] Step 3: post-check Turnstile status");
-  }
-
   /**
    * Intercept Cloudflare Turnstile network requests to capture sitekey BEFORE page can hide it.
    * This works even if Turnstile auto-resolves immediately.
@@ -298,33 +170,6 @@ export class BrowserService {
       // Check if this is a Cloudflare Turnstile request
       if ((url.includes('challenges.cloudflare.com') || url.includes('turnstile')) &&
         (url.includes('/turnstile/') || url.includes('/challenge-platform/'))) {
-
-        // Capture managed-widget metadata when present (query params vary by Turnstile build).
-        try {
-          const u = new URL(url);
-          const action =
-            u.searchParams.get("action") ||
-            u.searchParams.get("pageAction") ||
-            u.searchParams.get("pa");
-          const cData =
-            u.searchParams.get("cdata") ||
-            u.searchParams.get("cData") ||
-            u.searchParams.get("data") ||
-            u.searchParams.get("chlPageData");
-          if (action && !this.capturedTurnstileAction) {
-            this.capturedTurnstileAction = action;
-            logger.info({ action, source: "network_interception" }, "[Turnstile] ✅ Captured action from network");
-          }
-          if (cData && !this.capturedTurnstileCData) {
-            this.capturedTurnstileCData = cData;
-            logger.info(
-              { cDataLen: cData.length, source: "network_interception" },
-              "[Turnstile] ✅ Captured cData/data from network"
-            );
-          }
-        } catch {
-          /* ignore */
-        }
 
         if (!this.capturedTurnstileSitekey) {
           logger.info({ urlPreview: url.substring(0, 150) }, "[Turnstile] Network: Cloudflare request detected");
@@ -457,7 +302,36 @@ export class BrowserService {
     }
     await page.bringToFront().catch(() => { });
     logger.info("Navigating to login page...");
-    await page.goto(config.loginPageUrl, { waitUntil: "domcontentloaded", timeout: 120_000 });
+    const navResponse = await page.goto(config.loginPageUrl, { waitUntil: "domcontentloaded", timeout: 120_000 });
+
+    if (navResponse && navResponse.status() === 403) {
+      throw new VfsForbiddenError("Login page returned 403 Forbidden — IP/session blocked by Cloudflare or VFS.");
+    }
+
+    // VFS sometimes redirects to a "page not found" URL instead of the login form.
+    const currentUrl = page.url();
+    if (/\/page-not-found\b/i.test(currentUrl)) {
+      throw new VfsForbiddenError(`Login page redirected to ${currentUrl} — IP/session blocked or route unavailable.`);
+    }
+
+    // Detect VFS/Cloudflare WAF block shown as JSON body (e.g. {"code":"403201","description":""}).
+    // The HTTP status may be 200 but the page renders a raw JSON error instead of the login form.
+    try {
+      const bodyText = await page.locator("body").innerText({ timeout: 5_000 });
+      const trimmed = bodyText.trim();
+      if (/^\s*\{/.test(trimmed)) {
+        try {
+          const parsed = JSON.parse(trimmed) as { code?: string | number };
+          if (parsed.code && String(parsed.code).startsWith("403")) {
+            throw new VfsForbiddenError(`Login page body contains WAF block: code ${parsed.code}`);
+          }
+        } catch (e) {
+          if (e instanceof VfsForbiddenError) throw e;
+        }
+      }
+    } catch (e) {
+      if (e instanceof VfsForbiddenError) throw e;
+    }
 
     // Wait for login form inputs to be ready
     const visibleOnly = ':not(.d-none):not([aria-hidden="true"])';
@@ -532,12 +406,6 @@ export class BrowserService {
       timeoutMs: 25_000,
     });
 
-    const waitForManualTurnstile = !config.capmonsterEnabled;
-    if (waitForManualTurnstile) {
-      logger.info("Solve Turnstile in the browser, then press Enter here.");
-      await waitForEnter();
-    }
-
     const submitBtn = await this.resolveLoginSubmitButton(page);
 
     const wantMailTm =
@@ -590,19 +458,34 @@ export class BrowserService {
 
     // Optimized: Submit immediately without unnecessary waits
     await this.submitLoginImmediately(page, submitBtn, {
-      waitForManualTurnstile,
       loginRefill: { username, password, usernameSelectors, passwordSelectors },
     });
 
     const pwdLoginRes = await passwordLoginResponsePromise;
     if (pwdLoginRes) {
+      const pwdStatus = pwdLoginRes.status();
+
+      if (pwdStatus === 429) {
+        const pwdBody = await pwdLoginRes.text().catch(() => "");
+        logger.error({ status: pwdStatus, bodySnippet: pwdBody.slice(0, 200) }, "[Login] /user/login returned 429 Too Many Requests");
+        throw new VfsLoginRateLimitedError("Login API returned 429 Too Many Requests — rate limited by VFS.");
+      }
+
       const pwdBody = await pwdLoginRes.text().catch(() => "");
       const pwdJson = parseVfsUserLoginResponseBody(pwdBody);
       if (pwdJson) {
         const errObj = pwdJson.error as { code?: number; description?: string } | undefined;
+
+        // Body-level 429 code (e.g. {"code":"429001"})
+        const bodyCode = String((pwdJson as Record<string, unknown>).code ?? errObj?.code ?? "");
+        if (bodyCode.startsWith("429")) {
+          logger.error({ status: pwdStatus, code: bodyCode }, "[Login] /user/login body has 429 code");
+          throw new VfsLoginRateLimitedError(`Login API returned code ${bodyCode} — rate limited by VFS.`);
+        }
+
         if (errObj && errObj.code === 413 && errObj.description === "Invalid Sender User") {
           logger.error(
-            { status: pwdLoginRes.status(), error: errObj },
+            { status: pwdStatus, error: errObj },
             "[Login] Login failed — email not registered (error 413 / Invalid Sender User)"
           );
           void new TelegramService()
@@ -614,7 +497,7 @@ export class BrowserService {
         if (forStore) mergeVfsLoginProfile(forStore);
         logger.info(
           {
-            status: pwdLoginRes.status(),
+            status: pwdStatus,
             loginUser: pwdJson.loginUser,
             isAuthenticated: pwdJson.isAuthenticated,
           },
@@ -1436,13 +1319,12 @@ export class BrowserService {
   }
 
   /**
-   * Login submit: prefer auto-resolved Turnstile; with CapMonster enabled, wait up to 5s before solving.
+   * Login submit: wait for Turnstile to auto-resolve, then click Sign In.
    */
   private async submitLoginImmediately(
     page: Page,
     submitBtn: import("playwright").Locator,
     opts: {
-      waitForManualTurnstile: boolean;
       loginRefill?: {
         username: string;
         password: string;
@@ -1462,60 +1344,11 @@ export class BrowserService {
       .catch(() => "");
 
     if (existingToken) {
-      logger.info({ tokenLength: existingToken.length }, "[Login] ✓ Using auto-resolved Turnstile token - clicking Sign In immediately");
-    } else if (this.getTurnstile() && !opts.waitForManualTurnstile) {
-      logger.info("[Login] Waiting up to 10s for Turnstile to auto-resolve (saves CapMonster if browser solves it)...");
-      const capmonsterWaitStart = Date.now();
-      const autoResolveDeadline = capmonsterWaitStart + 10_000;
-      let tokenAfterWait = "";
-
-      while (Date.now() < autoResolveDeadline) {
-        tokenAfterWait = await page
-          .evaluate(() => {
-            const el =
-              document.querySelector<HTMLTextAreaElement>('textarea[name="cf-turnstile-response"]') ??
-              document.querySelector<HTMLInputElement>('input[name="cf-turnstile-response"]');
-            return (el as HTMLInputElement | null)?.value?.trim() ?? "";
-          })
-          .catch(() => "");
-
-        if (tokenAfterWait) {
-          logger.info(
-            { tokenLength: tokenAfterWait.length, elapsedMs: Date.now() - capmonsterWaitStart },
-            "[Login] ✓ Turnstile auto-resolved within wait window — skipping CapMonster"
-          );
-          break;
-        }
-
-        await page.waitForTimeout(200);
-      }
-
-      if (!tokenAfterWait) {
-        logger.info("[Login] No auto-resolved token after 10s — using CapMonster (network-captured sitekey when available)...");
-        await this.solveAndInjectTurnstile(page, page.url());
-
-        logger.info("[Login] Verifying CapMonster token was injected...");
-        const tokenValue = await page
-          .evaluate(() => {
-            const el =
-              document.querySelector<HTMLTextAreaElement>('textarea[name="cf-turnstile-response"]') ??
-              document.querySelector<HTMLInputElement>('input[name="cf-turnstile-response"]');
-            return (el as HTMLInputElement | null)?.value?.trim() ?? "";
-          })
-          .catch(() => "");
-
-        if (!tokenValue) {
-          throw new Error("CapMonster solve completed but token NOT found in page - injection failed");
-        }
-
-        logger.info({ tokenLength: tokenValue.length }, "[Login] ✓ Token verified in page - ready to sign in");
-      }
-    } else if (opts.waitForManualTurnstile) {
-      await waitForEnter();
+      logger.info({ tokenLength: existingToken.length }, "[Login] ✓ Using auto-resolved Turnstile token");
     } else {
-      // Fallback: wait for auto-resolve if CapMonster not configured
-      logger.info("[Login] CapMonster not configured - waiting for Turnstile to auto-resolve...");
-      const deadline = Date.now() + 10_000;
+      logger.info("[Login] Waiting up to 10s for Turnstile to auto-resolve...");
+      const waitStart = Date.now();
+      const deadline = waitStart + 10_000;
       let tokenValue = "";
 
       while (Date.now() < deadline) {
@@ -1529,7 +1362,10 @@ export class BrowserService {
           .catch(() => "");
 
         if (tokenValue) {
-          logger.info({ elapsedMs: Date.now() - (deadline - 10_000) }, "[Login] Turnstile resolved automatically");
+          logger.info(
+            { tokenLength: tokenValue.length, elapsedMs: Date.now() - waitStart },
+            "[Login] ✓ Turnstile auto-resolved within wait window"
+          );
           break;
         }
 
@@ -1537,7 +1373,7 @@ export class BrowserService {
       }
 
       if (!tokenValue) {
-        logger.warn("[Login] Turnstile did not auto-resolve and CapMonster not configured");
+        logger.warn("[Login] Turnstile did not auto-resolve within 10s — proceeding anyway");
         await page.waitForTimeout(5000);
       }
     }
@@ -1725,21 +1561,6 @@ export class BrowserService {
         submitBtn = retryBtn;
       }
     }
-  }
-
-  /**
-   * Managed Turnstile needs action + cData for a valid token; network sitekey capture alone is not enough.
-   * Read widget metadata from DOM / shadow root so CapMonster matches the live challenge.
-   */
-  private async resolveTurnstileSolveOptionsFromPage(page: Page): Promise<TurnstileSolveOptions> {
-    const raw = await page.evaluate(extractTurnstileSolveMetadataFromDom);
-    const o: TurnstileSolveOptions = {};
-    if (raw.action?.trim()) o.pageAction = raw.action.trim();
-    if (raw.data?.trim()) o.data = raw.data.trim();
-    // Fallback: if DOM doesn't expose managed metadata, reuse any captured values from network interception.
-    if (!o.pageAction && this.capturedTurnstileAction?.trim()) o.pageAction = this.capturedTurnstileAction.trim();
-    if (!o.data && this.capturedTurnstileCData?.trim()) o.data = this.capturedTurnstileCData.trim();
-    return o;
   }
 
   private dashboardUrlRegex(): RegExp {
@@ -2127,8 +1948,8 @@ export class BrowserService {
 
         if (tsToken) {
           logger.info({ tokenLength: tsToken.length }, "[OTP] ✓ Using auto-resolved Turnstile token");
-        } else if (this.getTurnstile()) {
-          logger.info("[OTP] Waiting up to 10s for Turnstile to auto-resolve (saves CapMonster if browser solves it)...");
+        } else {
+          logger.info("[OTP] Waiting up to 10s for Turnstile to auto-resolve...");
           const otpTsWaitStart = Date.now();
           const otpTsDeadline = otpTsWaitStart + 10_000;
 
@@ -2137,7 +1958,7 @@ export class BrowserService {
             if (tsToken) {
               logger.info(
                 { tokenLength: tsToken.length, elapsedMs: Date.now() - otpTsWaitStart },
-                "[OTP] ✓ Turnstile auto-resolved within wait window — skipping CapMonster"
+                "[OTP] ✓ Turnstile auto-resolved within wait window"
               );
               break;
             }
@@ -2145,17 +1966,9 @@ export class BrowserService {
           }
 
           if (!tsToken) {
-            logger.info("[OTP] No auto-resolved token after 10s — using CapMonster (network-captured sitekey when available)...");
-            try {
-              await this.solveAndInjectTurnstile(page, page.url());
-            } catch (err) {
-              logger.error({ err }, "[OTP] Failed to solve Turnstile with CapMonster - waiting for auto-resolve or manual solve");
-              await page.waitForTimeout(3000);
-            }
+            logger.warn("[OTP] Turnstile did not auto-resolve within 10s — proceeding anyway");
+            await page.waitForTimeout(3000);
           }
-        } else {
-          logger.warn("[OTP] CapMonster not configured - waiting for Turnstile to auto-resolve");
-          await page.waitForTimeout(3000);
         }
       }
 
@@ -2403,597 +2216,6 @@ export class BrowserService {
     }
   }
 
-  private async solveAndInjectTurnstile(page: Page, pageUrl: string): Promise<void> {
-    logger.info("[Turnstile] Attempting to extract sitekey for CapMonster...");
-
-    // METHOD 0: Use captured sitekey from network interception (most reliable!)
-    if (this.capturedTurnstileSitekey) {
-      logger.info({ sitekey: this.capturedTurnstileSitekey, source: 'network_interception' }, "[Turnstile] ✅ Using sitekey captured from network!");
-
-      const solver = this.getTurnstile();
-      if (solver) {
-        try {
-          const solveOpts = await this.resolveTurnstileSolveOptionsFromPage(page);
-          logger.info(
-            { hasPageAction: !!solveOpts.pageAction, hasData: !!solveOpts.data },
-            "[Turnstile] CapMonster metadata from widget (action/cData — required for many managed widgets)"
-          );
-          const token = await solver.solve(pageUrl.split("#")[0], this.capturedTurnstileSitekey, solveOpts);
-          logger.info({ tokenLen: token.length }, "[Turnstile] CapMonster solved, injecting token...");
-          await page.evaluate(injectTurnstileTokenInPage, token);
-          await page.waitForTimeout(1000);
-
-          const tokenVerified = await page.evaluate(() => {
-            const el =
-              document.querySelector<HTMLTextAreaElement>('textarea[name="cf-turnstile-response"]') ??
-              document.querySelector<HTMLInputElement>('input[name="cf-turnstile-response"]');
-            return !!(el as HTMLInputElement | null)?.value?.trim();
-          });
-
-          if (!tokenVerified) {
-            throw new Error("[Turnstile] Token injection verification failed");
-          }
-
-          logger.info("[Turnstile] ✅ Token injected and verified via network-captured sitekey");
-          return;
-        } catch (err) {
-          logger.error({ err }, "[Turnstile] CapMonster solve failed with network-captured sitekey, trying fallbacks...");
-        }
-      }
-    } else {
-      logger.warn("[Turnstile] No sitekey captured from network, trying other methods...");
-    }
-
-    // METHOD 1: Prefer real widget params from DOM (data-sitekey) before any page-context guesses.
-    // This avoids solving against placeholder/demo keys like 0x1AAAA... when the actual widget uses 3x....
-    logger.info("[Turnstile] Trying DOM extraction for Turnstile params (data-sitekey)...");
-    const domParams = await page.evaluate(extractTurnstileParamsFull).catch(() => null);
-    if (domParams?.sitekey) {
-      logger.info(
-        { sitekey: domParams.sitekey, hasAction: !!domParams.action, hasData: !!domParams.data, source: "dom_data_sitekey" },
-        "[Turnstile] ✅ Found sitekey in DOM"
-      );
-      const solver = this.getTurnstile();
-      if (solver) {
-        const domOpts = await this.resolveTurnstileSolveOptionsFromPage(page);
-        const token = await solver.solve(pageUrl.split("#")[0], domParams.sitekey, {
-          pageAction: domParams.action ?? domOpts.pageAction,
-          data: domParams.data ?? domOpts.data,
-        });
-        logger.info(
-          { tokenLen: token.length, tokenPrefix: token.slice(0, 30) },
-          "[Turnstile] CapMonster solved, injecting token..."
-        );
-        await page.evaluate(injectTurnstileTokenInPage, token);
-        await page.waitForTimeout(1000);
-
-        const tokenVerified = await page.evaluate(() => {
-          const el =
-            document.querySelector<HTMLTextAreaElement>('textarea[name="cf-turnstile-response"]') ??
-            document.querySelector<HTMLInputElement>('input[name="cf-turnstile-response"]');
-          return !!(el as HTMLInputElement | null)?.value?.trim();
-        });
-        if (!tokenVerified) throw new Error("[Turnstile] Token injection verification failed");
-        logger.info("[Turnstile] ✅ Token injected and verified via DOM params");
-        return;
-      }
-    }
-
-    // METHOD 2: Check if sitekey is in page context (might be stored by Turnstile)
-    logger.info("[Turnstile] Checking page context for Turnstile sitekey...");
-    const contextSitekey = await page.evaluate(() => {
-      // Check window._cf_chl_opt object (Cloudflare's internal config)
-      const win = window as any;
-      if (win._cf_chl_opt?.brfbX2) {
-        console.log('[Turnstile] ✅ Found sitekey in window._cf_chl_opt.brfbX2:', win._cf_chl_opt.brfbX2);
-        return win._cf_chl_opt.brfbX2;
-      }
-
-      // Check other common locations
-      if (win.turnstile?.sitekey) return win.turnstile.sitekey;
-      if (win.turnstileConfig?.sitekey) return win.turnstileConfig.sitekey;
-
-      // Check all script tags for sitekey patterns
-      const scripts = Array.from(document.querySelectorAll('script'));
-      for (const script of scripts) {
-        const content = script.textContent || '';
-
-        // Look for brfbX2 property in scripts (Cloudflare's sitekey storage)
-        const brfbMatch = content.match(/brfbX2['":\s]+['"]([^'"]+)['"]/i);
-        if (brfbMatch && brfbMatch[1]) {
-          console.log('[Turnstile] ✅ Found sitekey in script (brfbX2):', brfbMatch[1]);
-          return brfbMatch[1];
-        }
-
-        // Look for 0x... pattern (alphanumeric, not just hex!)
-        const match = content.match(/(0x[0-9A-Za-z_-]{20,})/);
-        if (match && match[1] && match[1].length >= 20) {
-          console.log('[Turnstile] ✅ Found sitekey pattern in script:', match[1]);
-          return match[1];
-        }
-      }
-
-      return null;
-    });
-
-    if (contextSitekey) {
-      logger.info({ sitekey: contextSitekey, source: 'page_context' }, "[Turnstile] ✅ Found sitekey in page context!");
-
-      const solver = this.getTurnstile();
-      if (solver) {
-        try {
-          const solveOpts = await this.resolveTurnstileSolveOptionsFromPage(page);
-          const token = await solver.solve(pageUrl.split("#")[0], contextSitekey, solveOpts);
-          logger.info(
-            { tokenLen: token.length, tokenPrefix: token.slice(0, 30) },
-            "[Turnstile] CapMonster solved, injecting token..."
-          );
-          await page.evaluate(injectTurnstileTokenInPage, token);
-          await page.waitForTimeout(1000);
-
-          const tokenVerified = await page.evaluate(() => {
-            const el =
-              document.querySelector<HTMLTextAreaElement>('textarea[name="cf-turnstile-response"]') ??
-              document.querySelector<HTMLInputElement>('input[name="cf-turnstile-response"]');
-            return !!(el as HTMLInputElement | null)?.value?.trim();
-          });
-
-          if (!tokenVerified) {
-            throw new Error("[Turnstile] Token injection verification failed");
-          }
-
-          logger.info("[Turnstile] ✅ Token injected and verified via page context");
-          return;
-        } catch (err) {
-          logger.error({ err }, "[Turnstile] CapMonster solve failed");
-          throw err;
-        }
-      }
-    }
-
-    // METHOD 2: Use Playwright CDP to pierce closed shadow DOM
-    logger.info("[Turnstile] Using CDP to pierce closed shadow DOM...");
-
-    try {
-      const cdpSession = await page.context().newCDPSession(page);
-
-      // CRITICAL: Enable DOM agent first
-      await cdpSession.send('DOM.enable');
-
-      // Search for all iframes including those in shadow DOM
-      const searchResult = await cdpSession.send('DOM.performSearch', {
-        query: 'iframe',
-        includeUserAgentShadowDOM: true
-      });
-
-      logger.info({ resultCount: searchResult.resultCount }, "[Turnstile] CDP search found iframes");
-
-      if (searchResult.resultCount > 0) {
-        const { nodeIds } = await cdpSession.send('DOM.getSearchResults', {
-          searchId: searchResult.searchId,
-          fromIndex: 0,
-          toIndex: searchResult.resultCount
-        });
-
-        logger.info({ nodeCount: nodeIds.length }, "[Turnstile] CDP retrieved iframe nodes");
-
-        // Check each iframe for Turnstile URL
-        for (const nodeId of nodeIds) {
-          try {
-            const { attributes } = await cdpSession.send('DOM.getAttributes', { nodeId });
-
-            // attributes is array: [name1, value1, name2, value2, ...]
-            for (let i = 0; i < attributes.length; i += 2) {
-              if (attributes[i] === 'src') {
-                const src = attributes[i + 1];
-
-                if (src && (src.includes('challenges.cloudflare.com') || src.includes('turnstile'))) {
-                  logger.info({ srcPreview: src.substring(0, 150) }, "[Turnstile] CDP found Cloudflare iframe!");
-
-                  // Extract sitekey from URL
-                  const match = src.match(/\/([0-9A-Za-z_-]{20,})\//);
-                  const match0x = src.match(/(0x[0-9A-Fa-f_-]{20,})/);
-                  const sitekey = match?.[1] || match0x?.[1];
-
-                  if (sitekey) {
-                    logger.info({ sitekey, source: 'CDP_shadow_dom' }, "[Turnstile] ✅ CDP extracted sitekey from closed shadow DOM!");
-
-                    const solver = this.getTurnstile();
-                    if (!solver) {
-                      logger.warn("[Turnstile] CapMonster not configured");
-                      return;
-                    }
-
-                    const solveOpts = await this.resolveTurnstileSolveOptionsFromPage(page);
-                    const token = await solver.solve(pageUrl.split("#")[0], sitekey, solveOpts);
-                    logger.info(
-                      { tokenLen: token.length, tokenPrefix: token.slice(0, 30) },
-                      "[Turnstile] CapMonster solved, injecting token..."
-                    );
-                    await page.evaluate(injectTurnstileTokenInPage, token);
-                    await page.waitForTimeout(1000);
-
-                    // Verify token
-                    const tokenVerified = await page.evaluate(() => {
-                      const el =
-                        document.querySelector<HTMLTextAreaElement>('textarea[name="cf-turnstile-response"]') ??
-                        document.querySelector<HTMLInputElement>('input[name="cf-turnstile-response"]');
-                      return !!(el as HTMLInputElement | null)?.value?.trim();
-                    });
-
-                    if (!tokenVerified) {
-                      throw new Error("[Turnstile] Token injection verification failed");
-                    }
-
-                    logger.info("[Turnstile] ✅ Token injected and verified via CDP method");
-                    await cdpSession.detach();
-                    return;
-                  }
-                }
-              }
-            }
-          } catch (nodeErr) {
-            // Skip this node
-          }
-        }
-
-        await cdpSession.send('DOM.discardSearchResults', { searchId: searchResult.searchId });
-      }
-
-      await cdpSession.detach();
-      logger.warn("[Turnstile] CDP found no Turnstile iframes, trying fallback...");
-    } catch (cdpErr) {
-      logger.warn({ err: cdpErr }, "[Turnstile] CDP method failed, trying fallback...");
-    }
-
-    // FALLBACK: Install MutationObserver (for iframes that load after page load)
-    logger.info("[Turnstile] Installing MutationObserver as fallback...");
-
-    const sitekeyFromObserver = await page.evaluate(() => {
-      return new Promise<string | null>((resolve) => {
-        let resolved = false;
-        let checkCount = 0;
-
-        const timeout = setTimeout(() => {
-          if (!resolved) {
-            resolved = true;
-            console.log('[Turnstile] MutationObserver timeout after 15 seconds, checked', checkCount, 'times');
-            resolve(null);
-          }
-        }, 15000); // 15 second timeout
-
-        // Function to check all iframes on the page
-        const checkAllIframes = (): boolean => {
-          checkCount++;
-          const allIframes = document.querySelectorAll('iframe');
-
-          if (checkCount % 10 === 0 || allIframes.length > 0) {
-            console.log('[Turnstile] Check #' + checkCount + ':', allIframes.length, 'total iframes');
-          }
-
-          for (const iframe of Array.from(allIframes)) {
-            const src = iframe.src || iframe.getAttribute('src') || '';
-
-            // Log first few iframes
-            if (checkCount <= 5 || src.includes('cloudflare') || src.includes('turnstile')) {
-              console.log('[Turnstile] iframe src:', src.substring(0, 150));
-            }
-
-            if (src && (src.includes('challenges.cloudflare.com') || src.includes('turnstile'))) {
-              console.log('[Turnstile] 🎯 Found Cloudflare/Turnstile iframe!');
-              console.log('[Turnstile] Full URL:', src);
-
-              try {
-                const url = new URL(src);
-                console.log('[Turnstile] Pathname:', url.pathname);
-
-                // Extract sitekey from path: /cdn-cgi/challenge-platform/.../SITEKEY/...
-                // The sitekey is typically right before /auto/ or similar
-                const pathMatch = url.pathname.match(/\/([0-9A-Za-z_-]{20,})\//);
-                console.log('[Turnstile] Path regex match:', pathMatch);
-
-                if (pathMatch && pathMatch[1]) {
-                  console.log('[Turnstile] ✅ EXTRACTED SITEKEY:', pathMatch[1]);
-                  if (!resolved) {
-                    resolved = true;
-                    clearTimeout(timeout);
-                    resolve(pathMatch[1]);
-                  }
-                  return true;
-                } else {
-                  console.log('[Turnstile] ⚠️ Regex did not match path - trying alternative extraction');
-                  // Try to find sitekey pattern in the full path
-                  const allMatches = url.pathname.match(/0x[0-9A-Fa-f_-]{20,}/g);
-                  if (allMatches && allMatches[0]) {
-                    console.log('[Turnstile] ✅ EXTRACTED SITEKEY (0x pattern):', allMatches[0]);
-                    if (!resolved) {
-                      resolved = true;
-                      clearTimeout(timeout);
-                      resolve(allMatches[0]);
-                    }
-                    return true;
-                  }
-                }
-              } catch (err) {
-                console.error('[Turnstile] Error parsing iframe URL:', err);
-              }
-            }
-          }
-          return false;
-        };
-
-        // Check immediately in case iframe is already loaded
-        console.log('[Turnstile] Starting initial iframe check...');
-        if (checkAllIframes()) return;
-
-        // Set up MutationObserver to catch dynamically added iframes
-        console.log('[Turnstile] Setting up MutationObserver...');
-        const observer = new MutationObserver((mutations) => {
-          if (resolved) return;
-
-          let iframesMutated = false;
-          for (const mutation of mutations) {
-            // Check added nodes
-            for (const node of Array.from(mutation.addedNodes)) {
-              if (node.nodeType === 1) { // Element node
-                const element = node as Element;
-
-                // Check if the node itself is an iframe
-                if (element.tagName === 'IFRAME') {
-                  console.log('[Turnstile] Mutation: iframe added directly');
-                  iframesMutated = true;
-                }
-
-                // Check if the node contains iframes
-                const iframes = element.querySelectorAll('iframe');
-                if (iframes.length > 0) {
-                  console.log('[Turnstile] Mutation: element contains', iframes.length, 'iframe(s)');
-                  iframesMutated = true;
-                }
-              }
-            }
-
-            // Check for attribute changes (src attribute)
-            if (mutation.type === 'attributes' && mutation.attributeName === 'src') {
-              console.log('[Turnstile] Mutation: src attribute changed on', (mutation.target as Element).tagName);
-              iframesMutated = true;
-            }
-          }
-
-          if (iframesMutated && checkAllIframes()) return;
-        });
-
-        // Observe entire document for DOM changes
-        observer.observe(document.documentElement, {
-          childList: true,
-          subtree: true,
-          attributes: true,
-          attributeFilter: ['src']
-        });
-
-        // Poll for iframes every 200ms as backup (in case MutationObserver misses something)
-        const interval = setInterval(() => {
-          if (resolved) {
-            clearInterval(interval);
-            observer.disconnect();
-            return;
-          }
-          checkAllIframes();
-        }, 200);
-      });
-    });
-
-    if (sitekeyFromObserver) {
-      logger.info({ sitekey: sitekeyFromObserver, source: 'mutation_observer' }, "[Turnstile] ✅ Successfully extracted sitekey from closed shadow DOM iframe!");
-
-      const solver = this.getTurnstile();
-      if (!solver) {
-        logger.warn("[Turnstile] CapMonster not configured");
-        return;
-      }
-
-      try {
-        const solveOpts = await this.resolveTurnstileSolveOptionsFromPage(page);
-        const token = await solver.solve(pageUrl.split("#")[0], sitekeyFromObserver, solveOpts);
-        logger.info(
-          { tokenLen: token.length, tokenPrefix: token.slice(0, 30) },
-          "[Turnstile] CapMonster returned token, injecting into page..."
-        );
-        await page.evaluate(injectTurnstileTokenInPage, token);
-        await page.waitForTimeout(1000);
-
-        // Verify token was successfully injected
-        const tokenVerified = await page.evaluate(() => {
-          const el =
-            document.querySelector<HTMLTextAreaElement>('textarea[name="cf-turnstile-response"]') ??
-            document.querySelector<HTMLInputElement>('input[name="cf-turnstile-response"]');
-          return !!(el as HTMLInputElement | null)?.value?.trim();
-        });
-
-        if (!tokenVerified) {
-          throw new Error("[Turnstile] Token injection verification failed - cf-turnstile-response field is empty");
-        }
-
-        logger.info("[Turnstile] Token injected and verified successfully");
-        return;
-      } catch (err) {
-        logger.error({ err }, "[Turnstile] CapMonster solve failed");
-        throw err;
-      }
-    }
-
-    logger.warn("[Turnstile] MutationObserver did not find sitekey, trying fallback methods...");
-
-    // FALLBACK Method 1: Check page source / HTML for sitekey
-    const pageSource = await page.evaluate(() => {
-      // Try to find sitekey in page source
-      const scripts = Array.from(document.querySelectorAll('script'));
-      for (const script of scripts) {
-        const content = script.textContent || script.innerHTML;
-        // Look for common Turnstile patterns
-        const match = content.match(/['"](0x[0-9A-Fa-f_-]{20,}|[0-9A-Za-z_-]{32,})['"]/) ||
-          content.match(/sitekey['":\s]+['"]([^'"]+)['"]/i);
-        if (match) return match[1];
-      }
-
-      // Check window object for Turnstile config
-      const win = window as any;
-      if (win.turnstile?.sitekey) return win.turnstile.sitekey;
-      if (win.turnstileConfig?.sitekey) return win.turnstileConfig.sitekey;
-
-      // Check for data attributes on elements
-      const elementsWithData = document.querySelectorAll('[data-turnstile-sitekey], [data-cf-sitekey]');
-      for (const el of Array.from(elementsWithData)) {
-        const key = el.getAttribute('data-turnstile-sitekey') || el.getAttribute('data-cf-sitekey');
-        if (key) return key;
-      }
-
-      return null;
-    });
-
-    if (pageSource) {
-      logger.info({ sitekey: pageSource, source: 'page_source' }, "[Turnstile] Found sitekey in page source!");
-
-      const solver = this.getTurnstile();
-      if (!solver) {
-        logger.warn("[Turnstile] CapMonster not configured");
-        return;
-      }
-
-      try {
-        const solveOpts = await this.resolveTurnstileSolveOptionsFromPage(page);
-        const token = await solver.solve(pageUrl.split("#")[0], pageSource, solveOpts);
-        logger.info(
-          { tokenLen: token.length, tokenPrefix: token.slice(0, 30) },
-          "[Turnstile] CapMonster returned token, injecting into page..."
-        );
-        await page.evaluate(injectTurnstileTokenInPage, token);
-        await page.waitForTimeout(1000);
-
-        // Verify token was successfully injected
-        const tokenVerified = await page.evaluate(() => {
-          const el =
-            document.querySelector<HTMLTextAreaElement>('textarea[name="cf-turnstile-response"]') ??
-            document.querySelector<HTMLInputElement>('input[name="cf-turnstile-response"]');
-          return !!(el as HTMLInputElement | null)?.value?.trim();
-        });
-
-        if (!tokenVerified) {
-          throw new Error("[Turnstile] Token injection verification failed - cf-turnstile-response field is empty");
-        }
-
-        logger.info("[Turnstile] Token injected and verified successfully");
-        return;
-      } catch (err) {
-        logger.error({ err }, "[Turnstile] CapMonster solve failed");
-        throw err;
-      }
-    }
-
-    // FALLBACK Method 2: Try extractTurnstileParamsFull (standard DOM extraction)
-    logger.info("[Turnstile] Trying regular DOM extraction methods (extractTurnstileParamsFull)...");
-
-    const deadline = Date.now() + 10_000;
-    let params: { sitekey: string; action?: string; data?: string } | null = null;
-    let attemptCount = 0;
-
-    while (Date.now() < deadline) {
-      attemptCount++;
-      params = await page.evaluate(extractTurnstileParamsFull);
-      if (params?.sitekey) {
-        logger.info({ attempts: attemptCount, elapsedMs: 10_000 - (deadline - Date.now()) }, "[Turnstile] Sitekey found via regular DOM");
-        break;
-      }
-      await page.waitForTimeout(500);
-    }
-
-    if (!params?.sitekey) {
-      // LAST RESORT: If page was already loaded when bot started, reload to trigger Turnstile network request
-      if (!this.capturedTurnstileSitekey) {
-        logger.warn("[Turnstile] No sitekey captured - page may have been already loaded. Reloading page to trigger Turnstile...");
-
-        try {
-          await page.reload({ waitUntil: 'domcontentloaded', timeout: 15000 });
-          logger.info("[Turnstile] Page reloaded, waiting 3s for Turnstile network request...");
-          await page.waitForTimeout(3000);
-
-          // Check if we captured it now
-          if (this.capturedTurnstileSitekey) {
-            logger.info({ sitekey: this.capturedTurnstileSitekey }, "[Turnstile] ✅ Captured sitekey after page reload!");
-
-            const solver = this.getTurnstile();
-            if (solver) {
-              const solveOpts = await this.resolveTurnstileSolveOptionsFromPage(page);
-              const token = await solver.solve(pageUrl.split("#")[0], this.capturedTurnstileSitekey, solveOpts);
-              logger.info(
-                { tokenLen: token.length, tokenPrefix: token.slice(0, 30) },
-                "[Turnstile] CapMonster solved after reload, injecting token..."
-              );
-              await page.evaluate(injectTurnstileTokenInPage, token);
-              await page.waitForTimeout(1000);
-
-              const tokenVerified = await page.evaluate(() => {
-                const el =
-                  document.querySelector<HTMLTextAreaElement>('textarea[name="cf-turnstile-response"]') ??
-                  document.querySelector<HTMLInputElement>('input[name="cf-turnstile-response"]');
-                return !!(el as HTMLInputElement | null)?.value?.trim();
-              });
-
-              if (!tokenVerified) {
-                throw new Error("[Turnstile] Token injection verification failed after reload");
-              }
-
-              logger.info("[Turnstile] ✅ Token injected and verified after page reload");
-              return;
-            }
-          }
-        } catch (reloadErr) {
-          logger.warn({ err: reloadErr }, "[Turnstile] Page reload attempt failed");
-        }
-      }
-
-      logger.error({ attempts: attemptCount, capturedFromNetwork: !!this.capturedTurnstileSitekey }, "[Turnstile] ❌ FAILED to extract sitekey - all methods exhausted");
-      throw new Error("Turnstile sitekey extraction failed - MutationObserver, page source, and DOM extraction all failed");
-    }
-
-    logger.info({ sitekey: params.sitekey, action: params.action, data: params.data }, "[Turnstile] Found params, sending to CapMonster...");
-    const solver = this.getTurnstile();
-    if (!solver) {
-      logger.warn("[Turnstile] CapMonster not configured");
-      return;
-    }
-
-    try {
-      const domOpts = await this.resolveTurnstileSolveOptionsFromPage(page);
-      const token = await solver.solve(pageUrl.split("#")[0], params.sitekey, {
-        pageAction: params.action ?? domOpts.pageAction,
-        data: params.data ?? domOpts.data,
-      });
-      logger.info(
-        { tokenLen: token.length, tokenPrefix: token.slice(0, 30) },
-        "[Turnstile] CapMonster returned token, injecting into page..."
-      );
-      await page.evaluate(injectTurnstileTokenInPage, token);
-      await page.waitForTimeout(1000);
-
-      // Verify token was successfully injected
-      const tokenVerified = await page.evaluate(() => {
-        const el =
-          document.querySelector<HTMLTextAreaElement>('textarea[name="cf-turnstile-response"]') ??
-          document.querySelector<HTMLInputElement>('input[name="cf-turnstile-response"]');
-        return !!(el as HTMLInputElement | null)?.value?.trim();
-      });
-
-      if (!tokenVerified) {
-        throw new Error("[Turnstile] Token injection verification failed - cf-turnstile-response field is empty");
-      }
-
-      logger.info("[Turnstile] Token injected and verified successfully");
-    } catch (err) {
-      logger.error({ err }, "[Turnstile] CapMonster solve failed");
-      throw err;
-    }
-  }
 
   /**
    * Detach Playwright from Chrome CDP; next `ensureBrowser()` reconnects.
@@ -3012,102 +2234,6 @@ export class BrowserService {
       this.browser = null;
     }
   }
-}
-
-/**
- * Read Turnstile `action` and cData from the widget host. CapMonster needs these for managed widgets;
- * sitekey-only solves often produce a token that fills the textarea but is rejected on Sign In (no OTP step).
- */
-function extractTurnstileSolveMetadataFromDom(): { action?: string; data?: string } {
-  const scan = (root: Document | ShadowRoot): { action?: string; data?: string } | null => {
-    for (const el of root.querySelectorAll("[data-sitekey]")) {
-      const action = el.getAttribute("data-action")?.trim() || undefined;
-      const data =
-        el.getAttribute("data-cdata")?.trim() ||
-        el.getAttribute("data-challenge")?.trim() ||
-        undefined;
-      if (action || data) {
-        const out: { action?: string; data?: string } = {};
-        if (action) out.action = action;
-        if (data) out.data = data;
-        return out;
-      }
-    }
-    return null;
-  };
-
-  const top = scan(document);
-  if (top && (top.action || top.data)) return top;
-
-  const host = document.querySelector("app-cloudflare-captcha-container");
-  if (host?.shadowRoot) {
-    const inner = scan(host.shadowRoot);
-    if (inner && (inner.action || inner.data)) return inner;
-  }
-
-  return {};
-}
-
-function extractTurnstileParamsFull(): { sitekey: string; action?: string; data?: string } | null {
-  let sitekey: string | null = null;
-  let action: string | undefined;
-  let data: string | undefined;
-
-  // First, try to find [data-sitekey] in regular DOM
-  const widgets = document.querySelectorAll("[data-sitekey]");
-  for (const el of Array.from(widgets)) {
-    const sk = el.getAttribute("data-sitekey");
-    if (sk && sk.length >= 8) {
-      sitekey = sk;
-      action = el.getAttribute("data-action") ?? undefined;
-      data = el.getAttribute("data-cdata") ?? el.getAttribute("data-challenge") ?? undefined;
-      console.log('[Turnstile] Found sitekey in regular DOM via [data-sitekey]');
-      break;
-    }
-  }
-
-  // If not found, try regular DOM iframe search
-  if (!sitekey) {
-    const ifr = document.querySelector('iframe[src*="turnstile" i], iframe[src*="challenges.cloudflare" i]') as HTMLIFrameElement | null;
-    if (ifr?.src) {
-      try {
-        const k = new URL(ifr.src).searchParams.get("k");
-        if (k) {
-          sitekey = k;
-          console.log('[Turnstile] Found sitekey in regular DOM iframe');
-        }
-      } catch {
-        /* ignore */
-      }
-    }
-  }
-
-  // If still not found, pierce closed shadow DOM (for app-cloudflare-captcha-container)
-  if (!sitekey) {
-    try {
-      const container = document.querySelector('app-cloudflare-captcha-container');
-      if (container?.shadowRoot) {
-        console.log('[Turnstile] Searching in closed shadow DOM (app-cloudflare-captcha-container)...');
-        const shadowIframe = container.shadowRoot.querySelector('iframe[src*="turnstile"], iframe[src*="challenges.cloudflare"]') as HTMLIFrameElement | null;
-        if (shadowIframe?.src) {
-          const k = new URL(shadowIframe.src).searchParams.get("k");
-          if (k) {
-            sitekey = k;
-            console.log('[Turnstile] Found sitekey in closed shadow DOM iframe');
-          }
-        } else {
-          console.log('[Turnstile] No iframe found in shadow DOM');
-        }
-      } else {
-        console.log('[Turnstile] app-cloudflare-captcha-container not found or has no shadowRoot');
-      }
-    } catch (err) {
-      console.error('[Turnstile] Error accessing shadow DOM:', err);
-    }
-  }
-
-  if (!sitekey) return null;
-  return { sitekey, action, data };
 }
 
 function injectTurnstileTokenInPage(token: string): void {
@@ -3211,15 +2337,4 @@ function injectTurnstileTokenInPage(token: string): void {
     form.dispatchEvent(new Event("change", { bubbles: true }));
     form.dispatchEvent(new Event("input", { bubbles: true }));
   }
-}
-
-function waitForEnter(): Promise<void> {
-  return new Promise((resolve) => {
-    const readline = require("node:readline");
-    const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
-    rl.question("Press Enter when Turnstile is done in the browser... ", () => {
-      rl.close();
-      resolve();
-    });
-  });
 }

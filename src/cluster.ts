@@ -7,9 +7,10 @@ import { setSessionLoginCredentials } from "./utils/sessionLogin.store";
 import { setApplicantDetailsOverrides } from "./utils/applicantDetails.store";
 import { TelegramService } from "./services/telegram.service";
 import {
-  killChromeTreeByCdpPortRange,
   killChromeTreeByCdpPortRangeSync,
 } from "./utils/killChromeByCdpPort";
+import { isSlotFoundByAnyInstance, clearSlotState } from "./utils/slotState";
+import { readRoleAssignments, clearRoleAssignments, clearActivationSignal } from "./utils/sentinelState";
 
 /** How many bot instances are currently running. Set by ensureInstances(). */
 let currentNumInstances = 0;
@@ -90,7 +91,7 @@ async function startFormServer(): Promise<void> {
     if (now - lastTelegramNotifyBatchTs > 2000) {
       lastTelegramNotifyBatchTs = now;
       const dt = new Date().toLocaleString();
-      void new TelegramService().notify(`${dt} — ${submittedCount} bot${submittedCount > 1 ? "s are" : " is"} running...`, { raw: true }).catch(() => {});
+      void new TelegramService().notify(`${dt} — ${submittedCount} bot${submittedCount > 1 ? "s are" : " is"} running...`, { raw: true }).catch(() => { });
     }
 
     const instanceId = typeof formData.instanceId === "number" ? formData.instanceId : 1;
@@ -153,7 +154,27 @@ async function startFormServer(): Promise<void> {
         logger.warn({ instanceId }, "Cannot send message to instance process");
       }
     });
-  }, { collectLogin: true });
+  }, {
+    collectLogin: true,
+    onForceBook: () => {
+      const slotState = isSlotFoundByAnyInstance();
+      if (slotState.found) {
+        return { ok: false, error: "Booking already in progress — a slot was found and instances are booking." };
+      }
+      const stoppedIds = new Set(readRoleAssignments()?.stoppedIds ?? []);
+      const eligible = instances.filter((i) => i.process && !i.process.killed && !stoppedIds.has(i.id));
+      if (eligible.length === 0) {
+        return { ok: false, error: "No active instances. All may be stopped or not yet started." };
+      }
+      let queued = 0;
+      for (const inst of eligible) {
+        inst.process!.send({ type: "force-book", instanceId: inst.id });
+        queued++;
+      }
+      logger.info({ queued, skippedStopped: stoppedIds.size }, "[ForceBook] Sent force-book IPC to active instances");
+      return { ok: true, queued };
+    },
+  });
 }
 
 function spawnBotInstance(instanceId: number, totalInstances: number): ChildProcess {
@@ -192,6 +213,11 @@ function spawnBotInstance(instanceId: number, totalInstances: number): ChildProc
 async function main(): Promise<void> {
   logger.info("Starting VFS Bot Cluster — open the setup form, set the number of instances, and click Submit to start");
 
+  // Wipe stale shared state from previous sessions so new instances start clean.
+  clearRoleAssignments(true);
+  clearActivationSignal();
+  clearSlotState();
+
   // Start the shared form server. Instances are spawned lazily on first Submit,
   // not at startup — so the user can choose the count from the UI.
   startFormServer().catch((err) => {
@@ -213,20 +239,20 @@ function shutdown(): void {
   isClusterShuttingDown = true;
   const portCount = getInstancePortRangeCount();
   logger.info({ instances: portCount, basePort: BASE_DEBUGGING_PORT }, "Shutting down cluster — closing Chrome windows and child processes");
-  void (async () => {
-    try {
-      await closeApplicantFormServer();
-      // Kill Chrome trees for every instance port first (covers detached Chrome).
-      await killChromeTreeByCdpPortRange(BASE_DEBUGGING_PORT, portCount);
-      for (const inst of instances) {
-        if (inst.process && !inst.process.killed) {
-          inst.process.kill("SIGTERM");
-        }
-      }
-    } finally {
-      process.exit(0);
+
+  // Kill child processes first so they don't spawn new async PowerShell kill commands.
+  for (const inst of instances) {
+    if (inst.process && !inst.process.killed) {
+      inst.process.kill("SIGTERM");
     }
-  })();
+  }
+
+  // Synchronous Chrome kill — completes before exit, no lingering PowerShell processes.
+  killChromeTreeByCdpPortRangeSync(BASE_DEBUGGING_PORT, portCount);
+
+  void closeApplicantFormServer().finally(() => {
+    process.exit(0);
+  });
 }
 
 process.on("SIGINT", shutdown);

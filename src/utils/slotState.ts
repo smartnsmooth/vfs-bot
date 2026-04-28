@@ -69,18 +69,26 @@ export function clearSlotState(): void {
 /**
  * Resolve as soon as another instance marks slot found (fs.watch based).
  * Used to wake sleeping poll loops immediately (no need to wait for interval).
+ *
+ * `cachedState()` returns the captured slot state even after the file is deleted,
+ * so a peer that clears `slot-state.json` quickly doesn't erase the signal for
+ * instances that are mid-API-call when the file was written.
  */
 export function createSlotFoundWatcher(myInstanceId?: number): {
   wait: () => Promise<SlotFoundState>;
+  cachedState: () => SlotFoundState | null;
   dispose: () => void;
 } {
   let disposed = false;
   let resolved = false;
   let pending: ((s: SlotFoundState) => void) | null = null;
+  let captured: SlotFoundState | null = null;
+
+  const cachedState = (): SlotFoundState | null => captured;
 
   const wait = (): Promise<SlotFoundState> => {
     if (disposed) return Promise.resolve({ found: false });
-    if (resolved) return Promise.resolve(isSlotFoundByAnyInstance());
+    if (resolved) return Promise.resolve(captured ?? isSlotFoundByAnyInstance());
     return new Promise<SlotFoundState>((resolve) => {
       pending = resolve;
     });
@@ -92,6 +100,7 @@ export function createSlotFoundWatcher(myInstanceId?: number): {
     if (!state.found) return;
     if (myInstanceId != null && state.foundBy === myInstanceId) return;
     resolved = true;
+    captured = state;
     if (pending) {
       pending(state);
       pending = null;
@@ -125,5 +134,5 @@ export function createSlotFoundWatcher(myInstanceId?: number): {
     }
   };
 
-  return { wait, dispose };
+  return { wait, cachedState, dispose };
 }

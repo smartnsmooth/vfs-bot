@@ -372,12 +372,23 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     }
     applyInstanceScheduleRangeToForm(inst.details || {});
 
-    // postLoginPollDelay is global (instance 0); apply from whichever source has it.
+    // Global settings (instance 0): postLoginPollDelay, sentinelMode, sentinelCount.
     const globalInst = data.instances["0"];
     const plpdEl = document.getElementById("postLoginPollDelay");
     if (plpdEl) {
       const src = (globalInst && globalInst.details) || (inst && inst.details) || {};
       plpdEl.value = src.postLoginPollDelay != null ? String(src.postLoginPollDelay) : "30";
+    }
+    var globalSrc = (globalInst && globalInst.details) || {};
+    var smEl = document.getElementById("sentinelMode");
+    var scEl = document.getElementById("sentinelCount");
+    var scWrap = document.getElementById("sentinelCountWrapper");
+    if (smEl) {
+      smEl.checked = globalSrc.sentinelMode === true;
+      if (scWrap) scWrap.style.display = smEl.checked ? "block" : "none";
+    }
+    if (scEl && globalSrc.sentinelCount != null) {
+      scEl.value = String(globalSrc.sentinelCount);
     }
 
     if (showAlert) {
@@ -409,6 +420,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       numInstances: getNumInstances(),
       userPollInterval: parseInt(String(fd.get("userPollInterval") || "60"), 10) || 60,
       postLoginPollDelay: parseInt(String(fd.get("postLoginPollDelay") || "30"), 10),
+      sentinelMode: document.getElementById("sentinelMode") ? document.getElementById("sentinelMode").checked : false,
+      sentinelCount: parseInt(String(fd.get("sentinelCount") || "4"), 10) || 4,
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
     };
     if (!Number.isFinite(body.postLoginPollDelay) || body.postLoginPollDelay < 0) body.postLoginPollDelay = 30;
@@ -507,6 +520,15 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
 
       updateInstanceSelector();
 
+      var sentinelCheckbox = document.getElementById("sentinelMode");
+      var sentinelCountWrapper = document.getElementById("sentinelCountWrapper");
+      if (sentinelCheckbox && sentinelCountWrapper) {
+        sentinelCheckbox.addEventListener("change", function () {
+          sentinelCountWrapper.style.display = sentinelCheckbox.checked ? "block" : "none";
+          scheduleAutoSave();
+        });
+      }
+
       const instanceIdSelect = document.getElementById("instanceId");
       if (instanceIdSelect) {
         instanceIdSelect.addEventListener("change", function () {
@@ -573,6 +595,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       numInstances: getNumInstances(),
       userPollInterval: parseInt(String(fd.get("userPollInterval") || "60"), 10) || 60,
       postLoginPollDelay: parseInt(String(fd.get("postLoginPollDelay") || "30"), 10),
+      sentinelMode: document.getElementById("sentinelMode") ? document.getElementById("sentinelMode").checked : false,
+      sentinelCount: parseInt(String(fd.get("sentinelCount") || "4"), 10) || 4,
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
     };
     if (!Number.isFinite(body.postLoginPollDelay) || body.postLoginPollDelay < 0) body.postLoginPollDelay = 30;
@@ -600,6 +624,31 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     } catch (err) {
       msg.className = "err";
       msg.textContent = String(err);
+    }
+  });
+
+  document.getElementById("forceBookBtn").addEventListener("click", async function () {
+    const msg = document.getElementById("msg");
+    const btn = document.getElementById("forceBookBtn");
+    msg.textContent = "";
+    btn.disabled = true;
+    btn.textContent = "Booking...";
+    try {
+      const r = await fetch("/api/force-book", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+      const j = await r.json();
+      if (j.ok) {
+        msg.className = "ok";
+        msg.textContent = "\\u2713 Force booking triggered for " + (j.queued || "all") + " instance(s). Check terminal.";
+      } else {
+        msg.className = "err";
+        msg.textContent = j.error || "Force book failed";
+      }
+    } catch (err) {
+      msg.className = "err";
+      msg.textContent = String(err);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = "Book Slot";
     }
   });
 })();

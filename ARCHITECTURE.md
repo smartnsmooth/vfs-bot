@@ -21,7 +21,7 @@
 | **API endpoints** (login, slots, hold) | `.env`: `VFS_LOGIN_ENDPOINT`, `VFS_SLOT_ENDPOINT`, `VFS_HOLD_ENDPOINT`, `VFS_OTP_ENDPOINT`, `VFS_REFRESH_ENDPOINT` |
 | **Booking/hold page URL** | `.env`: `VFS_HOLD_PAGE_URL` (browser opens this for hold + CAPTCHA) |
 | **Slot API response shape** | `src/services/polling.service.ts`: `SlotApiResponse` and parsing of `data.slots` / `data.data.slots` |
-| **Turnstile / CAPTCHA** | `src/services/browser.service.ts`: `solveAndInjectTurnstile()`; `src/services/turnstile.service.ts` (CapMonster). Set `CAPMONSTER_API_KEY` for auto-solve. |
+| **Turnstile / CAPTCHA** | `src/services/browser.service.ts`: Turnstile auto-resolves in the browser; no external solver. |
 | **Form fields** (pre-fill) | `src/services/browser.service.ts`: `prefillFormIfPresent()` (applicant details come from the setup form at runtime) |
 | **Anti-bot / rate limits** | `src/utils/proxy.util.ts` and `.env`: `PROXY_URL` or `PROXY_LIST`; optionally increase `POLLING_INTERVAL_MS` |
 | **Session / cookies** | `src/services/session.service.ts`: how cookie is read (body vs `Set-Cookie` header); refresh logic |
@@ -33,7 +33,6 @@
 - `src/services/session.service.ts` — Login, OTP submit, refresh.
 - `src/services/polling.service.ts` — HTTP slot check, multi-center, proxy rotation.
 - `src/services/browser.service.ts` — Hold page, Turnstile solve + inject, form pre-fill, payment (Playwright).
-- `src/services/turnstile.service.ts` — CapMonster Cloud API (createTask → getTaskResult → token).
 - `src/services/telegram.service.ts` — Alerts.
 - `src/utils/proxy.util.ts` — Load and rotate proxies from env.
 
@@ -55,17 +54,11 @@ Optional: `BROWSER_CDP_URL=http://localhost:9222` (default) if you use another p
 ## Env Summary
 
 - **Required** (unless USE_EXISTING_BROWSER): `VFS_USERNAME`, `VFS_PASSWORD`; if Telegram on: `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID`
-- **Optional**: `USE_EXISTING_BROWSER`, `BROWSER_CDP_URL`, `VFS_OTP`, `POLLING_INTERVAL_MS`, `HOLD_DEADLINE_MS`, `VFS_CENTER_IDS`, `PROXY_URL` / `PROXY_LIST`, `VFS_*` endpoints, `BROWSER_HEADLESS`, `LOG_LEVEL`, **CapMonster**: `CAPMONSTER_API_KEY`, `CAPMONSTER_API_URL`
+- **Optional**: `USE_EXISTING_BROWSER`, `BROWSER_CDP_URL`, `VFS_OTP`, `POLLING_INTERVAL_MS`, `HOLD_DEADLINE_MS`, `VFS_CENTER_IDS`, `PROXY_URL` / `PROXY_LIST`, `VFS_*` endpoints, `BROWSER_HEADLESS`, `LOG_LEVEL`
 
-## Turnstile / CapMonster
+## Turnstile
 
-Turnstile is solved via **CapMonster Cloud**. Set `CAPMONSTER_API_KEY` in `.env`; the bot will:
-
-1. Detect Turnstile on the page (`data-sitekey`), extract optional `data-action` and `data-cdata`.
-2. Send a task to CapMonster (`https://api.capmonster.cloud`); poll until solution is ready.
-3. Inject the token into `[name="cf-turnstile-response"]` and dispatch input/change events.
-
-If `CAPMONSTER_API_KEY` is not set, Turnstile solve is skipped (run with `BROWSER_HEADLESS=false` to solve manually). Optional: `CAPMONSTER_API_URL` to use a different endpoint.
+Turnstile auto-resolves in the browser. The bot waits up to 10 seconds for the Cloudflare challenge to produce a token, then proceeds with login/OTP submission.
 
 ## Proxies
 
