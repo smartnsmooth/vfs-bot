@@ -66,8 +66,10 @@ const FAST_SKIP_CALENDAR_UP_TO_INSTANCE = Math.max(
 );
 const DEFAULT_POLL_INTERVAL_SEC = 60;
 
-/** Standby bots ping the browser tab every 3 minutes to keep the VFS session alive while idle. */
-const STANDBY_KEEPALIVE_INTERVAL_MS = 180_000;
+/** Standby bots stay completely idle (no requests). After this interval the VFS session
+ *  is assumed expired and the bot performs a full re-login cycle (close browser → clear
+ *  caches → rotate IP → reopen browser → login). */
+const STANDBY_SESSION_EXPIRY_MS = 28 * 60 * 1000; // 28 minutes
 
 /**
  * Read sentinel mode settings from setup UI (global overrides, instance 0).
@@ -1192,11 +1194,23 @@ async function loginWithForbiddenRecovery(instanceId?: number): Promise<void> {
  * Try save-applicants; on 422 "Invalid request", retry by re-polling then re-calling save.
  * On 10673 ("no appointment slots"), retry up to `VFS_POLL_RELOGIN_INTERVAL` times at poll interval, then poll-style relogin + slot poll, forever until save succeeds.
  */
-async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: SlotFoundState): Promise<void> {
+async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: SlotFoundState): Promise<boolean> {
   const pollIntervalMs = getFixedTimingForInstance(instanceId).pollIntervalMs;
   const phase1Attempts = Math.max(1, config.pollReloginInterval);
+  const chainAbortSeq = pollingAbortSeq;
+
+  // If a newer force-book arrived before this chain even started, exit immediately.
+  if (pollingAbortSeq !== chainAbortSeq) {
+    logger.info({ instanceId }, "[ForceBook] Booking chain superseded before start — skipping");
+    return false;
+  }
 
   applicants10673Recovery: while (true) {
+    // Check abort before each Applicants API attempt so superseded chains don't waste a request.
+    if (pollingAbortSeq !== chainAbortSeq) {
+      logger.info({ instanceId }, "[ForceBook] Booking chain superseded — exiting before save-applicants");
+      return false;
+    }
     for (let phase1Idx = 0; phase1Idx < phase1Attempts; phase1Idx++) {
       let saw10673ThisPhase = false;
       for (let attempt = 1; attempt <= MAX_SAVE_APPLICANTS_RETRIES; attempt++) {
@@ -1226,13 +1240,20 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
           const stillAvailable = await runPollLoop(instanceId);
           if (!stillAvailable) {
             logger.warn({ instanceId }, "Slot no longer available on retry poll — aborting booking chain");
-            return;
+            return false;
           }
         }
       }
       if (saw10673ThisPhase && phase1Idx < phase1Attempts - 1) {
         logger.info({ instanceId, delayMs: pollIntervalMs, phase1Round: phase1Idx + 1 }, "10673 — waiting poll interval before next save applicants attempt");
-        await new Promise((r) => setTimeout(r, pollIntervalMs));
+        await Promise.race([
+          new Promise<void>((r) => setTimeout(r, pollIntervalMs)),
+          waitForPollingAbort(chainAbortSeq),
+        ]);
+        if (pollingAbortSeq !== chainAbortSeq) {
+          logger.info({ instanceId }, "[ForceBook] 10673 retry delay interrupted by new force-book — exiting booking chain");
+          return false;
+        }
       }
     }
 
@@ -1344,6 +1365,7 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
       await browser.postFeesLiftApi();
     }
   }
+  return true;
 }
 
 type SubmitMeta = { firstSubmit: boolean; instanceId?: number };
@@ -1384,8 +1406,10 @@ async function performVfsLoginFromStore(instanceId?: number): Promise<void> {
  * fresh VFS session that cycle, e.g. relogin or new browser).
  */
 /**
- * Standby idle loop: bot stays logged in, maintains session via periodic lightweight pings,
- * and watches for activation signal from a sentinel bot. Returns the activation signal when triggered.
+ * Standby idle loop: bot stays completely idle (no requests). After 28 minutes the VFS
+ * session is assumed expired and the bot performs a full re-login cycle (close browser,
+ * clear caches, rotate IP, reopen browser, login). Returns when an activation signal or
+ * promotion is received.
  */
 type StandbyWakeReason =
   | { reason: "activated"; signal: SlotSignal }
@@ -1393,7 +1417,7 @@ type StandbyWakeReason =
   | null;
 
 async function runStandbyIdleLoop(instanceId: number): Promise<StandbyWakeReason> {
-  logger.info({ instanceId, role: "standby" as BotRole, keepaliveIntervalMs: STANDBY_KEEPALIVE_INTERVAL_MS }, "[Sentinel] Entering standby idle state — waiting for activation signal or promotion");
+  logger.info({ instanceId, role: "standby" as BotRole, sessionExpiryMs: STANDBY_SESSION_EXPIRY_MS }, "[Sentinel] Entering standby idle state — no requests, waiting for activation signal, promotion, or session expiry");
 
   const activationWatcher = createActivationWatcher(instanceId);
   const roleWatcher = createRoleChangeWatcher(instanceId);
@@ -1404,7 +1428,7 @@ async function runStandbyIdleLoop(instanceId: number): Promise<StandbyWakeReason
       if (pollingAbortSeq !== myAbortSeq) break;
 
       const woke = await Promise.race([
-        new Promise<"keepalive">((r) => setTimeout(() => r("keepalive"), STANDBY_KEEPALIVE_INTERVAL_MS)),
+        new Promise<"session_expired">((r) => setTimeout(() => r("session_expired"), STANDBY_SESSION_EXPIRY_MS)),
         activationWatcher.wait().then(() => "activated" as const),
         roleWatcher.wait().then(() => "promoted" as const),
         waitForPollingAbort(myAbortSeq).then(() => "abort" as const),
@@ -1429,29 +1453,25 @@ async function runStandbyIdleLoop(instanceId: number): Promise<StandbyWakeReason
         return { reason: "promoted" };
       }
 
-      // Keepalive: hit CheckIsSlotAvailable to refresh the VFS server-side session.
+      // Session expired after 28 minutes of idle — perform full re-login cycle:
+      // close browser → clear caches → rotate IP → reopen browser → login
+      logger.info({ instanceId, expiryMs: STANDBY_SESSION_EXPIRY_MS }, "[Sentinel/Standby] Session expired after idle period — performing full re-login cycle");
+      await telegram.notify(`[Standby] Bot ${instanceId} session expired — re-login cycle (close browser, clear cache, rotate IP, new browser)`).catch(() => { });
       try {
-        const { getConfiguredCenters } = await import("./utils/centerConfig.js");
-        const centers = getConfiguredCenters(instanceId);
-        if (centers.length > 0) {
-          const center = centers[0]!;
-          const keepaliveResult = await polling.checkSlotsInBrowser(browser, {
-            centerCode: center.vacCode,
-            visaCategoryCode: center.visaCategoryCode,
-            centerNumber: center.centerNumber,
-          });
-          if (keepaliveResult.forbidden) {
-            logger.error({ instanceId }, "[Sentinel/Standby] 403 Forbidden on keepalive — restarting browser + rotating IP");
-            await telegram.alert("error", `Bot ${instanceId ?? "?"} got 403 on keepalive. Restarting browser + rotating IP...`).catch(() => { });
-            await performPollStyleRelogin(instanceId, "403-forbidden-keepalive-recovery");
-            logger.info({ instanceId }, "[Sentinel/Standby] Recovered from 403 — resuming standby");
-          } else {
-            logger.debug({ instanceId, centerCode: center.vacCode }, "[Sentinel/Standby] Session keepalive — slot check sent");
-          }
-        }
+        await browser.logoutVfsAndOpenLoginFirstTab().catch(() => { });
+        clearApplicantIpCache();
+        await relaunchChromeAfterCredentialSwapLogout();
+        await performVfsLoginFromStore(instanceId);
+        await browser.resolveApplicantIpForPayload();
+        await browser.preparePollingAfterLogin({ skipDashboardNavigate: true });
+        logger.info({ instanceId }, "[Sentinel/Standby] Re-login cycle complete — resuming idle standby");
+        await telegram.notify(`[Standby] Bot ${instanceId} re-logged in after session expiry — idle again`).catch(() => { });
       } catch (err) {
-        logger.warn({ err, instanceId }, "[Sentinel/Standby] Keepalive slot check failed — session may have expired");
+        logger.error({ err, instanceId }, "[Sentinel/Standby] Re-login cycle failed — will retry after next expiry interval");
+        await telegram.alert("error", `Bot ${instanceId} standby re-login failed: ${err instanceof Error ? err.message : String(err)}`).catch(() => { });
       }
+
+      // Reset watchers for the next idle period (activation/role watchers persist across re-login)
     }
   } finally {
     activationWatcher.dispose();
@@ -1512,6 +1532,15 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
 
   let kind = classifyVfsFirstTabUrl(firstUrl);
 
+  if (kind === "page_not_found") {
+    logger.error({ instanceId, url: firstUrl }, "[Chrome] Page-not-found — IP/session blocked. Closing browser, clearing caches, rotating IP, reopening...");
+    await telegram.alert("error", `Bot ${instanceId ?? "?"} landed on page-not-found — restarting browser + rotating IP`).catch(() => { });
+    clearApplicantIpCache();
+    await relaunchChromeAfterCredentialSwapLogout();
+    firstUrl = await browser.getFirstTabUrl();
+    kind = classifyVfsFirstTabUrl(firstUrl);
+  }
+
   if (kind === "blank") {
     await openLoginWithForbiddenRecovery(instanceId);
     console.log("[Chrome] Opened login page (was blank)");
@@ -1524,6 +1553,20 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
   const sentinelModeActive = isSentinelModeEnabled();
   const uiSentinelCount = getSentinelCountFromUI();
   let myRole: BotRole = sentinelModeActive ? getCurrentRole(instanceId ?? 1, totalInstances, uiSentinelCount) : "sentinel";
+
+  // Detect WAF JSON block on a login-URL page (e.g. {"code":"403201"}).
+  // The URL looks normal (/login) but the body is a JSON error — no login form exists.
+  if (kind === "login") {
+    const isWafBlocked = await browser.detectWafJsonBlock();
+    if (isWafBlocked) {
+      logger.error({ instanceId, url: firstUrl }, "[Chrome] Login page shows WAF JSON block (403) — closing browser, clearing caches, rotating IP, reopening...");
+      await telegram.alert("error", `Bot ${instanceId ?? "?"} login page WAF blocked (403 JSON) — restarting browser + rotating IP`).catch(() => { });
+      clearApplicantIpCache();
+      await relaunchChromeAfterCredentialSwapLogout();
+      firstUrl = await browser.getFirstTabUrl();
+      kind = classifyVfsFirstTabUrl(firstUrl);
+    }
+  }
 
   let didLoginThisCycle = false;
   if (kind === "login") {
@@ -1611,6 +1654,7 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
     }
   }
 
+  const cycleAbortSeq = pollingAbortSeq;
   let slotFoundDuringPoll = false;
   if (didLoginThisCycle) {
     const globalDet0 = getApplicantDetailsOverrides(0);
@@ -1620,16 +1664,37 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
         : DEFAULT_POST_LOGIN_POLL_DELAY_SEC;
     const postLoginDelayMs = postLoginDelaySec * 1000;
     logger.info({ instanceId, postLoginDelayMs }, "Post-login base delay before polling");
-    await new Promise((r) => setTimeout(r, postLoginDelayMs));
+    await Promise.race([
+      new Promise((r) => setTimeout(r, postLoginDelayMs)),
+      waitForPollingAbort(cycleAbortSeq),
+    ]);
+    if (pollingAbortSeq !== cycleAbortSeq) {
+      logger.info({ instanceId }, "[poll] Post-login delay aborted (force-book or config update)");
+      return;
+    }
     const fixedTiming = getFixedTimingForInstance(instanceId);
     logger.info(
       { instanceId, delayMs: fixedTiming.postLoginOffsetMs, mode: "fixed_by_instance" },
       "Post-login fixed delay before polling (after base delay)"
     );
-    await new Promise((r) => setTimeout(r, fixedTiming.postLoginOffsetMs));
+    await Promise.race([
+      new Promise((r) => setTimeout(r, fixedTiming.postLoginOffsetMs)),
+      waitForPollingAbort(cycleAbortSeq),
+    ]);
+    if (pollingAbortSeq !== cycleAbortSeq) {
+      logger.info({ instanceId }, "[poll] Post-login offset delay aborted (force-book or config update)");
+      return;
+    }
   }
 
   await browser.preparePollingAfterLogin({ skipDashboardNavigate });
+
+  // Check if force-book or config-update fired during preparePolling — exit early so the
+  // queued attack cycle can start immediately.
+  if (pollingAbortSeq !== cycleAbortSeq) {
+    logger.info({ instanceId }, "[poll] Cycle aborted before entering poll/standby (force-book or config update)");
+    return;
+  }
 
   if (myRole === "standby") {
     // STANDBY BOT: stay idle, maintain session, wait for activation signal from sentinel or promotion.
@@ -1715,7 +1780,9 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
     }
 
     // Sentinel got blocked (429/401/login failure) — demote to standby, promote a standby to sentinel.
-    if (!slotFoundDuringPoll && sentinelModeActive) {
+    // BUT: if the poll loop was aborted (force-book or config-update), don't demote — just exit
+    // cleanly so the queued force-book attack cycle (or config reload) can start.
+    if (!slotFoundDuringPoll && sentinelModeActive && pollingAbortSeq === cycleAbortSeq) {
       logger.info({ instanceId }, "[Sentinel] Polling failed — demoting this sentinel to standby and promoting a standby bot");
       await telegram.notify(`[Sentinel] Bot ${instanceId} blocked — demoting to standby, promoting replacement`).catch(() => { });
 
@@ -1773,9 +1840,10 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
       instanceBookingActive = true;
       logger.info({ instanceId }, "[Booking] Started — this instance will not be interrupted by new slot finds");
       try {
-        await runBookingChainWithRetry(instanceId, slotStateSnapshot);
-        // Booking chain completed (schedule API called) — payment page is now open.
+        const bookingCompleted = await runBookingChainWithRetry(instanceId, slotStateSnapshot);
         instanceBookingActive = false;
+        if (!bookingCompleted) break; // Aborted/superseded — do not mark payment page
+        // Booking chain completed (schedule API called) — payment page is now open.
         instanceOnPaymentPage = true;
         // await restoreChromeWindow();
         // logger.info({ instanceId }, "[Chrome] Restored browser for payment page");
@@ -1858,27 +1926,51 @@ async function start(): Promise<void> {
       process.on("message", (msg: any) => {
         if (msg?.instanceId !== myInstanceId) return;
 
-        // force-book must run immediately (not queued behind run-bot-cycle)
-        // so it can write slot-state.json while the poll loop is active.
+        // force-book: attack mode — every click skips slot checking and goes straight
+        // to the booking chain (Applicants API → Calendar → Timeslot → Fees → Schedule).
         if (msg?.type === "force-book") {
           if (instanceStopped) {
             logger.info({ instanceId: myInstanceId }, "[ForceBook] Ignored — instance is stopped (login failed)");
             return;
           }
-          if (instanceBookingActive || instanceOnPaymentPage) {
-            logger.info({ instanceId: myInstanceId }, "[ForceBook] Ignored — already booking or on payment page");
+          if (instanceOnPaymentPage) {
+            logger.info({ instanceId: myInstanceId }, "[ForceBook] Ignored — already on payment page");
             return;
           }
-          logger.info({ instanceId: myInstanceId }, "[ForceBook] Manual booking triggered — writing slot-state to wake all loops");
-          const syntheticSlot = {
-            id: `force-book_${Date.now()}`,
-            center: "",
-            date: "",
-            time: "00:00:00",
-          };
-          markSlotFound(0, "", "", syntheticSlot);
-          broadcastActivationSignal(0, "", "", syntheticSlot);
-          telegram.alert("info", `Bot ${myInstanceId} — manual Book Slot triggered. Entering booking cycle...`).catch(() => { });
+          // Abort any in-progress polling/standby so the new attack cycle can start.
+          instanceBookingActive = false;
+          clearSlotState();
+          clearSlotCenterOverride();
+          clearSlotDate();
+          requestPollingAbort("force-book-attack", myInstanceId);
+          logger.info({ instanceId: myInstanceId }, "[ForceBook] Attack mode — clearing state and starting booking chain directly (skip slot check)");
+          // Queue the booking chain so it runs sequentially after the current cycle exits.
+          ipcChain = ipcChain.then(async () => {
+            try {
+              instanceBookingActive = true;
+              try {
+                const bookingCompleted = await runBookingChainWithRetry(myInstanceId);
+                instanceBookingActive = false;
+                if (bookingCompleted) {
+                  instanceOnPaymentPage = true;
+                  logger.info({ instanceId: myInstanceId }, "[ForceBook] Booking complete — on payment page");
+                } else {
+                  logger.info({ instanceId: myInstanceId }, "[ForceBook] Booking chain superseded/aborted — not marking payment page");
+                }
+              } catch (err) {
+                instanceBookingActive = false;
+                logger.error({ err, instanceId: myInstanceId }, "[ForceBook] Booking chain failed");
+                await telegram.alert("error", `Bot ${myInstanceId} force-book failed: ${err instanceof Error ? err.message : String(err)}`).catch(() => { });
+                clearSlotState();
+                clearSlotCenterOverride();
+                clearSlotDate();
+              }
+            } catch (err) {
+              logger.error({ err, instanceId: myInstanceId }, "[ForceBook] Attack cycle failed");
+              await telegram.alert("error", `Bot ${myInstanceId} force-book cycle error: ${err instanceof Error ? err.message : String(err)}`).catch(() => { });
+            }
+          });
+          telegram.alert("info", `Bot ${myInstanceId} — attack mode: booking chain starting...`).catch(() => { });
           return;
         }
 
@@ -1921,17 +2013,41 @@ async function start(): Promise<void> {
       if (instanceStopped) {
         return { ok: false, error: "Instance is stopped (login failed). Cannot book." };
       }
-      if (instanceBookingActive || instanceOnPaymentPage) {
-        return { ok: false, error: "Booking already in progress." };
+      if (instanceOnPaymentPage) {
+        return { ok: false, error: "Already on payment page." };
       }
-      const slotState = isSlotFoundByAnyInstance();
-      if (slotState.found) {
-        return { ok: false, error: "Booking already in progress — a slot was found." };
-      }
-      logger.info("[ForceBook] Manual booking triggered (single-instance mode)");
-      const syntheticSlot = { id: `force-book_${Date.now()}`, center: "", date: "", time: "00:00:00" };
-      markSlotFound(0, "", "", syntheticSlot);
-      broadcastActivationSignal(0, "", "", syntheticSlot);
+      // Attack mode: skip slot checking, go straight to booking chain.
+      instanceBookingActive = false;
+      clearSlotState();
+      clearSlotCenterOverride();
+      clearSlotDate();
+      requestPollingAbort("force-book-attack");
+      logger.info("[ForceBook] Attack mode — clearing state and starting booking chain directly (single-instance)");
+      enqueueSubmitTask(async () => {
+        try {
+          instanceBookingActive = true;
+          try {
+            const bookingCompleted = await runBookingChainWithRetry();
+            instanceBookingActive = false;
+            if (bookingCompleted) {
+              instanceOnPaymentPage = true;
+              logger.info("[ForceBook] Booking complete — on payment page");
+            } else {
+              logger.info("[ForceBook] Booking chain superseded/aborted — not marking payment page");
+            }
+          } catch (err) {
+            instanceBookingActive = false;
+            logger.error({ err }, "[ForceBook] Booking chain failed");
+            await telegram.alert("error", `Force-book failed: ${err instanceof Error ? err.message : String(err)}`).catch(() => { });
+            clearSlotState();
+            clearSlotCenterOverride();
+            clearSlotDate();
+          }
+        } catch (err) {
+          logger.error({ err }, "[ForceBook] Attack cycle failed");
+          await telegram.alert("error", `Force-book cycle error: ${err instanceof Error ? err.message : String(err)}`).catch(() => { });
+        }
+      });
       return { ok: true, queued: 1 };
     },
   });

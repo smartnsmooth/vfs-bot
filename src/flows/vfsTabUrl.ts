@@ -1,4 +1,4 @@
-export type VfsTabKind = "blank" | "login" | "dashboard" | "vfs_other";
+export type VfsTabKind = "blank" | "login" | "dashboard" | "vfs_other" | "page_not_found";
 
 /**
  * Classify first VFS tab URL for submit-driven flow:
@@ -6,12 +6,16 @@ export type VfsTabKind = "blank" | "login" | "dashboard" | "vfs_other";
  * - login → run login automation
  * - dashboard → skip login
  * - vfs_other (application detail, your-details, etc.) → skip login, go to polling
+ * - page_not_found → IP/session blocked; needs full browser restart + IP rotation
  */
 export function classifyVfsFirstTabUrl(raw: string): VfsTabKind {
   const u = (raw || "").trim().toLowerCase();
   if (!u || u === "about:blank") return "blank";
 
   if (!u.includes("visa.vfsglobal.com")) return "blank";
+
+  // VFS sometimes redirects to page-not-found when the IP/session is blocked.
+  if (u.includes("page-not-found")) return "page_not_found";
 
   if (u.includes("/login")) return "login";
 

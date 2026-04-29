@@ -1,0 +1,14 @@
+{
+  "sentinelIds": [
+    1,
+    3
+  ],
+  "standbyIds": [
+    4,
+    5
+  ],
+  "stoppedIds": [
+    2
+  ],
+  "timestamp": 1777489675707
+}

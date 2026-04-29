@@ -245,6 +245,31 @@ export class BrowserService {
   }
 
   /**
+   * Check if the current VFS page shows a WAF JSON block (e.g. `{"code":"403201"}`).
+   * The URL may look normal (/login) but the body is a JSON error instead of the login form.
+   */
+  async detectWafJsonBlock(): Promise<boolean> {
+    try {
+      const browser = await this.ensureBrowser();
+      const pages = browser.contexts()[0]?.pages() ?? [];
+      const page = this.findPreferredVfsPage(pages) ?? pages[0];
+      if (!page) return false;
+      const bodyText = await page.locator("body").innerText({ timeout: 5_000 });
+      const trimmed = bodyText.trim();
+      if (/^\s*\{/.test(trimmed)) {
+        try {
+          const parsed = JSON.parse(trimmed) as { code?: string | number };
+          if (parsed.code && String(parsed.code).startsWith("403")) {
+            logger.warn({ code: parsed.code }, "[WAF] Detected WAF JSON block on page body");
+            return true;
+          }
+        } catch { /* not JSON */ }
+      }
+    } catch { /* page read failed */ }
+    return false;
+  }
+
+  /**
    * Clicks the local setup form Submit (`http://127.0.0.1:…/`) if that tab is open in Chrome.
    * Same network effect as a manual Submit (POST `/api/submit`).
    */
@@ -388,6 +413,30 @@ export class BrowserService {
     const page = this.findPreferredVfsPage(pages) ?? pages[0];
     if (!page) throw new Error("No tab. Open Chrome with at least one tab, or open the VFS login page.");
     await page.bringToFront().catch(() => { });
+
+    // Guard: the page may have been redirected to page-not-found or WAF-blocked
+    // between openLoginInFirstTab and now (or the redirect happened after the
+    // initial navigation completed).
+    const currentUrl = page.url();
+    if (/\/page-not-found\b/i.test(currentUrl)) {
+      throw new VfsForbiddenError(`Login tab redirected to ${currentUrl} — IP/session blocked.`);
+    }
+    try {
+      const bodyText = await page.locator("body").innerText({ timeout: 5_000 });
+      const trimmed = bodyText.trim();
+      if (/^\s*\{/.test(trimmed)) {
+        try {
+          const parsed = JSON.parse(trimmed) as { code?: string | number };
+          if (parsed.code && String(parsed.code).startsWith("403")) {
+            throw new VfsForbiddenError(`Login page body contains WAF block: code ${parsed.code}`);
+          }
+        } catch (e) {
+          if (e instanceof VfsForbiddenError) throw e;
+        }
+      }
+    } catch (e) {
+      if (e instanceof VfsForbiddenError) throw e;
+    }
 
     // Wait for login form inputs to be ready
     const visibleOnly = ':not(.d-none):not([aria-hidden="true"])';
@@ -1876,6 +1925,10 @@ export class BrowserService {
   private async resubmitLoginAfterOtp(page: Page): Promise<void> {
     const submitBtn = await this.resolvePostOtpSubmitButton(page);
 
+    // Dismiss cookie consent if it appeared after the first Sign In (OTP page load).
+    // The consent overlay can block the Turnstile iframe, preventing it from auto-resolving.
+    await this.dismissCookieConsent(page, true);
+
     // Wait for both OTP to be filled AND Turnstile to be valid
     logger.info("[OTP] Waiting for OTP to be filled and Turnstile to be valid...");
     const deadline = Date.now() + 60_000; // 60 seconds for OTP fetching
@@ -1975,6 +2028,12 @@ export class BrowserService {
       if (otpFilled && turnstileValid) {
         logger.info({ elapsedMs: Date.now() - (deadline - 60_000) }, "[OTP] Both OTP filled and Turnstile valid - ready to submit");
         break;
+      }
+
+      // If Turnstile is stuck, try dismissing a late-appearing consent overlay that
+      // may be covering the Turnstile iframe (one-shot, non-blocking).
+      if (otpFilled && !turnstileValid && elapsed > 5_000 && elapsed < 5_500) {
+        this.dismissCookieConsent(page, true).catch(() => { });
       }
 
       // Log progress every 2 seconds

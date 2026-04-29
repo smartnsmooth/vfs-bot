@@ -157,21 +157,19 @@ async function startFormServer(): Promise<void> {
   }, {
     collectLogin: true,
     onForceBook: () => {
-      const slotState = isSlotFoundByAnyInstance();
-      if (slotState.found) {
-        return { ok: false, error: "Booking already in progress — a slot was found and instances are booking." };
-      }
       const stoppedIds = new Set(readRoleAssignments()?.stoppedIds ?? []);
       const eligible = instances.filter((i) => i.process && !i.process.killed && !stoppedIds.has(i.id));
       if (eligible.length === 0) {
         return { ok: false, error: "No active instances. All may be stopped or not yet started." };
       }
+      // Clear previous slot state so all bots start fresh (attack mode: every click re-triggers).
+      clearSlotState();
       let queued = 0;
       for (const inst of eligible) {
         inst.process!.send({ type: "force-book", instanceId: inst.id });
         queued++;
       }
-      logger.info({ queued, skippedStopped: stoppedIds.size }, "[ForceBook] Sent force-book IPC to active instances");
+      logger.info({ queued, skippedStopped: stoppedIds.size }, "[ForceBook] Sent force-book IPC to active instances (attack mode)");
       return { ok: true, queued };
     },
   });
