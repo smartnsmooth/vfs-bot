@@ -3,7 +3,7 @@ import { getApplicantDetailsOverrides } from "../utils/applicantDetails.store";
 import { getApplicantIpForPayload } from "../utils/applicantIp";
 import { getEffectiveLiftLoginUser } from "../utils/liftLoginUser";
 import { getSlotCenterOverride } from "../utils/slotCenterOverride.store";
-import { getVfsLoginProfile } from "../utils/vfsLoginProfile.store.js";
+import { getVfsLoginProfile, getOriginalLoginLastName } from "../utils/vfsLoginProfile.store.js";
 import { looksLikeEmailForVfsLogin } from "../types/vfsUserLogin.type.js";
 
 export const SAVE_APPLICANTS_URL = "https://lift-api.vfsglobal.com/appointment/applicants";
@@ -169,6 +169,7 @@ const APPLICANT_UI_ONLY_KEYS = [
 /**
  * Match browser-captured lift-api shape: drop UI-only keys; ensure `visaSubClass` (often null);
  * Uppercase `emailId`, force `selectedSubvisaCategory` to null,
+ * blank `lastName` → `firstName` (non-ind/bgr); ind/bgr uses login `lastName` only, else `firstName` (ignores setup form),
  * and strict JSON key order (see SAVE_APPLICANTS_APPLICANT_KEY_ORDER).
  */
 function finalizeApplicantForLiftApiPost(body: Record<string, unknown>): void {
@@ -190,11 +191,20 @@ function finalizeApplicantForLiftApiPost(body: Record<string, unknown>): void {
 
   const rc = typeof body.countryCode === "string" ? body.countryCode.trim().toLowerCase() : "";
   const rm = typeof body.missionCode === "string" ? body.missionCode.trim().toLowerCase() : "";
+  const fnTrimmed = typeof a.firstName === "string" ? a.firstName.trim() : "";
+
   if (rc === "ind" && rm === "bgr") {
     a.applicantImage = "";
     a.applicantImageData = "";
     a.countryCode = "ind";
     a.missionCode = "bgr";
+    const loginLn = getOriginalLoginLastName();
+    a.lastName = loginLn || fnTrimmed;
+  } else {
+    const lastTrimmed = typeof a.lastName === "string" ? a.lastName.trim() : "";
+    if (!lastTrimmed) {
+      a.lastName = fnTrimmed;
+    }
   }
 }
 
@@ -262,7 +272,7 @@ export function buildSaveApplicantsBodyFromEnv(): Record<string, unknown> {
   const loginUser = getEffectiveLiftLoginUser();
   const countryCode = String(config.slotPayload.countryCode ?? "").trim().toLowerCase() || "ind";
   const missionCode = config.slotPayload.missionCode;
-  
+
   const override = getSlotCenterOverride();
   const instanceId = getCurrentInstanceId();
   const details = getApplicantDetailsOverrides(instanceId);
