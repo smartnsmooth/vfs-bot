@@ -9,7 +9,7 @@ import { TelegramService } from "./services/telegram.service";
 import {
   killChromeTreeByCdpPortRangeSync,
 } from "./utils/killChromeByCdpPort";
-import { isSlotFoundByAnyInstance, clearSlotState } from "./utils/slotState";
+import { clearSlotState } from "./utils/slotState";
 import { readRoleAssignments, clearRoleAssignments, clearActivationSignal } from "./utils/sentinelState";
 
 /** How many bot instances are currently running. Set by ensureInstances(). */
@@ -157,19 +157,24 @@ async function startFormServer(): Promise<void> {
   }, {
     collectLogin: true,
     onForceBook: () => {
-      const stoppedIds = new Set(readRoleAssignments()?.stoppedIds ?? []);
-      const eligible = instances.filter((i) => i.process && !i.process.killed && !stoppedIds.has(i.id));
+      const roles = readRoleAssignments();
+      const stoppedIds = new Set(roles?.stoppedIds ?? []);
+
+      const eligible = instances.filter((i) => {
+        if (!i.process || i.process.killed || stoppedIds.has(i.id)) return false;
+        return true;
+      });
+
       if (eligible.length === 0) {
         return { ok: false, error: "No active instances. All may be stopped or not yet started." };
       }
-      // Clear previous slot state so all bots start fresh (attack mode: every click re-triggers).
       clearSlotState();
       let queued = 0;
       for (const inst of eligible) {
         inst.process!.send({ type: "force-book", instanceId: inst.id });
         queued++;
       }
-      logger.info({ queued, skippedStopped: stoppedIds.size }, "[ForceBook] Sent force-book IPC to active instances (attack mode)");
+      logger.info({ queued, skippedStopped: stoppedIds.size }, "[ForceBook] Sent force-book IPC to ALL active instances — starting polling");
       return { ok: true, queued };
     },
   });

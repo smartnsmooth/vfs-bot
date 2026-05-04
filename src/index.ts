@@ -1926,8 +1926,8 @@ async function start(): Promise<void> {
       process.on("message", (msg: any) => {
         if (msg?.instanceId !== myInstanceId) return;
 
-        // force-book: attack mode — every click skips slot checking and goes straight
-        // to the booking chain (Applicants API → Calendar → Timeslot → Fees → Schedule).
+        // force-book: all instances start polling. When a slot is found the normal
+        // booking flow kicks in (slot discovery → booking chain).
         if (msg?.type === "force-book") {
           if (instanceStopped) {
             logger.info({ instanceId: myInstanceId }, "[ForceBook] Ignored — instance is stopped (login failed)");
@@ -1937,40 +1937,56 @@ async function start(): Promise<void> {
             logger.info({ instanceId: myInstanceId }, "[ForceBook] Ignored — already on payment page");
             return;
           }
-          // Abort any in-progress polling/standby so the new attack cycle can start.
+          // Abort any in-progress polling/standby so the new poll cycle can start.
           instanceBookingActive = false;
           clearSlotState();
           clearSlotCenterOverride();
           clearSlotDate();
-          requestPollingAbort("force-book-attack", myInstanceId);
-          logger.info({ instanceId: myInstanceId }, "[ForceBook] Attack mode — clearing state and starting booking chain directly (skip slot check)");
-          // Queue the booking chain so it runs sequentially after the current cycle exits.
+          requestPollingAbort("force-book-poll", myInstanceId);
+          logger.info({ instanceId: myInstanceId }, "[ForceBook] All-instance polling mode — clearing state and starting poll loop");
           ipcChain = ipcChain.then(async () => {
             try {
-              instanceBookingActive = true;
-              try {
-                const bookingCompleted = await runBookingChainWithRetry(myInstanceId);
-                instanceBookingActive = false;
-                if (bookingCompleted) {
-                  instanceOnPaymentPage = true;
-                  logger.info({ instanceId: myInstanceId }, "[ForceBook] Booking complete — on payment page");
-                } else {
-                  logger.info({ instanceId: myInstanceId }, "[ForceBook] Booking chain superseded/aborted — not marking payment page");
+              await browser.preparePollingAfterLogin({ skipDashboardNavigate: true });
+
+              const pollReloginInterval = config.pollReloginInterval;
+              const onPollRelogin =
+                pollReloginInterval > 0 ? () => performPollStyleRelogin(myInstanceId, "force-book-poll") : undefined;
+
+              const slotFound = await runPollLoop(myInstanceId, {
+                reloginAfter: pollReloginInterval > 0 ? pollReloginInterval : undefined,
+                onRelogin: onPollRelogin,
+              });
+
+              if (slotFound) {
+                const slotStateSnapshot = isSlotFoundByAnyInstance();
+                instanceBookingActive = true;
+                logger.info({ instanceId: myInstanceId }, "[ForceBook] Slot found during polling — starting booking chain");
+                try {
+                  const bookingCompleted = await runBookingChainWithRetry(myInstanceId, slotStateSnapshot);
+                  instanceBookingActive = false;
+                  if (bookingCompleted) {
+                    instanceOnPaymentPage = true;
+                    logger.info({ instanceId: myInstanceId }, "[ForceBook] Booking complete — on payment page");
+                  } else {
+                    logger.info({ instanceId: myInstanceId }, "[ForceBook] Booking chain superseded/aborted — not marking payment page");
+                  }
+                } catch (err) {
+                  instanceBookingActive = false;
+                  logger.error({ err, instanceId: myInstanceId }, "[ForceBook] Booking chain failed");
+                  await telegram.alert("error", `Bot ${myInstanceId} force-book booking failed: ${err instanceof Error ? err.message : String(err)}`).catch(() => { });
+                  clearSlotState();
+                  clearSlotCenterOverride();
+                  clearSlotDate();
                 }
-              } catch (err) {
-                instanceBookingActive = false;
-                logger.error({ err, instanceId: myInstanceId }, "[ForceBook] Booking chain failed");
-                await telegram.alert("error", `Bot ${myInstanceId} force-book failed: ${err instanceof Error ? err.message : String(err)}`).catch(() => { });
-                clearSlotState();
-                clearSlotCenterOverride();
-                clearSlotDate();
+              } else {
+                logger.info({ instanceId: myInstanceId }, "[ForceBook] No slot found during polling");
               }
             } catch (err) {
-              logger.error({ err, instanceId: myInstanceId }, "[ForceBook] Attack cycle failed");
-              await telegram.alert("error", `Bot ${myInstanceId} force-book cycle error: ${err instanceof Error ? err.message : String(err)}`).catch(() => { });
+              logger.error({ err, instanceId: myInstanceId }, "[ForceBook] Poll cycle failed");
+              await telegram.alert("error", `Bot ${myInstanceId} force-book poll error: ${err instanceof Error ? err.message : String(err)}`).catch(() => { });
             }
           });
-          telegram.alert("info", `Bot ${myInstanceId} — attack mode: booking chain starting...`).catch(() => { });
+          telegram.alert("info", `Bot ${myInstanceId} — starting polling...`).catch(() => { });
           return;
         }
 
@@ -2016,36 +2032,52 @@ async function start(): Promise<void> {
       if (instanceOnPaymentPage) {
         return { ok: false, error: "Already on payment page." };
       }
-      // Attack mode: skip slot checking, go straight to booking chain.
       instanceBookingActive = false;
       clearSlotState();
       clearSlotCenterOverride();
       clearSlotDate();
-      requestPollingAbort("force-book-attack");
-      logger.info("[ForceBook] Attack mode — clearing state and starting booking chain directly (single-instance)");
+      requestPollingAbort("force-book-poll");
+      logger.info("[ForceBook] Starting polling (single-instance)");
       enqueueSubmitTask(async () => {
         try {
-          instanceBookingActive = true;
-          try {
-            const bookingCompleted = await runBookingChainWithRetry();
-            instanceBookingActive = false;
-            if (bookingCompleted) {
-              instanceOnPaymentPage = true;
-              logger.info("[ForceBook] Booking complete — on payment page");
-            } else {
-              logger.info("[ForceBook] Booking chain superseded/aborted — not marking payment page");
+          await browser.preparePollingAfterLogin({ skipDashboardNavigate: true });
+
+          const pollReloginInterval = config.pollReloginInterval;
+          const onPollRelogin =
+            pollReloginInterval > 0 ? () => performPollStyleRelogin(undefined, "force-book-poll") : undefined;
+
+          const slotFound = await runPollLoop(undefined, {
+            reloginAfter: pollReloginInterval > 0 ? pollReloginInterval : undefined,
+            onRelogin: onPollRelogin,
+          });
+
+          if (slotFound) {
+            const slotStateSnapshot = isSlotFoundByAnyInstance();
+            instanceBookingActive = true;
+            logger.info("[ForceBook] Slot found during polling — starting booking chain");
+            try {
+              const bookingCompleted = await runBookingChainWithRetry(undefined, slotStateSnapshot);
+              instanceBookingActive = false;
+              if (bookingCompleted) {
+                instanceOnPaymentPage = true;
+                logger.info("[ForceBook] Booking complete — on payment page");
+              } else {
+                logger.info("[ForceBook] Booking chain superseded/aborted — not marking payment page");
+              }
+            } catch (err) {
+              instanceBookingActive = false;
+              logger.error({ err }, "[ForceBook] Booking chain failed");
+              await telegram.alert("error", `Force-book failed: ${err instanceof Error ? err.message : String(err)}`).catch(() => { });
+              clearSlotState();
+              clearSlotCenterOverride();
+              clearSlotDate();
             }
-          } catch (err) {
-            instanceBookingActive = false;
-            logger.error({ err }, "[ForceBook] Booking chain failed");
-            await telegram.alert("error", `Force-book failed: ${err instanceof Error ? err.message : String(err)}`).catch(() => { });
-            clearSlotState();
-            clearSlotCenterOverride();
-            clearSlotDate();
+          } else {
+            logger.info("[ForceBook] No slot found during polling");
           }
         } catch (err) {
-          logger.error({ err }, "[ForceBook] Attack cycle failed");
-          await telegram.alert("error", `Force-book cycle error: ${err instanceof Error ? err.message : String(err)}`).catch(() => { });
+          logger.error({ err }, "[ForceBook] Poll cycle failed");
+          await telegram.alert("error", `Force-book poll error: ${err instanceof Error ? err.message : String(err)}`).catch(() => { });
         }
       });
       return { ok: true, queued: 1 };
