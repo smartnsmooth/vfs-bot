@@ -2,7 +2,12 @@ import dotenv from "dotenv";
 dotenv.config({ override: true });
 import { spawn, ChildProcess } from "node:child_process";
 import { logger } from "./utils/logger";
-import { runApplicantFormWithSubmitHandler, closeApplicantFormServer } from "./ui/applicantDetailsFormServer";
+import {
+  runApplicantFormWithSubmitHandler,
+  closeApplicantFormServer,
+  type TestApplicantsApiBatchResult,
+  type TestApplicantsApiInstanceResult,
+} from "./ui/applicantDetailsFormServer";
 import { setSessionLoginCredentials } from "./utils/sessionLogin.store";
 import { setApplicantDetailsOverrides } from "./utils/applicantDetails.store";
 import { TelegramService } from "./services/telegram.service";
@@ -27,6 +32,9 @@ interface BotInstance {
 }
 
 const instances: BotInstance[] = [];
+
+/** Parent waits for `test-applicants-result` from a child (same `requestId`). */
+const pendingTestApplicants = new Map<string, (msg: Record<string, unknown>) => void>();
 
 function enqueueTaskForInstance(instanceId: number, task: () => Promise<void>): void {
   const inst = instances.find((i) => i.id === instanceId);
@@ -156,6 +164,46 @@ async function startFormServer(): Promise<void> {
     });
   }, {
     collectLogin: true,
+    onTestApplicantsApi: async (): Promise<TestApplicantsApiBatchResult> => {
+      const running = instances.filter((i) => i.process && !i.process.killed);
+      if (running.length === 0) {
+        return { results: [] };
+      }
+      const batchId = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+      const results = await Promise.all(
+        running.map(
+          (inst) =>
+            new Promise<TestApplicantsApiInstanceResult>((resolve) => {
+              const requestId = `${batchId}-i${inst.id}`;
+              const timer = setTimeout(() => {
+                if (pendingTestApplicants.delete(requestId)) {
+                  resolve({
+                    instanceId: inst.id,
+                    ok: false,
+                    error:
+                      "Timeout (90s) waiting for applicants API test — ensure this instance is logged in (visa.vfsglobal.com tab open).",
+                  });
+                }
+              }, 90_000);
+              pendingTestApplicants.set(requestId, (msg) => {
+                clearTimeout(timer);
+                pendingTestApplicants.delete(requestId);
+                if (msg.ok === true && typeof msg.status === "number" && typeof msg.bodyPreview === "string") {
+                  resolve({ instanceId: inst.id, ok: true, status: msg.status, bodyPreview: msg.bodyPreview });
+                } else {
+                  resolve({
+                    instanceId: inst.id,
+                    ok: false,
+                    error: typeof msg.error === "string" ? msg.error : "Test applicants API failed",
+                  });
+                }
+              });
+              inst.process!.send({ type: "test-applicants", instanceId: inst.id, requestId });
+            })
+        )
+      );
+      return { results };
+    },
     onForceBook: () => {
       const roles = readRoleAssignments();
       const stoppedIds = new Set(roles?.stoppedIds ?? []);
@@ -207,6 +255,15 @@ function spawnBotInstance(instanceId: number, totalInstances: number): ChildProc
   child.on("message", (msg: any) => {
     if (msg?.type === "bot-cycle-complete") {
       logger.info({ instanceId }, "Bot cycle completed for instance");
+      return;
+    }
+    if (msg?.type === "test-applicants-result" && typeof msg.requestId === "string") {
+      const cb = pendingTestApplicants.get(msg.requestId);
+      if (cb) {
+        pendingTestApplicants.delete(msg.requestId);
+        cb(msg as Record<string, unknown>);
+      }
+      return;
     }
   });
 

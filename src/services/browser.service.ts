@@ -55,7 +55,7 @@ import { setScheduleUrl } from "../utils/scheduleUrl.store";
 import { saveBookingConfirmationFile } from "../utils/bookingConfirmationFile";
 import { buildScheduleRedirectUrl } from "../utils/scheduleRedirectUrl";
 import { classifyVfsFirstTabUrl } from "../flows/vfsTabUrl";
-import { getApplicantFormServerOrigin } from "../ui/applicantDetailsFormServer";
+import { getApplicantFormServerOrigin, isApplicantFormServerUrl } from "../ui/applicantDetailsFormServer";
 import {
   fetchMailTmToken,
   isMailTmVerbose,
@@ -146,15 +146,31 @@ export class BrowserService {
   }
 
   /** Prefer an existing VFS portal tab over arbitrary `pages()[0]` (e.g. setup form or new tab). */
-  private findPreferredVfsPage(pages: Page[]): Page | null {
+  private findPreferredVfsPage(pages: Page[], opts?: { excludeApplicantSetup?: boolean }): Page | null {
+    const excludeSetup = opts?.excludeApplicantSetup === true;
     for (const p of pages) {
       try {
-        if (p.url().toLowerCase().includes("visa.vfsglobal.com")) return p;
+        const u = p.url();
+        if (excludeSetup && isApplicantFormServerUrl(u)) continue;
+        if (u.toLowerCase().includes("visa.vfsglobal.com")) return p;
       } catch {
         continue;
       }
     }
     return null;
+  }
+
+  /** All tabs across CDP contexts (default context alone is not always enough). */
+  private collectAllPagesFromBrowser(browser: Browser): Page[] {
+    const out: Page[] = [];
+    for (const ctx of browser.contexts()) {
+      try {
+        out.push(...ctx.pages());
+      } catch {
+        /* ignore */
+      }
+    }
+    return out;
   }
 
   /**
@@ -225,8 +241,8 @@ export class BrowserService {
 
   async getFirstTabUrl(): Promise<string> {
     const browser = await this.ensureBrowser();
-    const pages = browser.contexts()[0]?.pages() ?? [];
-    const vfsPage = this.findPreferredVfsPage(pages);
+    const pages = this.collectAllPagesFromBrowser(browser);
+    const vfsPage = this.findPreferredVfsPage(pages, { excludeApplicantSetup: true });
     if (vfsPage) {
       try {
         await vfsPage.bringToFront().catch(() => { });
@@ -251,8 +267,8 @@ export class BrowserService {
   async detectWafJsonBlock(): Promise<boolean> {
     try {
       const browser = await this.ensureBrowser();
-      const pages = browser.contexts()[0]?.pages() ?? [];
-      const page = this.findPreferredVfsPage(pages) ?? pages[0];
+      const pages = this.collectAllPagesFromBrowser(browser);
+      const page = this.findPreferredVfsPage(pages, { excludeApplicantSetup: true }) ?? pages[0];
       if (!page) return false;
       const bodyText = await page.locator("body").innerText({ timeout: 5_000 });
       const trimmed = bodyText.trim();
@@ -276,22 +292,22 @@ export class BrowserService {
   async tryClickLocalApplicantSetupFormSubmit(): Promise<boolean> {
     const origin = getApplicantFormServerOrigin();
     const browser = await this.ensureBrowser();
-    const ctx = browser.contexts()[0];
-    if (!ctx) return false;
-    for (const page of ctx.pages()) {
-      let u = "";
-      try {
-        u = page.url();
-      } catch {
-        continue;
-      }
-      if (!u.startsWith(origin)) continue;
-      try {
-        await page.locator('form#f button[type="submit"]').click({ timeout: 5000 });
-        await page.waitForTimeout(1500);
-        return true;
-      } catch {
-        /* try next page */
+    for (const ctx of browser.contexts()) {
+      for (const page of ctx.pages()) {
+        let u = "";
+        try {
+          u = page.url();
+        } catch {
+          continue;
+        }
+        if (!u.startsWith(origin)) continue;
+        try {
+          await page.locator('form#f button[type="submit"]').click({ timeout: 5000 });
+          await page.waitForTimeout(1500);
+          return true;
+        } catch {
+          /* try next page */
+        }
       }
     }
     return false;
@@ -309,8 +325,17 @@ export class BrowserService {
   private async getFirstPageForIpLookup(): Promise<Page | null> {
     try {
       const browser = await this.ensureBrowser();
-      const pages = browser.contexts()[0]?.pages() ?? [];
-      return this.findPreferredVfsPage(pages) ?? pages[0] ?? null;
+      const pages = this.collectAllPagesFromBrowser(browser);
+      const vfs = this.findPreferredVfsPage(pages, { excludeApplicantSetup: true });
+      if (vfs) return vfs;
+      const nonSetup = pages.find((p) => {
+        try {
+          return !isApplicantFormServerUrl(p.url());
+        } catch {
+          return false;
+        }
+      });
+      return nonSetup ?? pages[0] ?? null;
     } catch {
       return null;
     }
@@ -320,10 +345,17 @@ export class BrowserService {
     const browser = await this.ensureBrowser();
     const context = browser.contexts()[0];
     if (!context) throw new Error("No browser context");
-    const pages = context.pages();
-    let page = this.findPreferredVfsPage(pages);
+    const pages = this.collectAllPagesFromBrowser(browser);
+    let page = this.findPreferredVfsPage(pages, { excludeApplicantSetup: true });
     if (!page) {
-      page = pages[0] ?? (await context.newPage());
+      page =
+        pages.find((p) => {
+          try {
+            return !isApplicantFormServerUrl(p.url());
+          } catch {
+            return false;
+          }
+        }) ?? pages[0] ?? (await context.newPage());
     }
     await page.bringToFront().catch(() => { });
     logger.info("Navigating to login page...");
@@ -373,8 +405,17 @@ export class BrowserService {
     const browser = await this.ensureBrowser();
     const context = browser.contexts()[0];
     if (!context) throw new Error("No browser context");
-    const pages = context.pages();
-    const page = this.findPreferredVfsPage(pages) ?? pages[0];
+    const pages = this.collectAllPagesFromBrowser(browser);
+    const page =
+      this.findPreferredVfsPage(pages, { excludeApplicantSetup: true }) ??
+      pages.find((p) => {
+        try {
+          return !isApplicantFormServerUrl(p.url());
+        } catch {
+          return false;
+        }
+      }) ??
+      pages[0];
     if (!page) {
       await this.openLoginInFirstTab();
       return;
@@ -409,8 +450,18 @@ export class BrowserService {
     const browser = await this.ensureBrowser();
     const context = browser.contexts()[0];
     if (!context) throw new Error("No browser context");
-    const pages = context.pages();
-    const page = this.findPreferredVfsPage(pages) ?? pages[0];
+    const pages = this.collectAllPagesFromBrowser(browser);
+    let page = this.findPreferredVfsPage(pages, { excludeApplicantSetup: true });
+    if (!page) {
+      page =
+        pages.find((p) => {
+          try {
+            return !isApplicantFormServerUrl(p.url());
+          } catch {
+            return false;
+          }
+        }) ?? pages[0] ?? null;
+    }
     if (!page) throw new Error("No tab. Open Chrome with at least one tab, or open the VFS login page.");
     await page.bringToFront().catch(() => { });
 
@@ -745,6 +796,26 @@ export class BrowserService {
   }
 
   /**
+   * POST `appointment/applicants` from the current logged-in VFS tab (setup-form test).
+   * Does not skip when a URN is already stored; does not treat non-2xx as thrown — check `status`.
+   *
+   * Intentionally does **not** call {@link waitForLiftClientSourceIfNeeded}: that waits indefinitely until the
+   * bot sniffs a lift-api response, which often never happens after a manual-only login — so the test would hang
+   * with no request in DevTools. {@link postLiftJsonFromPage} already reads `clientsource` from the tab's storage
+   * when nothing was captured in Node.
+   */
+  async testSaveApplicantsViaLiftApi(): Promise<{ status: number; body: string }> {
+    const page = await this.getVfsPage();
+    await page.waitForTimeout(500);
+    await ensureApplicantIpResolved(page);
+    const body = buildSaveApplicantsBody();
+    logger.info({ url: SAVE_APPLICANTS_URL }, "[Test] POST appointment/applicants");
+    const res = await this.postLiftJsonFromPage(page, SAVE_APPLICANTS_URL, body);
+    logger.info({ status: res.status, responseBody: res.body.slice(0, 1500) }, "[Test] Applicants API response");
+    return res;
+  }
+
+  /**
    * POST /appointment/fees (call from index after save applicants).
    * Uses stored URN from {@link setApplicationUrn} and the same VFS tab as lift-api.
    */
@@ -823,18 +894,32 @@ export class BrowserService {
 
   private async getVfsPage(): Promise<Page> {
     const browser = await this.ensureBrowser();
-    const pages = browser.contexts()[0]?.pages() ?? [];
-
-    const page = pages.find((p) => {
-      try {
-        return p.url().includes("visa.vfsglobal.com");
-      } catch {
-        return false;
-      }
-    });
-
-    if (!page) throw new Error("No VFS tab open. Keep a visa.vfsglobal.com tab open in Chrome.");
+    const pages = this.collectAllPagesFromBrowser(browser);
+    const page = this.findPreferredVfsPage(pages, { excludeApplicantSetup: true });
+    if (!page) {
+      const cdp = config.browserCdpUrl;
+      const sample = [
+        ...new Set(
+          pages.map((p) => {
+            try {
+              return p.url();
+            } catch {
+              return "";
+            }
+          })
+        ),
+      ]
+        .filter(Boolean)
+        .slice(0, 12);
+      throw new Error(
+        `No visa.vfsglobal.com tab found in the instance Chrome (CDP at ${cdp}). ` +
+          `Click "Submit & Run" first to start the bot, wait for VFS login to complete, then retry. ` +
+          `Tab URLs seen: ${sample.join(" | ") || "(none)"}`
+      );
+    }
     this.attachLiftApiClientSourceSniffer(page.context());
+    await page.bringToFront().catch(() => { });
+    logger.info({ cdpUrl: config.browserCdpUrl, tabUrl: page.url() }, "[lift-api] Using VFS tab for POST");
     return page;
   }
 

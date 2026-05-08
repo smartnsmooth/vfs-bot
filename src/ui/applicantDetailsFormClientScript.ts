@@ -42,7 +42,10 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
   }
 
   const countryMissionMap = {
-    ind: [{label: "Bulgaria", value: "bgr"}],
+    ind: [
+      { label: "Bulgaria", value: "bgr" },
+      { label: "Latvia", value: "lva" },
+    ],
     egy: [{label: "Portugal", value: "prt"}],
     sau: [{label: "Portugal", value: "prt"}],
   };
@@ -125,6 +128,16 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
         { value: "Busi", label: "Business Visa" },
       ]},
     ],
+    "ind-lva": [
+      {
+        value: "LVAIND",
+        label: "Latvia Visa Application Centre – India",
+        categories: [
+          { value: "EmployL", label: "Employment" },
+          { value: "BUS", label: "Business" },
+        ],
+      },
+    ],
     "egy-prt": [
       { value: "POAL", label: "Portugal Visa Application Center-Alexandria", categories: [
         { value: "JB", label: "Job seeker" },
@@ -160,6 +173,12 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     if (el) el.style.display = isManualApplicantRoute() ? "" : "none";
   }
 
+  function updateIndLvaExtraFields() {
+    var wrap = document.getElementById("indLvaExtraFields");
+    if (!wrap) return;
+    wrap.style.display = getRouteKey() === "ind-lva" ? "" : "none";
+  }
+
   function updateMissionOptions() {
     const countryEl = document.getElementById("countryCode");
     const missionEl = document.getElementById("missionCode");
@@ -177,6 +196,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     }
     updateCenterOptions();
     updateManualApplicantFields();
+    updateIndLvaExtraFields();
   }
 
   function populateCenterSelect(selectId, placeholderText, centers, prevValue) {
@@ -295,6 +315,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
         "selectedSubvisaCategory",
         "vacCode2",
         "selectedSubvisaCategory2",
+        "helloVerifyNumber",
+        "juridictionCode",
       ].concat(manualApplicantFieldIds);
       for (let fi = 0; fi < fieldsToClear.length; fi++) {
         const el = document.getElementById(fieldsToClear[fi]);
@@ -323,6 +345,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       "selectedSubvisaCategory",
       "vacCode2",
       "selectedSubvisaCategory2",
+      "helloVerifyNumber",
+      "juridictionCode",
     ].concat(manualApplicantFieldIds);
     for (let ai = 0; ai < allFields.length; ai++) {
       const el = document.getElementById(allFields[ai]);
@@ -370,6 +394,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       var sc2El = document.getElementById("selectedSubvisaCategory2");
       if (sc2El && inst.details.selectedSubvisaCategory2) sc2El.value = String(inst.details.selectedSubvisaCategory2);
     }
+    updateIndLvaExtraFields();
     applyInstanceScheduleRangeToForm(inst.details || {});
 
     // Global settings (instance 0): postLoginPollDelay, sentinelMode, sentinelCount.
@@ -423,6 +448,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       sentinelMode: document.getElementById("sentinelMode") ? document.getElementById("sentinelMode").checked : false,
       sentinelCount: parseInt(String(fd.get("sentinelCount") || "4"), 10) || 4,
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
+      helloVerifyNumber: String(fd.get("helloVerifyNumber") ?? "").trim() || undefined,
+      juridictionCode: String(fd.get("juridictionCode") ?? "").trim() || undefined,
     };
     if (!Number.isFinite(body.postLoginPollDelay) || body.postLoginPollDelay < 0) body.postLoginPollDelay = 30;
     if (collectLogin) {
@@ -486,6 +513,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       if (missionCodeSelect) {
         missionCodeSelect.addEventListener("change", function () {
           updateCenterOptions();
+          updateIndLvaExtraFields();
           scheduleAutoSave();
         });
       }
@@ -598,6 +626,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       sentinelMode: document.getElementById("sentinelMode") ? document.getElementById("sentinelMode").checked : false,
       sentinelCount: parseInt(String(fd.get("sentinelCount") || "4"), 10) || 4,
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
+      helloVerifyNumber: String(fd.get("helloVerifyNumber") ?? "").trim() || undefined,
+      juridictionCode: String(fd.get("juridictionCode") ?? "").trim() || undefined,
     };
     if (!Number.isFinite(body.postLoginPollDelay) || body.postLoginPollDelay < 0) body.postLoginPollDelay = 30;
     if (collectLogin) {
@@ -651,6 +681,68 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       btn.textContent = "Book Slot";
     }
   });
+
+  var testApplicantsBtn = document.getElementById("testApplicantsApiBtn");
+  if (testApplicantsBtn) {
+    testApplicantsBtn.addEventListener("click", async function () {
+      const msg = document.getElementById("msg");
+      const btn = document.getElementById("testApplicantsApiBtn");
+      msg.textContent = "";
+      btn.disabled = true;
+      var prevLabel = btn.textContent;
+      btn.textContent = "Saving…";
+      try {
+        await saveFormData(false);
+        btn.textContent = "Calling API (all instances)…";
+        const r = await fetch("/api/test-applicants", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: "{}",
+        });
+        const j = await r.json();
+        if (!r.ok) {
+          msg.className = "err";
+          msg.textContent = j.error || "Test applicants API failed";
+          return;
+        }
+        const rows = Array.isArray(j.results) ? j.results : [];
+        if (rows.length === 0) {
+          msg.className = "err";
+          msg.textContent = "No running instances. Click Submit & Run first to spawn bots, then try again.";
+          return;
+        }
+        var lines = [];
+        var anyBad = false;
+        for (var i = 0; i < rows.length; i++) {
+          var row = rows[i];
+          var id = row.instanceId;
+          if (row.ok === true && typeof row.status === "number") {
+            var prev = typeof row.bodyPreview === "string" ? row.bodyPreview : "";
+            if (row.status < 200 || row.status >= 300) anyBad = true;
+            lines.push(
+              "Instance " +
+                id +
+                ": HTTP " +
+                row.status +
+                (prev ? " — " + prev.slice(0, 500) : "") +
+                " (see that instance’s Chrome / Network tab)."
+            );
+          } else {
+            anyBad = true;
+            lines.push("Instance " + id + ": " + (row.error || "failed"));
+          }
+        }
+        msg.className = anyBad ? "err" : "ok";
+        msg.textContent = lines.join("\\n");
+      } catch (err) {
+        msg.className = "err";
+        msg.textContent = String(err);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = prevLabel;
+      }
+    });
+  }
 })();
 </script>`;
 }

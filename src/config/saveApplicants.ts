@@ -206,6 +206,17 @@ function finalizeApplicantForLiftApiPost(body: Record<string, unknown>): void {
       a.lastName = fnTrimmed;
     }
   }
+
+  if (rc === "ind" && rm === "lva") {
+    const jc = typeof a.juridictionCode === "string" ? a.juridictionCode.trim() : "";
+    if (jc) {
+      body.juridictionCode = jc;
+    }
+    const hv = typeof a.helloVerifyNumber === "string" ? a.helloVerifyNumber.replace(/\D/g, "") : "";
+    if (hv.length === 6) {
+      a.helloVerifyNumber = hv;
+    }
+  }
 }
 
 /** Override applicant + root `loginUser` with 1:1 fields from last `POST /user/login` response (see vfsLoginProfile.store). */

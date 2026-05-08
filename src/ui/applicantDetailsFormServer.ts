@@ -36,6 +36,17 @@ export function getApplicantFormServerOrigin(): string {
   return `http://127.0.0.1:${boundPort}`;
 }
 
+/** True when `pageUrl` is the local setup form tab (never use for lift-api `fetch`). */
+export function isApplicantFormServerUrl(pageUrl: string): boolean {
+  try {
+    const u = new URL(pageUrl);
+    const fo = new URL(getApplicantFormServerOrigin());
+    return u.protocol === fo.protocol && u.hostname === fo.hostname && u.port === fo.port;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * JSON body matching the browser form submit (for programmatic POST to `/api/submit`).
  * Merges stored overrides, then defaults from env; adds VFS login when `collectLogin`.
@@ -57,6 +68,14 @@ export function buildApplicantFormSubmitJsonForBot(collectLogin: boolean): Recor
   const nat = typeof base.nationalityCode === "string" ? base.nationalityCode.trim() : "";
   if (typeof exp !== "string" || !exp.trim() || !vac || !cat || !nat) {
     return null;
+  }
+  const mission = typeof base.missionCode === "string" ? base.missionCode.trim().toLowerCase() : "";
+  if (mission === "lva") {
+    const hvRaw = typeof base.helloVerifyNumber === "string" ? base.helloVerifyNumber.replace(/\D/g, "") : "";
+    const jur = typeof base.juridictionCode === "string" ? base.juridictionCode.trim() : "";
+    if (hvRaw.length !== 6 || !jur) {
+      return null;
+    }
   }
   if (collectLogin) {
     const s = getSessionLoginCredentials();
@@ -171,6 +190,8 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
     "selectedSubvisaCategory2",
     "countryCode",
     "missionCode",
+    "helloVerifyNumber",
+    "juridictionCode",
   ] as const;
   for (const k of keys) {
     const v = str(k);
@@ -215,6 +236,11 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
     const v = parseInt(j.sentinelCount, 10);
     if (Number.isFinite(v) && v >= 1) out.sentinelCount = v;
   }
+  if (typeof out.helloVerifyNumber === "string") {
+    const digits = out.helloVerifyNumber.replace(/\D/g, "").slice(0, 6);
+    if (digits.length > 0) out.helloVerifyNumber = digits;
+    else delete out.helloVerifyNumber;
+  }
   return out;
 }
 
@@ -242,6 +268,7 @@ function buildPageHtml(collectLogin: boolean): string {
     <label for="missionCode" style="margin-top:0.75rem">To country</label>
     <select id="missionCode" name="missionCode">
       <option value="bgr">Bulgaria</option>
+      <option value="lva">Latvia</option>
       <option value="prt">Portugal</option>
     </select>
     <label for="userPollInterval" style="margin-top:0.75rem">Poll interval (seconds)</label>
@@ -342,9 +369,10 @@ function buildPageHtml(collectLogin: boolean): string {
     }
     .picker-row { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; margin-top: 0.25rem; }
     .picker-row input[type="date"] { margin-top: 0; max-width: 11rem; flex: 1 1 auto; min-width: 0; }
-    .form-actions { margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid #38444d; display: flex; gap: 0.75rem; align-items: center; }
-    button[type="submit"] { margin-top: 0; flex: 1; }
-    #forceBookBtn { margin-top: 0; flex: 1; background: #f5a623; color: #15202b; font-weight: 700; }
+    .form-actions { margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid #38444d; display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; }
+    button[type="submit"] { margin-top: 0; flex: 1; min-width: 8rem; }
+    #forceBookBtn { margin-top: 0; flex: 1; min-width: 8rem; background: #f5a623; color: #15202b; font-weight: 700; }
+    #testApplicantsApiBtn { display: none; }
     button { width: 100%; padding: 0.65rem; border: none; border-radius: 8px;
       background: #1d9bf0; color: #fff; font-weight: 600; cursor: pointer; font-size: 1rem; }
     button:hover { filter: brightness(1.08); }
@@ -644,6 +672,27 @@ function buildPageHtml(collectLogin: boolean): string {
           <option value="">-- Select Category --</option>
         </select>
 
+        <div id="indLvaExtraFields" style="display:none;margin-top:0.75rem">
+          <label for="helloVerifyNumber">Hello Verify Number (6 digits)</label>
+          <input type="text" id="helloVerifyNumber" name="helloVerifyNumber" inputmode="numeric" maxlength="6" pattern="[0-9]{6}" placeholder="000000" autocomplete="off" />
+          <label for="juridictionCode">Jurisdiction</label>
+          <select id="juridictionCode" name="juridictionCode">
+            <option value="">-- Select Jurisdiction --</option>
+            <option value="AHM">Latvia Visa Application Center - Ahmedabad</option>
+            <option value="BEN">Latvia Visa Application Center - Bengaluru</option>
+            <option value="CHA">Latvia Visa Application Center - Chandigarh</option>
+            <option value="CHE">Latvia Visa Application Center - Chennai</option>
+            <option value="KOC">Latvia Visa Application Center - Cochin</option>
+            <option value="GOA">Latvia Visa Application Center - Goa</option>
+            <option value="HYD">Latvia Visa Application Center - Hyderabad</option>
+            <option value="JAL">Latvia Visa Application Center - Jalandhar</option>
+            <option value="KOL">Latvia Visa Application Center - Kolkata</option>
+            <option value="MUM">Latvia Visa Application center - Mumbai</option>
+            <option value="DHI">Latvia Visa Application Center - New Delhi</option>
+            <option value="PUN">Latvia Visa Application Center - Pune</option>
+          </select>
+        </div>
+
         <hr class="section-rule" />
         <h3 class="section-title">Center 2 (optional)</h3>
         <p class="hint" style="margin-bottom:1rem">Leave empty to poll only Center 1</p>
@@ -661,6 +710,7 @@ function buildPageHtml(collectLogin: boolean): string {
     <div class="form-actions">
       <button type="submit" id="submitBtn">Submit &amp; Run</button>
       <button type="button" id="forceBookBtn">Book Slot</button>
+      <button type="button" id="testApplicantsApiBtn">Test applicants API</button>
     </div>
   </form>
   <p id="msg"></p>
@@ -668,6 +718,16 @@ function buildPageHtml(collectLogin: boolean): string {
 </body>
 </html>`;
 }
+
+/** One bot instance’s outcome for POST `appointment/applicants` (test button). */
+export type TestApplicantsApiInstanceResult =
+  | { instanceId: number; ok: true; status: number; bodyPreview: string }
+  | { instanceId: number; ok: false; error: string };
+
+/** Response: every running instance runs the lift-api applicants POST (cluster: one Chrome each). */
+export type TestApplicantsApiBatchResult = {
+  results: TestApplicantsApiInstanceResult[];
+};
 
 export type ApplicantFormOptions = {
   /**
@@ -677,6 +737,11 @@ export type ApplicantFormOptions = {
   collectLogin?: boolean;
   /** Called when user clicks "Book Slot" — triggers force-booking on all instances. */
   onForceBook?: () => { ok: boolean; error?: string; queued?: number };
+  /**
+   * Called when user clicks "Test applicants API" — each running instance POSTs lift-api applicants
+   * from its own logged-in Chrome tab (cluster); single-process returns one result row.
+   */
+  onTestApplicantsApi?: () => Promise<TestApplicantsApiBatchResult>;
 };
 
 export type FormSubmitInfo = { firstSubmit: boolean;[key: string]: unknown };
@@ -738,6 +803,7 @@ export function runApplicantFormWithSubmitHandler(
   options?: ApplicantFormOptions
 ): Promise<never> {
   const collectLogin = options?.collectLogin !== false;
+  const onTestApplicantsApi = options?.onTestApplicantsApi;
 
   const preferredPort = APPLICANT_UI_PORT;
   const host = "127.0.0.1";
@@ -945,6 +1011,23 @@ export function runApplicantFormWithSubmitHandler(
           }
           const result = options.onForceBook();
           json(res, result.ok ? 200 : 409, result);
+          return;
+        }
+
+        if (req.method === "POST" && path === "/api/test-applicants") {
+          if (!onTestApplicantsApi) {
+            json(res, 400, { ok: false, error: "Test applicants API not available in this mode." });
+            return;
+          }
+          try {
+            const result = await onTestApplicantsApi();
+            json(res, 200, result);
+          } catch (e) {
+            json(res, 500, {
+              results: [],
+              error: e instanceof Error ? e.message : String(e),
+            });
+          }
           return;
         }
 

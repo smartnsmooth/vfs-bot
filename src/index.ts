@@ -1926,8 +1926,42 @@ async function start(): Promise<void> {
       process.on("message", (msg: any) => {
         if (msg?.instanceId !== myInstanceId) return;
 
-        // force-book: all instances start polling. When a slot is found the normal
-        // booking flow kicks in (slot discovery → booking chain).
+        if (msg?.type === "test-applicants") {
+          // Stop slot polling / standby immediately (same knobs as force-book), then run the test on the chain.
+          instanceBookingActive = false;
+          clearSlotState();
+          clearSlotCenterOverride();
+          clearSlotDate();
+          requestPollingAbort("test-applicants", myInstanceId);
+          logger.info({ instanceId: myInstanceId }, "[TestApplicants] Polling aborted — calling applicants API");
+          ipcChain = ipcChain.then(async () => {
+            syncInstanceStoresFromDisk();
+            setCurrentInstanceId(myInstanceId);
+            try {
+              const result = await browser.testSaveApplicantsViaLiftApi();
+              const preview =
+                result.body.length > 12_000 ? result.body.slice(0, 12_000) + "…" : result.body;
+              process.send?.({
+                type: "test-applicants-result",
+                requestId: msg.requestId,
+                instanceId: myInstanceId,
+                ok: true,
+                status: result.status,
+                bodyPreview: preview,
+              });
+            } catch (err) {
+              process.send?.({
+                type: "test-applicants-result",
+                requestId: msg.requestId,
+                instanceId: myInstanceId,
+                ok: false,
+                error: err instanceof Error ? err.message : String(err),
+              });
+            }
+          });
+          return;
+        }
+
         if (msg?.type === "force-book") {
           if (instanceStopped) {
             logger.info({ instanceId: myInstanceId }, "[ForceBook] Ignored — instance is stopped (login failed)");
@@ -2081,6 +2115,26 @@ async function start(): Promise<void> {
         }
       });
       return { ok: true, queued: 1 };
+    },
+    onTestApplicantsApi: async () => {
+      instanceBookingActive = false;
+      clearSlotState();
+      clearSlotCenterOverride();
+      clearSlotDate();
+      requestPollingAbort("test-applicants");
+      logger.info("[TestApplicants] Polling aborted — calling applicants API");
+      reloadApplicantDetailsFromDisk();
+      const instanceId = parseInt(process.env.BOT_INSTANCE_ID ?? "1", 10);
+      setCurrentInstanceId(instanceId);
+      try {
+        const res = await browser.testSaveApplicantsViaLiftApi();
+        const preview = res.body.length > 12_000 ? res.body.slice(0, 12_000) + "…" : res.body;
+        return { results: [{ instanceId, ok: true, status: res.status, bodyPreview: preview }] };
+      } catch (err) {
+        return {
+          results: [{ instanceId, ok: false, error: err instanceof Error ? err.message : String(err) }],
+        };
+      }
     },
   });
 }
