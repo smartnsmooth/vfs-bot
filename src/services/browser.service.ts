@@ -593,15 +593,31 @@ export class BrowserService {
             .catch(() => { });
         }
         const flat = flattenVfsLoginResponseForProfile(pwdJson);
-        const forStore = stripPasswordStepApplicantFieldsForProfileMerge(flat);
+        const cc = String(config.slotPayload.countryCode ?? "").trim().toLowerCase();
+        const mc = String(config.slotPayload.missionCode ?? "").trim().toLowerCase();
+        /** India–Latvia (and any portal with no OTP) never gets a 2nd `/user/login`; keep applicant fields from this response. */
+        const mergeApplicantFromPasswordStep =
+          pwdJson.enableOTPAuthentication === false || (cc === "ind" && mc === "lva");
+        let forStore: Record<string, unknown> | null;
+        if (mergeApplicantFromPasswordStep && flat) {
+          const o = { ...flat };
+          delete o.applicantList;
+          delete o.applicant;
+          forStore = o;
+        } else {
+          forStore = stripPasswordStepApplicantFieldsForProfileMerge(flat);
+        }
         if (forStore) mergeVfsLoginProfile(forStore);
         logger.info(
           {
             status: pwdStatus,
             loginUser: pwdJson.loginUser,
             isAuthenticated: pwdJson.isAuthenticated,
+            mergeApplicantFromPasswordStep,
           },
-          "[Login] Merged password-step /user/login (session flags only — applicant fields come from OTP step)"
+          mergeApplicantFromPasswordStep
+            ? "[Login] Merged password-step /user/login (full profile — no OTP step)"
+            : "[Login] Merged password-step /user/login (session flags only — applicant fields come from OTP step)"
         );
       }
     }

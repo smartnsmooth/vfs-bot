@@ -688,7 +688,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       const msg = document.getElementById("msg");
       const btn = document.getElementById("testApplicantsApiBtn");
       msg.textContent = "";
-      btn.disabled = true;
+      btn.disabled = false;
       var prevLabel = btn.textContent;
       btn.textContent = "Saving…";
       try {

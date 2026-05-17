@@ -69,7 +69,7 @@ const DEFAULT_POLL_INTERVAL_SEC = 60;
 /** Standby bots stay completely idle (no requests). After this interval the VFS session
  *  is assumed expired and the bot performs a full re-login cycle (close browser → clear
  *  caches → rotate IP → reopen browser → login). */
-const STANDBY_SESSION_EXPIRY_MS = 28 * 60 * 1000; // 28 minutes
+const STANDBY_SESSION_EXPIRY_MS = 25 * 60 * 1000; // 25 minutes
 
 /**
  * Read sentinel mode settings from setup UI (global overrides, instance 0).
@@ -1139,6 +1139,16 @@ async function performPollStyleRelogin(instanceId?: number, context?: string): P
 
 const MAX_FORBIDDEN_RETRIES = 3;
 
+function isOtpRelatedLoginFailure(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const msg = err.message.toLowerCase();
+  return (
+    msg.includes("otp") ||
+    msg.includes("mail.tm") ||
+    msg.includes("login did not complete")
+  );
+}
+
 /**
  * Open login page with 403 recovery: if the page returns 403 Forbidden, close browser,
  * clear cache/cookies, rotate IP, open a new browser and retry.
@@ -1165,26 +1175,48 @@ async function openLoginWithForbiddenRecovery(instanceId?: number): Promise<void
 }
 
 /**
- * Login with 403 recovery: if VFS returns 403 at any point during login, close browser,
- * clear cache/cookies, rotate IP, open new browser, and retry from login page open.
+ * Login with recovery for 403 Forbidden (max 3 retries) and OTP/mail.tm failures (retry forever).
+ * On OTP failure: close browser, clear cache/cookies/storage, rotate IP, open new browser, retry.
  */
 async function loginWithForbiddenRecovery(instanceId?: number): Promise<void> {
-  for (let attempt = 1; attempt <= MAX_FORBIDDEN_RETRIES; attempt++) {
+  let forbiddenAttempts = 0;
+  let otpAttempts = 0;
+
+  while (true) {
     try {
       await performVfsLoginFromStore(instanceId);
       return;
     } catch (err) {
       if (err instanceof VfsForbiddenError) {
-        logger.error({ instanceId, attempt, maxRetries: MAX_FORBIDDEN_RETRIES }, "403 Forbidden during login — restarting browser + rotating IP");
-        await telegram.alert("error", `Bot ${instanceId ?? "?"} got 403 during login (attempt ${attempt}/${MAX_FORBIDDEN_RETRIES}). Restarting browser + rotating IP...`).catch(() => { });
+        forbiddenAttempts++;
+        logger.error({ instanceId, forbiddenAttempts, maxRetries: MAX_FORBIDDEN_RETRIES }, "403 Forbidden during login — restarting browser + rotating IP");
+        await telegram.alert("error", `Bot ${instanceId ?? "?"} got 403 during login (attempt ${forbiddenAttempts}/${MAX_FORBIDDEN_RETRIES}). Restarting browser + rotating IP...`).catch(() => { });
         clearApplicantIpCache();
         await relaunchChromeAfterCredentialSwapLogout();
-        if (attempt === MAX_FORBIDDEN_RETRIES) {
+        if (forbiddenAttempts >= MAX_FORBIDDEN_RETRIES) {
           throw new Error(`Login still 403 after ${MAX_FORBIDDEN_RETRIES} browser restarts — giving up.`);
         }
         await browser.openLoginInFirstTab();
         continue;
       }
+
+      if (isOtpRelatedLoginFailure(err)) {
+        otpAttempts++;
+        const reason = err instanceof Error ? err.message : String(err);
+        logger.error(
+          { instanceId, otpAttempts, reason },
+          "[Login/OTP] OTP step failed — closing browser, clearing cache, rotating IP, retrying"
+        );
+        await telegram.alert(
+          "error",
+          `Bot ${instanceId ?? "?"} OTP/login failed (attempt ${otpAttempts}): ${reason}\nRestarting browser + rotating IP...`
+        ).catch(() => { });
+        clearApplicantIpCache();
+        await relaunchChromeAfterCredentialSwapLogout();
+        await browser.openLoginInFirstTab();
+        continue;
+      }
+
       throw err;
     }
   }

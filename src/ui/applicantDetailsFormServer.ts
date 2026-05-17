@@ -372,7 +372,7 @@ function buildPageHtml(collectLogin: boolean): string {
     .form-actions { margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid #38444d; display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; }
     button[type="submit"] { margin-top: 0; flex: 1; min-width: 8rem; }
     #forceBookBtn { margin-top: 0; flex: 1; min-width: 8rem; background: #f5a623; color: #15202b; font-weight: 700; }
-    #testApplicantsApiBtn { display: none; }
+    #testApplicantsApiBtn { display: block; }
     button { width: 100%; padding: 0.65rem; border: none; border-radius: 8px;
       background: #1d9bf0; color: #fff; font-weight: 600; cursor: pointer; font-size: 1rem; }
     button:hover { filter: brightness(1.08); }

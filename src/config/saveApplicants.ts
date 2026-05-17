@@ -168,7 +168,7 @@ const APPLICANT_UI_ONLY_KEYS = [
 
 /**
  * Match browser-captured lift-api shape: drop UI-only keys; ensure `visaSubClass` (often null);
- * Uppercase `emailId`, force `selectedSubvisaCategory` to null,
+ * Uppercase `emailId` (except India–Latvia), force `selectedSubvisaCategory` to null (empty string for India–Latvia),
  * blank `lastName` → `firstName` (non-ind/bgr); ind/bgr uses login `lastName` only, else `firstName` (ignores setup form),
  * and strict JSON key order (see SAVE_APPLICANTS_APPLICANT_KEY_ORDER).
  */
@@ -179,18 +179,38 @@ function finalizeApplicantForLiftApiPost(body: Record<string, unknown>): void {
   for (const k of APPLICANT_UI_ONLY_KEYS) {
     delete a[k];
   }
-  if (!Object.prototype.hasOwnProperty.call(a, "visaSubClass")) {
-    a.visaSubClass = null;
-  }
-  a.selectedSubvisaCategory = null;
-  a.confirmPassportNumber = null;
-  const em = a.emailId;
-  if (typeof em === "string" && em.trim() !== "") {
-    a.emailId = em.trim().toUpperCase();
-  }
 
   const rc = typeof body.countryCode === "string" ? body.countryCode.trim().toLowerCase() : "";
   const rm = typeof body.missionCode === "string" ? body.missionCode.trim().toLowerCase() : "";
+  const isIndLva = rc === "ind" && rm === "lva";
+
+  if (isIndLva) {
+    a.centerClassCode = "";
+    a.selectedSubvisaCategory = "";
+    a.Subclasscode = "";
+    a.dateOfApplication = "";
+    a.AdditionalRefNo = "";
+    a.visaSubClass = "";
+    a.confirmPassportNumber = null;
+    const emLva = a.emailId;
+    if (typeof emLva === "string" && emLva.trim() !== "") {
+      a.emailId = emLva.trim();
+    }
+    delete a.applicantImageData;
+    delete a.countryCode;
+    delete a.missionCode;
+  } else {
+    if (!Object.prototype.hasOwnProperty.call(a, "visaSubClass")) {
+      a.visaSubClass = null;
+    }
+    a.selectedSubvisaCategory = null;
+    a.confirmPassportNumber = null;
+    const em = a.emailId;
+    if (typeof em === "string" && em.trim() !== "") {
+      a.emailId = em.trim().toUpperCase();
+    }
+  }
+
   const fnTrimmed = typeof a.firstName === "string" ? a.firstName.trim() : "";
 
   if (rc === "ind" && rm === "bgr") {
@@ -212,9 +232,14 @@ function finalizeApplicantForLiftApiPost(body: Record<string, unknown>): void {
     if (jc) {
       body.juridictionCode = jc;
     }
-    const hv = typeof a.helloVerifyNumber === "string" ? a.helloVerifyNumber.replace(/\D/g, "") : "";
-    if (hv.length === 6) {
-      a.helloVerifyNumber = hv;
+    const vc = typeof body.visaCategoryCode === "string" ? body.visaCategoryCode.trim() : "";
+    if (vc === "BUS") {
+      a.helloVerifyNumber = null;
+    } else {
+      const hv = typeof a.helloVerifyNumber === "string" ? a.helloVerifyNumber.replace(/\D/g, "") : "";
+      if (hv.length === 6) {
+        a.helloVerifyNumber = hv;
+      }
     }
   }
 }
@@ -227,6 +252,9 @@ function mergeVfsLoginProfileIntoSaveApplicantsBody(body: Record<string, unknown
   if (!Array.isArray(list) || !list[0] || typeof list[0] !== "object" || list[0] === null) return;
   const a = list[0] as Record<string, unknown>;
   const pr = p as Record<string, unknown>;
+  const rc = typeof body.countryCode === "string" ? body.countryCode.trim().toLowerCase() : "";
+  const rm = typeof body.missionCode === "string" ? body.missionCode.trim().toLowerCase() : "";
+  const isIndLva = rc === "ind" && rm === "lva";
 
   const setApplicant = (key: string, val: unknown): void => {
     if (val === undefined || val === null) return;
@@ -245,13 +273,15 @@ function mergeVfsLoginProfileIntoSaveApplicantsBody(body: Record<string, unknown
   setApplicant("salutation", pr.salutation);
   setApplicant("dateOfBirth", p.dateOfBirth);
   setApplicant("passportNumber", p.passportNumber);
-  setApplicant("passportExpirtyDate", pr.passportExpirtyDate);
+  if (!isIndLva) {
+    setApplicant("passportExpirtyDate", pr.passportExpirtyDate);
+  }
   setApplicant("dialCode", p.dialCode);
   setApplicant("contactNumber", p.contactNumber);
 
   const eid = typeof pr.emailId === "string" ? pr.emailId.trim() : "";
   if (eid) {
-    a.emailId = eid.toUpperCase();
+    a.emailId = isIndLva ? eid : eid.toUpperCase();
   }
 
   const nat = typeof pr.nationalityCode === "string" ? pr.nationalityCode.trim() : "";
@@ -273,7 +303,7 @@ function mergeVfsLoginProfileIntoSaveApplicantsBody(body: Record<string, unknown
     a.loginUser = lu;
     const hasEmail = typeof a.emailId === "string" && a.emailId.trim() !== "";
     if (!hasEmail && looksLikeEmailForVfsLogin(lu)) {
-      a.emailId = lu.trim().toUpperCase();
+      a.emailId = isIndLva ? lu.trim() : lu.trim().toUpperCase();
     }
   }
 }
@@ -431,7 +461,10 @@ export function buildSaveApplicantsBody(): Record<string, unknown> {
         const a = list[0] as Record<string, unknown>;
         const hasEmail = typeof a.emailId === "string" && a.emailId.trim() !== "";
         if (!hasEmail && looksLikeEmailForVfsLogin(lu)) {
-          a.emailId = lu.trim().toUpperCase();
+          const rc2 = typeof clone.countryCode === "string" ? clone.countryCode.trim().toLowerCase() : "";
+          const rm2 = typeof clone.missionCode === "string" ? clone.missionCode.trim().toLowerCase() : "";
+          const lva = rc2 === "ind" && rm2 === "lva";
+          a.emailId = lva ? lu.trim() : lu.trim().toUpperCase();
         }
       }
     }
