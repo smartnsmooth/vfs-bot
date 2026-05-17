@@ -15,11 +15,12 @@ import {
   killChromeTreeByCdpPortRangeSync,
 } from "./utils/killChromeByCdpPort";
 import { clearSlotState } from "./utils/slotState";
-import { readRoleAssignments, clearRoleAssignments, clearActivationSignal } from "./utils/sentinelState";
+import { clearPollReadyState, initPollReadyState } from "./utils/pollReadyState";
 
 /** How many bot instances are currently running. Set by ensureInstances(). */
 let currentNumInstances = 0;
 let lastTelegramNotifyBatchTs = 0;
+let pollReadyInitializedForBatch = false;
 const BASE_DEBUGGING_PORT = 9222;
 const BASE_PROFILE_DIR = process.env.CHROME_USER_DATA_DIR ?? "C:/vfs-bot-profile";
 
@@ -95,6 +96,17 @@ async function startFormServer(): Promise<void> {
       ? Math.floor(formData.numInstances)
       : currentNumInstances || 1;
     ensureInstances(submittedCount);
+
+    // Initialize the synchronized polling gate on the very first submit batch
+    // so child instances know how many peers to wait for before polling starts.
+    // Guard with a flag to avoid re-initializing when the handler is called
+    // once per instance in the same batch.
+    const isFirstSubmit = formData.firstSubmit === true;
+    if (isFirstSubmit && !pollReadyInitializedForBatch) {
+      pollReadyInitializedForBatch = true;
+      clearPollReadyState();
+      initPollReadyState(submittedCount);
+    }
     const now = Date.now();
     if (now - lastTelegramNotifyBatchTs > 2000) {
       lastTelegramNotifyBatchTs = now;
@@ -205,16 +217,10 @@ async function startFormServer(): Promise<void> {
       return { results };
     },
     onForceBook: () => {
-      const roles = readRoleAssignments();
-      const stoppedIds = new Set(roles?.stoppedIds ?? []);
-
-      const eligible = instances.filter((i) => {
-        if (!i.process || i.process.killed || stoppedIds.has(i.id)) return false;
-        return true;
-      });
+      const eligible = instances.filter((i) => i.process && !i.process.killed);
 
       if (eligible.length === 0) {
-        return { ok: false, error: "No active instances. All may be stopped or not yet started." };
+        return { ok: false, error: "No active instances. Not yet started." };
       }
       clearSlotState();
       let queued = 0;
@@ -222,7 +228,7 @@ async function startFormServer(): Promise<void> {
         inst.process!.send({ type: "force-book", instanceId: inst.id });
         queued++;
       }
-      logger.info({ queued, skippedStopped: stoppedIds.size }, "[ForceBook] Sent force-book IPC to ALL active instances — starting polling");
+      logger.info({ queued }, "[ForceBook] Sent force-book IPC to ALL active instances — starting polling");
       return { ok: true, queued };
     },
   });
@@ -274,9 +280,8 @@ async function main(): Promise<void> {
   logger.info("Starting VFS Bot Cluster — open the setup form, set the number of instances, and click Submit to start");
 
   // Wipe stale shared state from previous sessions so new instances start clean.
-  clearRoleAssignments(true);
-  clearActivationSignal();
   clearSlotState();
+  clearPollReadyState();
 
   // Start the shared form server. Instances are spawned lazily on first Submit,
   // not at startup — so the user can choose the count from the UI.

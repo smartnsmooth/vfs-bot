@@ -8,11 +8,19 @@ export class VfsForbiddenError extends Error {
   }
 }
 
-/** Thrown when VFS login API returns 429 Too Many Requests — caller should restart browser + rotate IP + demote sentinel. */
+/** Thrown when VFS login API returns 429 Too Many Requests — caller should restart browser + rotate IP. */
 export class VfsLoginRateLimitedError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "VfsLoginRateLimitedError";
+  }
+}
+
+/** Thrown when VFS restricts the User ID itself (429001) — permanent failure, no retry will help. */
+export class VfsUserIdRestrictedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "VfsUserIdRestrictedError";
   }
 }
 
@@ -261,8 +269,10 @@ export class BrowserService {
   }
 
   /**
-   * Check if the current VFS page shows a WAF JSON block (e.g. `{"code":"403201"}`).
-   * The URL may look normal (/login) but the body is a JSON error instead of the login form.
+   * Check if the current VFS page shows a block/error page — WAF JSON, "Access Restricted",
+   * "Session Expired or Invalid", or "User ID Restricted".
+   * Returns true for recoverable blocks (IP rotation helps).
+   * Throws VfsUserIdRestrictedError for permanent User ID bans (no retry).
    */
   async detectWafJsonBlock(): Promise<boolean> {
     try {
@@ -272,16 +282,39 @@ export class BrowserService {
       if (!page) return false;
       const bodyText = await page.locator("body").innerText({ timeout: 5_000 });
       const trimmed = bodyText.trim();
+
+      // User ID restricted (429001) — permanent failure, no retry will help.
+      if (/Access Restricted for User ID/i.test(trimmed) || /429001/.test(trimmed)) {
+        logger.error("[WAF] Detected 'Access Restricted for User ID' (429001) — permanent ban");
+        throw new VfsUserIdRestrictedError("User ID is restricted (429001) — account banned by VFS. No retry will help.");
+      }
+
       if (/^\s*\{/.test(trimmed)) {
         try {
           const parsed = JSON.parse(trimmed) as { code?: string | number };
+          if (String(parsed.code) === "429001") {
+            logger.error({ code: parsed.code }, "[WAF] Detected User ID restricted JSON (429001) — permanent ban");
+            throw new VfsUserIdRestrictedError("User ID is restricted (429001 JSON) — account banned by VFS. No retry will help.");
+          }
           if (parsed.code && String(parsed.code).startsWith("403")) {
             logger.warn({ code: parsed.code }, "[WAF] Detected WAF JSON block on page body");
             return true;
           }
-        } catch { /* not JSON */ }
+        } catch (e) {
+          if (e instanceof VfsUserIdRestrictedError) throw e;
+        }
       }
-    } catch { /* page read failed */ }
+      if (/Access Restricted Due to Unusual Activity/i.test(trimmed) || /403201/.test(trimmed)) {
+        logger.warn("[WAF] Detected HTML 'Access Restricted' block page (403201)");
+        return true;
+      }
+      if (/Session Expired or Invalid/i.test(trimmed)) {
+        logger.warn("[WAF] Detected 'Session Expired or Invalid' block page");
+        return true;
+      }
+    } catch (e) {
+      if (e instanceof VfsUserIdRestrictedError) throw e;
+    }
     return false;
   }
 
@@ -365,36 +398,14 @@ export class BrowserService {
       throw new VfsForbiddenError("Login page returned 403 Forbidden — IP/session blocked by Cloudflare or VFS.");
     }
 
-    // VFS sometimes redirects to a "page not found" URL instead of the login form.
-    const currentUrl = page.url();
-    if (/\/page-not-found\b/i.test(currentUrl)) {
-      throw new VfsForbiddenError(`Login page redirected to ${currentUrl} — IP/session blocked or route unavailable.`);
-    }
+    // Quick URL check after navigation (before entering the periodic loop).
+    this.throwIfBlockPage(page);
 
-    // Detect VFS/Cloudflare WAF block shown as JSON body (e.g. {"code":"403201","description":""}).
-    // The HTTP status may be 200 but the page renders a raw JSON error instead of the login form.
-    try {
-      const bodyText = await page.locator("body").innerText({ timeout: 5_000 });
-      const trimmed = bodyText.trim();
-      if (/^\s*\{/.test(trimmed)) {
-        try {
-          const parsed = JSON.parse(trimmed) as { code?: string | number };
-          if (parsed.code && String(parsed.code).startsWith("403")) {
-            throw new VfsForbiddenError(`Login page body contains WAF block: code ${parsed.code}`);
-          }
-        } catch (e) {
-          if (e instanceof VfsForbiddenError) throw e;
-        }
-      }
-    } catch (e) {
-      if (e instanceof VfsForbiddenError) throw e;
-    }
-
-    // Wait for login form inputs to be ready
+    // Wait for login form inputs — periodically checks for block pages (SPA may redirect after initial load).
     const visibleOnly = ':not(.d-none):not([aria-hidden="true"])';
     const usernameSelectors = `#email${visibleOnly}, input[formcontrolname="username"]${visibleOnly}, input[formControlName="username"]${visibleOnly}, input[formcontrolname="email"]${visibleOnly}, input[formControlName="email"]${visibleOnly}, input[name="username"]${visibleOnly}, input[name="email"]${visibleOnly}, input[type="email"]${visibleOnly}`;
 
-    await page.locator(usernameSelectors).first().waitFor({ state: "visible", timeout: 300_000 });
+    await this.waitForLoginFormOrThrowBlock(page, usernameSelectors, 300_000);
   }
 
   /**
@@ -468,32 +479,13 @@ export class BrowserService {
     // Guard: the page may have been redirected to page-not-found or WAF-blocked
     // between openLoginInFirstTab and now (or the redirect happened after the
     // initial navigation completed).
-    const currentUrl = page.url();
-    if (/\/page-not-found\b/i.test(currentUrl)) {
-      throw new VfsForbiddenError(`Login tab redirected to ${currentUrl} — IP/session blocked.`);
-    }
-    try {
-      const bodyText = await page.locator("body").innerText({ timeout: 5_000 });
-      const trimmed = bodyText.trim();
-      if (/^\s*\{/.test(trimmed)) {
-        try {
-          const parsed = JSON.parse(trimmed) as { code?: string | number };
-          if (parsed.code && String(parsed.code).startsWith("403")) {
-            throw new VfsForbiddenError(`Login page body contains WAF block: code ${parsed.code}`);
-          }
-        } catch (e) {
-          if (e instanceof VfsForbiddenError) throw e;
-        }
-      }
-    } catch (e) {
-      if (e instanceof VfsForbiddenError) throw e;
-    }
+    this.throwIfBlockPage(page);
 
-    // Wait for login form inputs to be ready
+    // Wait for login form inputs — periodically re-check for block pages (SPA redirect).
     const visibleOnly = ':not(.d-none):not([aria-hidden="true"])';
     const usernameSelectors = `#email${visibleOnly}, input[formcontrolname="username"]${visibleOnly}, input[formControlName="username"]${visibleOnly}, input[formcontrolname="email"]${visibleOnly}, input[formControlName="email"]${visibleOnly}, input[name="username"]${visibleOnly}, input[name="email"]${visibleOnly}, input[type="email"]${visibleOnly}`;
 
-    await page.locator(usernameSelectors).first().waitFor({ state: "visible", timeout: 300_000 });
+    await this.waitForLoginFormOrThrowBlock(page, usernameSelectors, 300_000);
 
     // Quick check for consent (3 seconds max) since email input is already visible
     await this.dismissCookieConsent(page, true);
@@ -929,8 +921,8 @@ export class BrowserService {
         .slice(0, 12);
       throw new Error(
         `No visa.vfsglobal.com tab found in the instance Chrome (CDP at ${cdp}). ` +
-          `Click "Submit & Run" first to start the bot, wait for VFS login to complete, then retry. ` +
-          `Tab URLs seen: ${sample.join(" | ") || "(none)"}`
+        `Click "Submit & Run" first to start the bot, wait for VFS login to complete, then retry. ` +
+        `Tab URLs seen: ${sample.join(" | ") || "(none)"}`
       );
     }
     this.attachLiftApiClientSourceSniffer(page.context());
@@ -1370,6 +1362,82 @@ export class BrowserService {
   async runSlotCheckInBrowser(url: string, payload: Record<string, unknown>): Promise<{ status: number; body: string }> {
     const page = await this.getVfsPage();
     return this.postLiftJsonFromPage(page, url, payload);
+  }
+
+  /**
+   * Throw VfsForbiddenError if the current page is a known block/error page.
+   * Checks URL patterns and body content.
+   */
+  private throwIfBlockPage(page: Page): void {
+    const url = page.url();
+    if (/\/page-not-found\b/i.test(url) || /\/session-expired\b/i.test(url)) {
+      throw new VfsForbiddenError(`Page redirected to ${url} — IP/session blocked.`);
+    }
+  }
+
+  /**
+   * Wait for the login form to become visible, but periodically check for block pages.
+   * Throws VfsForbiddenError if a block page is detected instead of hanging for 5 minutes.
+   */
+  private async waitForLoginFormOrThrowBlock(page: Page, usernameSelectors: string, timeoutMs: number): Promise<void> {
+    const BLOCK_CHECK_INTERVAL_MS = 5_000;
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      const remainingMs = Math.max(1000, deadline - Date.now());
+      const checkMs = Math.min(BLOCK_CHECK_INTERVAL_MS, remainingMs);
+
+      try {
+        await page.locator(usernameSelectors).first().waitFor({ state: "visible", timeout: checkMs });
+        return;
+      } catch {
+        // Login form not visible yet — check for block pages
+      }
+
+      const nowUrl = page.url();
+      if (/\/page-not-found\b/i.test(nowUrl) || /\/session-expired\b/i.test(nowUrl)) {
+        throw new VfsForbiddenError(`Login page redirected to ${nowUrl} — IP/session blocked.`);
+      }
+
+      try {
+        const bodyText = await page.locator("body").innerText({ timeout: 3_000 });
+        const trimmed = bodyText.trim();
+
+        // User ID restricted (429001) — permanent failure, no retry.
+        if (/Access Restricted for User ID/i.test(trimmed) || /429001/.test(trimmed)) {
+          throw new VfsUserIdRestrictedError("User ID is restricted (429001) — account banned, no retry will help.");
+        }
+
+        if (/^\s*\{/.test(trimmed)) {
+          try {
+            const parsed = JSON.parse(trimmed) as { code?: string | number };
+            if (String(parsed.code) === "429001") {
+              throw new VfsUserIdRestrictedError("User ID is restricted (429001 JSON) — account banned, no retry will help.");
+            }
+            if (parsed.code && String(parsed.code).startsWith("403")) {
+              throw new VfsForbiddenError(`Login page body contains WAF block: code ${parsed.code}`);
+            }
+          } catch (e) {
+            if (e instanceof VfsUserIdRestrictedError) throw e;
+            if (e instanceof VfsForbiddenError) throw e;
+          }
+        }
+        if (/Access Restricted Due to Unusual Activity/i.test(trimmed) || /403201/.test(trimmed)) {
+          throw new VfsForbiddenError("Login page shows 'Access Restricted Due to Unusual Activity' (403201) — IP blocked.");
+        }
+        if (/Session Expired or Invalid/i.test(trimmed)) {
+          throw new VfsForbiddenError("Login page shows 'Session Expired or Invalid' — session/IP blocked.");
+        }
+        if (/Go back to home/i.test(trimmed) && /VFS Global/i.test(trimmed) && !/sign\s*in/i.test(trimmed)) {
+          throw new VfsForbiddenError("Login page shows VFS error/block page (no login form, 'Go back to home' present).");
+        }
+      } catch (e) {
+        if (e instanceof VfsUserIdRestrictedError) throw e;
+        if (e instanceof VfsForbiddenError) throw e;
+      }
+    }
+
+    throw new Error("Login form did not appear within timeout — page may be stuck or blocked.");
   }
 
   private async dismissCookieConsent(page: Page, quickCheck: boolean = false): Promise<void> {

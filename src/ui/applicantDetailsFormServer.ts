@@ -225,17 +225,6 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
     const v = parseInt(j.postLoginPollDelay, 10);
     if (Number.isFinite(v) && v >= 0) out.postLoginPollDelay = v;
   }
-  if (j.sentinelMode === true || j.sentinelMode === "true" || j.sentinelMode === "on") {
-    out.sentinelMode = true;
-  } else if (j.sentinelMode === false || j.sentinelMode === "false" || j.sentinelMode === "" || j.sentinelMode === undefined) {
-    out.sentinelMode = false;
-  }
-  if (typeof j.sentinelCount === "number" && Number.isFinite(j.sentinelCount) && j.sentinelCount >= 1) {
-    out.sentinelCount = Math.floor(j.sentinelCount);
-  } else if (typeof j.sentinelCount === "string" && j.sentinelCount.trim() !== "") {
-    const v = parseInt(j.sentinelCount, 10);
-    if (Number.isFinite(v) && v >= 1) out.sentinelCount = v;
-  }
   if (typeof out.helloVerifyNumber === "string") {
     const digits = out.helloVerifyNumber.replace(/\D/g, "").slice(0, 6);
     if (digits.length > 0) out.helloVerifyNumber = digits;
@@ -277,15 +266,6 @@ function buildPageHtml(collectLogin: boolean): string {
     <input type="number" id="postLoginPollDelay" name="postLoginPollDelay" min="0" value="30" />
     <label for="numInstances">Number of instances</label>
     <input type="number" id="numInstances" name="numInstances" min="1" max="50" value="1" />
-    <div style="margin-top:0.75rem;display:flex;align-items:center;gap:0.5rem">
-      <input type="checkbox" id="sentinelMode" name="sentinelMode" style="width:auto;margin:0" />
-      <label for="sentinelMode" style="margin:0;cursor:pointer">Sentinel mode</label>
-    </div>
-    <div id="sentinelCountWrapper" style="display:none;margin-top:0.5rem">
-      <label for="sentinelCount">Sentinel count (active pollers)</label>
-      <input type="number" id="sentinelCount" name="sentinelCount" min="1" max="20" value="4" />
-      <p class="hint" style="margin:0.25rem 0 0;font-size:0.8rem;color:#8b98a5">First N bots poll actively; remaining bots stay idle until a slot is found, then all burst-poll simultaneously.</p>
-    </div>
     <div id="instanceSelectWrapper" style="display:block">
       <label for="instanceId" style="margin-top:0.75rem">Select instance to configure (each uses a different Chrome profile / IP)</label>
       <select id="instanceId" name="instanceId">
@@ -848,12 +828,6 @@ export function runApplicantFormWithSubmitHandler(
             if (globalDet && typeof globalDet.postLoginPollDelay === "number") {
               defaults.postLoginPollDelay = globalDet.postLoginPollDelay;
             }
-            if (globalDet && typeof globalDet.sentinelMode === "boolean") {
-              defaults.sentinelMode = globalDet.sentinelMode;
-            }
-            if (globalDet && typeof globalDet.sentinelCount === "number") {
-              defaults.sentinelCount = globalDet.sentinelCount;
-            }
             const payload: Record<string, unknown> = { ok: true, defaults };
             if (collectLogin) {
               const base = getLoginFormDefaults();
@@ -926,15 +900,13 @@ export function runApplicantFormWithSubmitHandler(
             ...rest
           } = j;
           const fields = parseApplicantFields(rest);
-          const { userPollInterval: upi, postLoginPollDelay: plpd, sentinelMode: sm, sentinelCount: sc, ...instanceFields } = fields;
+          const { userPollInterval: upi, postLoginPollDelay: plpd, ...instanceFields } = fields;
 
           {
             const global0 = getApplicantDetailsOverrides(0) ?? {};
             let changed = false;
             if (typeof upi === "number") { global0.userPollInterval = upi; changed = true; }
             if (typeof plpd === "number") { global0.postLoginPollDelay = plpd; changed = true; }
-            if (typeof sm === "boolean") { global0.sentinelMode = sm; changed = true; }
-            if (typeof sc === "number") { global0.sentinelCount = sc; changed = true; }
             if (typeof instanceFields.countryCode === "string") { global0.countryCode = instanceFields.countryCode; changed = true; }
             if (typeof instanceFields.missionCode === "string") { global0.missionCode = instanceFields.missionCode; changed = true; }
             if (changed) setApplicantDetailsOverrides(global0, 0);

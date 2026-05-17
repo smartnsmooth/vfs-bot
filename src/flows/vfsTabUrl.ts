@@ -14,8 +14,8 @@ export function classifyVfsFirstTabUrl(raw: string): VfsTabKind {
 
   if (!u.includes("visa.vfsglobal.com")) return "blank";
 
-  // VFS sometimes redirects to page-not-found when the IP/session is blocked.
-  if (u.includes("page-not-found")) return "page_not_found";
+  // VFS sometimes redirects to page-not-found or session-expired when the IP/session is blocked.
+  if (u.includes("page-not-found") || u.includes("session-expired")) return "page_not_found";
 
   if (u.includes("/login")) return "login";
 

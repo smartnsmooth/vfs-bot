@@ -397,23 +397,12 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     updateIndLvaExtraFields();
     applyInstanceScheduleRangeToForm(inst.details || {});
 
-    // Global settings (instance 0): postLoginPollDelay, sentinelMode, sentinelCount.
+    // Global settings (instance 0): postLoginPollDelay.
     const globalInst = data.instances["0"];
     const plpdEl = document.getElementById("postLoginPollDelay");
     if (plpdEl) {
       const src = (globalInst && globalInst.details) || (inst && inst.details) || {};
       plpdEl.value = src.postLoginPollDelay != null ? String(src.postLoginPollDelay) : "30";
-    }
-    var globalSrc = (globalInst && globalInst.details) || {};
-    var smEl = document.getElementById("sentinelMode");
-    var scEl = document.getElementById("sentinelCount");
-    var scWrap = document.getElementById("sentinelCountWrapper");
-    if (smEl) {
-      smEl.checked = globalSrc.sentinelMode === true;
-      if (scWrap) scWrap.style.display = smEl.checked ? "block" : "none";
-    }
-    if (scEl && globalSrc.sentinelCount != null) {
-      scEl.value = String(globalSrc.sentinelCount);
     }
 
     if (showAlert) {
@@ -445,8 +434,6 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       numInstances: getNumInstances(),
       userPollInterval: parseInt(String(fd.get("userPollInterval") || "60"), 10) || 60,
       postLoginPollDelay: parseInt(String(fd.get("postLoginPollDelay") || "30"), 10),
-      sentinelMode: document.getElementById("sentinelMode") ? document.getElementById("sentinelMode").checked : false,
-      sentinelCount: parseInt(String(fd.get("sentinelCount") || "4"), 10) || 4,
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
       helloVerifyNumber: String(fd.get("helloVerifyNumber") ?? "").trim() || undefined,
       juridictionCode: String(fd.get("juridictionCode") ?? "").trim() || undefined,
@@ -548,15 +535,6 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
 
       updateInstanceSelector();
 
-      var sentinelCheckbox = document.getElementById("sentinelMode");
-      var sentinelCountWrapper = document.getElementById("sentinelCountWrapper");
-      if (sentinelCheckbox && sentinelCountWrapper) {
-        sentinelCheckbox.addEventListener("change", function () {
-          sentinelCountWrapper.style.display = sentinelCheckbox.checked ? "block" : "none";
-          scheduleAutoSave();
-        });
-      }
-
       const instanceIdSelect = document.getElementById("instanceId");
       if (instanceIdSelect) {
         instanceIdSelect.addEventListener("change", function () {
@@ -623,8 +601,6 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       numInstances: getNumInstances(),
       userPollInterval: parseInt(String(fd.get("userPollInterval") || "60"), 10) || 60,
       postLoginPollDelay: parseInt(String(fd.get("postLoginPollDelay") || "30"), 10),
-      sentinelMode: document.getElementById("sentinelMode") ? document.getElementById("sentinelMode").checked : false,
-      sentinelCount: parseInt(String(fd.get("sentinelCount") || "4"), 10) || 4,
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
       helloVerifyNumber: String(fd.get("helloVerifyNumber") ?? "").trim() || undefined,
       juridictionCode: String(fd.get("juridictionCode") ?? "").trim() || undefined,
