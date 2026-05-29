@@ -308,6 +308,10 @@ export class BrowserService {
         logger.warn("[WAF] Detected HTML 'Access Restricted' block page (403201)");
         return true;
       }
+      if (/Permission Issues/i.test(trimmed) || /403101/.test(trimmed)) {
+        logger.warn("[WAF] Detected HTML 'Permission Issues' block page (403101)");
+        return true;
+      }
       if (/Session Expired or Invalid/i.test(trimmed)) {
         logger.warn("[WAF] Detected 'Session Expired or Invalid' block page");
         return true;
@@ -940,9 +944,21 @@ export class BrowserService {
     const res = await this.postLiftJsonFromPage(page, SAVE_APPLICANTS_URL, body);
     logger.info({ status: res.status, responseBody: res.body.slice(0, 1000) }, "Applicants API response");
 
+    if (res.status < 200 || res.status >= 300) {
+      throw new Error(
+        `Save applicants failed HTTP ${res.status}: ${res.body.slice(0, 500)}`
+      );
+    }
+
     const parsed = this.parseApplicantsResponseJson(res.body);
-    if (parsed.urn) setApplicationUrn(parsed.urn);
-    logger.info({ urn: parsed.urn }, "Applicants saved");
+    const urn = parsed.urn?.trim();
+    if (!urn) {
+      throw new Error(
+        `Save applicants failed: no URN in response (HTTP ${res.status})`
+      );
+    }
+    setApplicationUrn(urn);
+    logger.info({ urn }, "Applicants saved");
   }
 
   private async postFeesLiftApiOnPage(page: Page, urn: string): Promise<void> {
@@ -1089,7 +1105,7 @@ export class BrowserService {
     const res = await this.postLiftJsonFromPage(page, TIMESLOT_URL, payload);
     let j: {
       error?: unknown;
-      slots?: Array<{ allocationId?: string; slot?: string; type?: string }>;
+      slots?: Array<{ allocationId?: string | number; slot?: string; type?: string }>;
     };
     try {
       j = JSON.parse(res.body) as typeof j;
@@ -1133,7 +1149,7 @@ export class BrowserService {
 
       const chosenSlotIdx = subIdx % slots.length;
       const chosen = slots[chosenSlotIdx];
-      const alloc = chosen?.allocationId?.trim();
+      const alloc = String(chosen?.allocationId ?? "").trim();
       if (alloc) {
         setAllocationId(alloc);
         logger.info(

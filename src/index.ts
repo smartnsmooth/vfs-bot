@@ -28,6 +28,8 @@ import {
 } from "./utils/slotState";
 import { setSlotCenterOverride, clearSlotCenterOverride } from "./utils/slotCenterOverride.store";
 import { setSlotDate, clearSlotDate } from "./utils/slotDate.store";
+import { getApplicationUrn } from "./utils/applicationUrn.store";
+import { getAllocationId } from "./utils/allocationId.store";
 import {
   isPollingSlotInConstraint,
   NoDatesInScheduleRangeError,
@@ -1029,6 +1031,8 @@ function isSaveApplicantsFailure(err: unknown): boolean {
     m.includes("Save applicants API error:") ||
     m.includes("Save applicants failed HTTP") ||
     m.includes("Save applicants failed after retry HTTP") ||
+    m.includes("Save applicants failed: no URN") ||
+    m.includes("Save applicants did not set URN") ||
     m.startsWith("Save applicants: response is not JSON")
   );
 }
@@ -1263,6 +1267,11 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
     await runPollLoop(instanceId);
   }
 
+  const urnAfterSave = getApplicationUrn();
+  if (!urnAfterSave?.trim()) {
+    throw new Error("Save applicants did not set URN — aborting booking chain");
+  }
+
   const fastSkipCalendar = (instanceId ?? 1) <= FAST_SKIP_CALENDAR_UP_TO_INSTANCE;
   const scheduleConstraint = resolveScheduleDateConstraint(instanceId);
   const hasScheduleFilter = scheduleConstraintIsActive(scheduleConstraint);
@@ -1362,6 +1371,12 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
       await browser.postTimeslotLiftApi();
       await browser.postFeesLiftApi();
     }
+  }
+
+  if (!getAllocationId()?.trim()) {
+    throw new Error(
+      "Booking chain incomplete: schedule did not run (missing allocationId — save applicants or earlier APIs may have failed)"
+    );
   }
   return true;
 }
