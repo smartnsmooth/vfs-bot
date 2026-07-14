@@ -59,11 +59,15 @@ function tryRemove(p: string): void {
 
 /**
  * Call only when Chrome for this `user-data-dir` is not running (e.g. before spawn in `ensureChromeWithDevTools`).
- * Disabled when `VFS_CLEAR_CHROME_SESSION_ON_LAUNCH=false`.
+ * Disabled when `VFS_CLEAR_CHROME_SESSION_ON_LAUNCH=false` (except lock files are always cleared so Chrome can start).
+ *
+ * @param preserveAuthSession When true (4292XX IP rotate without relogin), only remove Singleton* locks;
+ *   keep cookies / local+session storage so the VFS JWT can survive the Chrome respawn.
  */
-export async function clearChromeSessionDataBeforeLaunch(userDataDir: string): Promise<void> {
-  if (!clearSessionOnLaunchEnabled()) return;
-
+export async function clearChromeSessionDataBeforeLaunch(
+  userDataDir: string,
+  opts?: { preserveAuthSession?: boolean }
+): Promise<void> {
   const dir = userDataDir.trim();
   if (!dir) return;
 
@@ -73,6 +77,17 @@ export async function clearChromeSessionDataBeforeLaunch(userDataDir: string): P
   for (const name of USER_DATA_ROOT_LOCK_FILES) {
     tryRemove(path.join(dir, name));
   }
+
+  if (opts?.preserveAuthSession) {
+    logger.info(
+      { userDataDir: dir, profile },
+      "[Chrome] Preserving auth session (cookies/storage) — only cleared Singleton locks for IP rotate"
+    );
+    await new Promise((r) => setTimeout(r, 200));
+    return;
+  }
+
+  if (!clearSessionOnLaunchEnabled()) return;
 
   if (!existsSync(profilePath)) {
     logger.debug({ profilePath }, "[Chrome] Profile dir missing — skip session clean");

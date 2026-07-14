@@ -6,6 +6,15 @@ import { getApplicantDetailsOverrides } from "../utils/applicantDetails.store";
 
 export const SCHEDULE_URL = "https://lift-api.vfsglobal.com/appointment/schedule";
 
+/**
+ * Per-route hardcoded defaults for free / VAC-collected services where the fees
+ * response intentionally omits currency. Captured from real successful uzb-lva
+ * schedule payloads (paymentmode "Vac" + currency "UZS").
+ */
+const ROUTE_PAYMENT_DEFAULTS: Record<string, { paymentmode: string; currency: string }> = {
+  "uzb-lva": { paymentmode: "Vac", currency: "UZS" },
+};
+
 /** POST /appointment/schedule — after timeslot; needs urn + allocationId. */
 export function buildScheduleBody(urn: string, allocationId: string): Record<string, unknown> {
   const u = urn.trim();
@@ -24,8 +33,23 @@ export function buildScheduleBody(urn: string, allocationId: string): Record<str
     throw new Error(`Schedule API requires numeric totalAmount from fees response; got: ${totalAmountRaw}`);
   }
 
+  const rc = String(config.slotPayload.countryCode ?? "").trim().toLowerCase();
+  const rm = String(config.slotPayload.missionCode ?? "").trim().toLowerCase();
+  const routeKey = `${rc}-${rm}`;
+  const routeDefaults = ROUTE_PAYMENT_DEFAULTS[routeKey];
+
   const currencyRaw = getCurrency();
-  if (!currencyRaw) {
+  let currency: string;
+  let paymentmode: string;
+
+  if (currencyRaw) {
+    currency = currencyRaw;
+    paymentmode = "Online";
+  } else if (routeDefaults) {
+    // Free / VAC-collected service: fees response omits currency; use captured route defaults.
+    currency = routeDefaults.currency;
+    paymentmode = routeDefaults.paymentmode;
+  } else {
     throw new Error("Schedule API requires currency from fees response");
   }
 
@@ -45,12 +69,12 @@ export function buildScheduleBody(urn: string, allocationId: string): Record<str
     aurn: null,
     notificationType: (process.env.VFS_SCHEDULE_NOTIFICATION_TYPE ?? "none").trim() || "none",
     paymentdetails: {
-      paymentmode: "Online",
+      paymentmode,
       RequestRefNo: "",
       clientId: "",
       merchantId: "",
       amount: totalAmountNum,
-      currency: currencyRaw,
+      currency,
     },
     allocationId: alloc,
     CanVFSReachoutToApplicant: process.env.VFS_SCHEDULE_CAN_REACHOUT !== "false",

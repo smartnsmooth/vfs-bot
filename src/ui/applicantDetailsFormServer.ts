@@ -253,6 +253,7 @@ function buildPageHtml(collectLogin: boolean): string {
       <option value="ind">India</option>
       <option value="egy">Egypt</option>
       <option value="sau">Saudi Arabia</option>
+      <option value="uzb">Uzbekistan</option>
     </select>
     <label for="missionCode" style="margin-top:0.75rem">To country</label>
     <select id="missionCode" name="missionCode">
@@ -671,6 +672,21 @@ function buildPageHtml(collectLogin: boolean): string {
             <option value="DHI">Latvia Visa Application Center - New Delhi</option>
             <option value="PUN">Latvia Visa Application Center - Pune</option>
           </select>
+        </div>
+
+        <div id="uzbLvaApplicantFields" style="display:none;margin-top:0.75rem">
+          <div class="row2">
+            <div>
+              <label for="firstNameUzbLva">First name</label>
+              <input id="firstNameUzbLva" name="firstNameUzbLva" placeholder="Akmal" />
+            </div>
+            <div>
+              <label for="lastNameUzbLva">Last name</label>
+              <input id="lastNameUzbLva" name="lastNameUzbLva" placeholder="Karimov" />
+            </div>
+          </div>
+          <label for="passportNumberUzbLva" style="margin-top:0.5rem">Passport number</label>
+          <input id="passportNumberUzbLva" name="passportNumberUzbLva" placeholder="AA1234567" />
         </div>
 
         <hr class="section-rule" />

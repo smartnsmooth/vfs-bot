@@ -1,4 +1,5 @@
 import { chromium, Browser, BrowserContext, Page } from "playwright";
+import { type Vfs429Kind } from "../utils/vfsRateLimit";
 
 /** Thrown when a VFS page or API returns HTTP 403 Forbidden — caller should restart browser + rotate IP. */
 export class VfsForbiddenError extends Error {
@@ -8,21 +9,39 @@ export class VfsForbiddenError extends Error {
   }
 }
 
-/** Thrown when VFS login API returns 429 Too Many Requests — caller should restart browser + rotate IP. */
-export class VfsLoginRateLimitedError extends Error {
+/** Thrown when a VFS API returns HTTP 504 Gateway Timeout — caller should restart browser + rotate IP + re-login. */
+export class VfsGatewayTimeoutError extends Error {
   constructor(message: string) {
     super(message);
-    this.name = "VfsLoginRateLimitedError";
+    this.name = "VfsGatewayTimeoutError";
   }
 }
 
-/** Thrown when VFS restricts the User ID itself (429001) — permanent failure, no retry will help. */
-export class VfsUserIdRestrictedError extends Error {
-  constructor(message: string) {
+/**
+ * Thrown when VFS returns a 429 family rate-limit (HTTP or body code).
+ * - kind "account" (4290XX) → stop the bot (User ID / account restricted)
+ * - kind "ip" (4292XX / other 429) → rotate IP without relogin first; escalate on repeat
+ */
+export class VfsRateLimitedError extends Error {
+  readonly kind: Vfs429Kind;
+  readonly code: string;
+
+  constructor(kind: Vfs429Kind, code: string, message: string) {
     super(message);
-    this.name = "VfsUserIdRestrictedError";
+    this.name = "VfsRateLimitedError";
+    this.kind = kind;
+    this.code = code;
+  }
+
+  get isAccountBlock(): boolean {
+    return this.kind === "account";
+  }
+
+  get isIpBlock(): boolean {
+    return this.kind === "ip";
   }
 }
+
 
 /** Returns true when the error is Playwright's "Target closed" family of errors. */
 function isTargetClosedError(e: unknown): boolean {
@@ -79,6 +98,21 @@ import {
   stripPasswordStepApplicantFieldsForProfileMerge,
 } from "../types/vfsUserLogin.type.js";
 import { clearVfsLoginProfile, mergeVfsLoginProfile } from "../utils/vfsLoginProfile.store.js";
+import {
+  classifyVfs429,
+  classifyVfs429FromHttp,
+  classifyVfs429FromPageText,
+} from "../utils/vfsRateLimit";
+
+function throwVfsRateLimited(kind: Vfs429Kind, code: string, detail: string): never {
+  throw new VfsRateLimitedError(
+    kind,
+    code,
+    kind === "account"
+      ? `VFS account/User ID rate-limit (${code}): ${detail}`
+      : `VFS IP rate-limit (${code}): ${detail}`
+  );
+}
 
 /** Sniff `clientsource` on any request to this host that sends the header (not only `/application`). */
 const LIFT_API_HOST_MARKER = "lift-api.vfsglobal.com";
@@ -270,56 +304,68 @@ export class BrowserService {
 
   /**
    * Check if the current VFS page shows a block/error page — WAF JSON, "Access Restricted",
-   * "Session Expired or Invalid", or "User ID Restricted".
-   * Returns true for recoverable blocks (IP rotation helps).
-   * Throws VfsUserIdRestrictedError for permanent User ID bans (no retry).
+   * "Session Expired or Invalid", or rate-limit / User ID restricted (429xxx).
+   * Returns true for recoverable blocks (browser restart + IP rotation helps).
+   * Account-level 4290XX also returns true (caller should stop, not rotate forever).
    */
   async detectWafJsonBlock(): Promise<boolean> {
+    const kind = await this.detectPageBlockKind();
+    return kind !== "none";
+  }
+
+  /**
+   * Classify the current page body as a VFS block.
+   * - account_429: 4290XX / User ID restricted — stop bot
+   * - ip_429: 4292XX / other 429 — IP rotate path
+   * - forbidden: 403 / Access Restricted / session expired
+   */
+  async detectPageBlockKind(): Promise<"none" | "account_429" | "ip_429" | "forbidden"> {
     try {
       const browser = await this.ensureBrowser();
       const pages = this.collectAllPagesFromBrowser(browser);
       const page = this.findPreferredVfsPage(pages, { excludeApplicantSetup: true }) ?? pages[0];
-      if (!page) return false;
+      if (!page) return "none";
       const bodyText = await page.locator("body").innerText({ timeout: 5_000 });
       const trimmed = bodyText.trim();
 
-      // User ID restricted (429001) — permanent failure, no retry will help.
-      if (/Access Restricted for User ID/i.test(trimmed) || /429001/.test(trimmed)) {
-        logger.error("[WAF] Detected 'Access Restricted for User ID' (429001) — permanent ban");
-        throw new VfsUserIdRestrictedError("User ID is restricted (429001) — account banned by VFS. No retry will help.");
+      const rate = classifyVfs429FromPageText(trimmed);
+      if (rate?.kind === "account") {
+        logger.warn({ code: rate.code }, "[WAF] Detected account/User ID rate-limit page (4290XX)");
+        return "account_429";
+      }
+      if (rate?.kind === "ip") {
+        logger.warn({ code: rate.code }, "[WAF] Detected IP rate-limit page (4292XX)");
+        return "ip_429";
       }
 
       if (/^\s*\{/.test(trimmed)) {
         try {
           const parsed = JSON.parse(trimmed) as { code?: string | number };
-          if (String(parsed.code) === "429001") {
-            logger.error({ code: parsed.code }, "[WAF] Detected User ID restricted JSON (429001) — permanent ban");
-            throw new VfsUserIdRestrictedError("User ID is restricted (429001 JSON) — account banned by VFS. No retry will help.");
-          }
-          if (parsed.code && String(parsed.code).startsWith("403")) {
+          const codeStr = parsed.code != null ? String(parsed.code) : "";
+          if (codeStr.startsWith("403")) {
             logger.warn({ code: parsed.code }, "[WAF] Detected WAF JSON block on page body");
-            return true;
+            return "forbidden";
           }
-        } catch (e) {
-          if (e instanceof VfsUserIdRestrictedError) throw e;
+        } catch {
+          /* not JSON */
         }
       }
       if (/Access Restricted Due to Unusual Activity/i.test(trimmed) || /403201/.test(trimmed)) {
         logger.warn("[WAF] Detected HTML 'Access Restricted' block page (403201)");
-        return true;
+        return "forbidden";
       }
       if (/Permission Issues/i.test(trimmed) || /403101/.test(trimmed)) {
         logger.warn("[WAF] Detected HTML 'Permission Issues' block page (403101)");
-        return true;
+        return "forbidden";
       }
       if (/Session Expired or Invalid/i.test(trimmed)) {
         logger.warn("[WAF] Detected 'Session Expired or Invalid' block page");
-        return true;
+        return "forbidden";
       }
-    } catch (e) {
-      if (e instanceof VfsUserIdRestrictedError) throw e;
+    } catch {
+      /* ignore */
     }
-    return false;
+    return "none";
   }
 
   /**
@@ -563,8 +609,18 @@ export class BrowserService {
 
       if (pwdStatus === 429) {
         const pwdBody = await pwdLoginRes.text().catch(() => "");
-        logger.error({ status: pwdStatus, bodySnippet: pwdBody.slice(0, 200) }, "[Login] /user/login returned 429 Too Many Requests");
-        throw new VfsLoginRateLimitedError("Login API returned 429 Too Many Requests — rate limited by VFS.");
+        const classified = classifyVfs429FromHttp(pwdStatus, pwdBody) ?? { kind: "ip" as const, code: "429" };
+        logger.error(
+          { status: pwdStatus, code: classified.code, kind: classified.kind, bodySnippet: pwdBody.slice(0, 200) },
+          "[Login] /user/login returned 429 Too Many Requests"
+        );
+        throwVfsRateLimited(classified.kind, classified.code, "Login API HTTP 429");
+      }
+
+      if (pwdStatus === 504) {
+        const pwdBody = await pwdLoginRes.text().catch(() => "");
+        logger.error({ status: pwdStatus, bodySnippet: pwdBody.slice(0, 200) }, "[Login] /user/login returned 504 Gateway Timeout");
+        throw new VfsGatewayTimeoutError("Login API returned 504 Gateway Timeout — restarting browser + rotating IP.");
       }
 
       const pwdBody = await pwdLoginRes.text().catch(() => "");
@@ -572,11 +628,12 @@ export class BrowserService {
       if (pwdJson) {
         const errObj = pwdJson.error as { code?: number; description?: string } | undefined;
 
-        // Body-level 429 code (e.g. {"code":"429001"})
+        // Body-level 429 code (e.g. {"code":"429001"} or {"code":"429201"})
         const bodyCode = String((pwdJson as Record<string, unknown>).code ?? errObj?.code ?? "");
-        if (bodyCode.startsWith("429")) {
-          logger.error({ status: pwdStatus, code: bodyCode }, "[Login] /user/login body has 429 code");
-          throw new VfsLoginRateLimitedError(`Login API returned code ${bodyCode} — rate limited by VFS.`);
+        const bodyKind = classifyVfs429(bodyCode);
+        if (bodyKind) {
+          logger.error({ status: pwdStatus, code: bodyCode, kind: bodyKind }, "[Login] /user/login body has 429 code");
+          throwVfsRateLimited(bodyKind, bodyCode, "Login API body rate-limit code");
         }
 
         if (errObj && errObj.code === 413 && errObj.description === "Invalid Sender User") {
@@ -1208,7 +1265,18 @@ export class BrowserService {
         })
         .catch(() => { });
     } else {
-      logger.info({ IsAppointmentBooked: j.IsAppointmentBooked }, "Schedule OK; no URL in response to build payment link");
+      logger.info({ IsAppointmentBooked: j.IsAppointmentBooked }, "Schedule OK; no URL in response (free service or VAC pay)");
+      void new TelegramService()
+        .alert(
+          "info",
+          `A Slot is Booked (free service — no payment required). Appointment: ${j.appointmentDate ?? "?"} ${j.appointmentTime ?? "?"}`,
+          {
+            booked: j.IsAppointmentBooked,
+            date: j.appointmentDate,
+            time: j.appointmentTime,
+          }
+        )
+        .catch(() => { });
     }
 
     await this.callScheduleRedirectGetIfPresent(page, j);
@@ -1222,18 +1290,35 @@ export class BrowserService {
   /**
    * Some schedule responses include redirect data as `url` + `payLoad`.
    * Navigate the current tab to `${url}?payLoad=${payLoad}` (real page redirect).
+   * For free / VAC-pay routes (e.g. uzb-lva) the response has `URL: null` —
+   * navigate to the route's dashboard page instead.
    */
   private async callScheduleRedirectGetIfPresent(
     page: Page,
     scheduleResponse: { URL?: string | null; url?: string | null; payLoad?: string | null; payload?: string | null }
   ): Promise<void> {
-    const finalUrl = buildScheduleRedirectUrl(scheduleResponse);
+    let finalUrl = buildScheduleRedirectUrl(scheduleResponse);
+    let isDashboardFallback = false;
+
+    if (!finalUrl) {
+      const rc = String(config.slotPayload.countryCode ?? "").trim().toLowerCase();
+      const rm = String(config.slotPayload.missionCode ?? "").trim().toLowerCase();
+      const routeKey = `${rc}-${rm}`;
+      // Routes where appointment is free / paid at VAC: schedule response omits URL,
+      // and we route the user to the dashboard page (skips confirmation page entirely).
+      const NO_PAYMENT_ROUTES = new Set(["uzb-lva"]);
+      if (NO_PAYMENT_ROUTES.has(routeKey) && rc && rm) {
+        finalUrl = `https://visa.vfsglobal.com/${rc}/en/${rm}/dashboard`;
+        isDashboardFallback = true;
+      }
+    }
+
     if (!finalUrl) return;
 
     const skipPaymentRedirect = /^true|1|yes$/i.test(
       (process.env.VFS_SKIP_SCHEDULE_PAYMENT_REDIRECT ?? "").trim()
     );
-    if (skipPaymentRedirect) {
+    if (skipPaymentRedirect && !isDashboardFallback) {
       logger.info(
         { urlPrefix: finalUrl.slice(0, 120) },
         "Skipping payment redirect after schedule (VFS_SKIP_SCHEDULE_PAYMENT_REDIRECT)"
@@ -1241,7 +1326,12 @@ export class BrowserService {
       return;
     }
 
-    logger.info({ urlPrefix: finalUrl.slice(0, 120) }, "Navigating to schedule redirect URL with payLoad");
+    logger.info(
+      { urlPrefix: finalUrl.slice(0, 120), isDashboardFallback },
+      isDashboardFallback
+        ? "Navigating to dashboard page (free service, no payment required)"
+        : "Navigating to schedule redirect URL with payLoad"
+    );
 
     /**
      * NOTE: `Sec-Fetch-Site` is browser-controlled and generally cannot be overridden via interception.
@@ -1301,7 +1391,7 @@ export class BrowserService {
     this.assertVfsPageLoggedInForLiftApi(page);
     const { origin, referer, route } = this.getLiftApiPageContextFromSource(page);
     const clientSourceOverride: string | null = getCapturedClientSource()?.trim() || null;
-    return page.evaluate(
+    const result = await page.evaluate(
       async (args: {
         url: string;
         payload: Record<string, unknown>;
@@ -1373,6 +1463,139 @@ export class BrowserService {
       },
       { url, payload, origin, referer, route, clientSourceOverride }
     );
+    if (result.status === 504) {
+      throw new VfsGatewayTimeoutError(`API returned 504 Gateway Timeout: ${url}`);
+    }
+    const rate = classifyVfs429FromHttp(result.status, result.body);
+    if (rate) {
+      logger.warn(
+        { url, status: result.status, code: rate.code, kind: rate.kind, bodySnippet: result.body.slice(0, 200) },
+        "[Lift API] 429 rate-limit response"
+      );
+      throwVfsRateLimited(rate.kind, rate.code, `Lift API ${url}`);
+    }
+    return result;
+  }
+
+  /**
+   * Capture authorize/JWT + page URL before Chrome kill so 4292XX IP rotate can resume without full relogin.
+   */
+  async snapshotVfsAuthForIpRotate(): Promise<{
+    pageUrl: string;
+    authorize: string | null;
+    clientsource: string | null;
+  }> {
+    const page = await this.getVfsPage();
+    let pageUrl = "";
+    try {
+      pageUrl = page.url();
+    } catch {
+      pageUrl = "";
+    }
+    const fromPage = await page
+      .evaluate(() => {
+        const getStored = (keys: string[]): string | null => {
+          try {
+            for (const k of keys) {
+              const v = sessionStorage.getItem(k) ?? localStorage.getItem(k);
+              if (v?.trim()) return v.trim();
+            }
+          } catch {
+            /* ignore */
+          }
+          return null;
+        };
+        return {
+          authorize:
+            getStored(["JWT", "authorize", "authToken", "token", "authorization"]) ?? null,
+          clientsource: getStored(["clientsource", "clientSource", "client_source"]) ?? null,
+        };
+      })
+      .catch(() => ({ authorize: null as string | null, clientsource: null as string | null }));
+
+    return {
+      pageUrl,
+      authorize: fromPage.authorize,
+      clientsource: fromPage.clientsource ?? getCapturedClientSource()?.trim() ?? null,
+    };
+  }
+
+  /**
+   * After IP-only Chrome relaunch: reconnect, open prior VFS URL (or login), reinject authorize token.
+   * Throws if the tab lands on login/blank (session lost → caller should escalate to full relogin).
+   */
+  async restoreVfsSessionAfterIpRotate(snap: {
+    pageUrl: string;
+    authorize: string | null;
+    clientsource: string | null;
+  }): Promise<void> {
+    const browser = await this.ensureBrowser();
+    let page = this.findPreferredVfsPage(this.collectAllPagesFromBrowser(browser), {
+      excludeApplicantSetup: true,
+    });
+    if (!page) {
+      const ctx = browser.contexts()[0] ?? (await browser.newContext());
+      page = await ctx.newPage();
+    }
+
+    const target =
+      snap.pageUrl && classifyVfsFirstTabUrl(snap.pageUrl) !== "blank"
+        ? snap.pageUrl
+        : config.loginPageUrl;
+
+    await page.goto(target, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => { });
+    await page.waitForTimeout(1_500);
+
+    if (snap.authorize?.trim()) {
+      await page.evaluate(
+        (args: { authorize: string; clientsource: string | null }) => {
+          try {
+            sessionStorage.setItem("authorize", args.authorize);
+            sessionStorage.setItem("JWT", args.authorize);
+            localStorage.setItem("authorize", args.authorize);
+            localStorage.setItem("JWT", args.authorize);
+            if (args.clientsource) {
+              sessionStorage.setItem("clientsource", args.clientsource);
+              localStorage.setItem("clientsource", args.clientsource);
+            }
+          } catch {
+            /* ignore */
+          }
+        },
+        { authorize: snap.authorize.trim(), clientsource: snap.clientsource }
+      );
+    }
+    if (snap.clientsource?.trim()) {
+      setCapturedClientSource(snap.clientsource.trim());
+    }
+
+    let url = "";
+    try {
+      url = page.url();
+    } catch {
+      url = "";
+    }
+    let kind = classifyVfsFirstTabUrl(url);
+    if (kind === "login" || kind === "blank") {
+      // Chrome often opens on /login; with cookies/JWT try dashboard.
+      const dashUrl = url.includes("/login")
+        ? url.replace(/\/login\/?$/i, "/dashboard")
+        : config.loginPageUrl.replace(/\/login\/?$/i, "/dashboard");
+      await page.goto(dashUrl, { waitUntil: "domcontentloaded", timeout: 60_000 }).catch(() => { });
+      await page.waitForTimeout(1_500);
+      try {
+        url = page.url();
+      } catch {
+        url = "";
+      }
+      kind = classifyVfsFirstTabUrl(url);
+    }
+    if (kind === "login" || kind === "blank" || kind === "page_not_found") {
+      throw new Error(
+        `IP rotate without relogin lost VFS session (tab is ${kind || "unknown"}). Escalate to full relogin.`
+      );
+    }
+    logger.info({ url, hasAuthorize: Boolean(snap.authorize?.trim()) }, "[429 IP] Restored VFS session after proxy rotate");
   }
 
   async runSlotCheckInBrowser(url: string, payload: Record<string, unknown>): Promise<{ status: number; body: string }> {
@@ -1419,22 +1642,24 @@ export class BrowserService {
         const bodyText = await page.locator("body").innerText({ timeout: 3_000 });
         const trimmed = bodyText.trim();
 
-        // User ID restricted (429001) — permanent failure, no retry.
-        if (/Access Restricted for User ID/i.test(trimmed) || /429001/.test(trimmed)) {
-          throw new VfsUserIdRestrictedError("User ID is restricted (429001) — account banned, no retry will help.");
+        if (/Access Restricted for User ID/i.test(trimmed) || /429\d{0,3}/.test(trimmed)) {
+          const rate = classifyVfs429FromPageText(trimmed) ?? { kind: "account" as const, code: "4290" };
+          throwVfsRateLimited(rate.kind, rate.code, "Login page shows rate-limit / User ID restricted");
         }
 
         if (/^\s*\{/.test(trimmed)) {
           try {
             const parsed = JSON.parse(trimmed) as { code?: string | number };
-            if (String(parsed.code) === "429001") {
-              throw new VfsUserIdRestrictedError("User ID is restricted (429001 JSON) — account banned, no retry will help.");
+            const codeStr = parsed.code != null ? String(parsed.code) : "";
+            const rateKind = classifyVfs429(codeStr);
+            if (rateKind) {
+              throwVfsRateLimited(rateKind, codeStr, "Login page body contains rate-limit JSON block");
             }
-            if (parsed.code && String(parsed.code).startsWith("403")) {
+            if (codeStr.startsWith("403")) {
               throw new VfsForbiddenError(`Login page body contains WAF block: code ${parsed.code}`);
             }
           } catch (e) {
-            if (e instanceof VfsUserIdRestrictedError) throw e;
+            if (e instanceof VfsRateLimitedError) throw e;
             if (e instanceof VfsForbiddenError) throw e;
           }
         }
@@ -1448,7 +1673,7 @@ export class BrowserService {
           throw new VfsForbiddenError("Login page shows VFS error/block page (no login form, 'Go back to home' present).");
         }
       } catch (e) {
-        if (e instanceof VfsUserIdRestrictedError) throw e;
+        if (e instanceof VfsRateLimitedError) throw e;
         if (e instanceof VfsForbiddenError) throw e;
       }
     }
@@ -2332,16 +2557,37 @@ export class BrowserService {
     }
 
     if (capturedOtpLogin) {
+      const otpStatus = capturedOtpLogin.status();
+      if (otpStatus === 429) {
+        const body = await capturedOtpLogin.text().catch(() => "");
+        const classified = classifyVfs429FromHttp(otpStatus, body) ?? { kind: "ip" as const, code: "429" };
+        logger.error(
+          { status: otpStatus, code: classified.code, kind: classified.kind, bodySnippet: body.slice(0, 200) },
+          "[Login] OTP /user/login returned 429"
+        );
+        throwVfsRateLimited(classified.kind, classified.code, "OTP Login API HTTP 429");
+      }
+      if (otpStatus === 504) {
+        const body = await capturedOtpLogin.text().catch(() => "");
+        logger.error({ status: otpStatus, bodySnippet: body.slice(0, 200) }, "[Login] OTP /user/login returned 504 Gateway Timeout");
+        throw new VfsGatewayTimeoutError("Login API returned 504 Gateway Timeout after OTP — restarting browser + rotating IP.");
+      }
       const body = await capturedOtpLogin.text().catch(() => "");
       const json = parseVfsUserLoginResponseBody(body);
       this.lastPostOtpLoginResponse = {
-        status: capturedOtpLogin.status(),
+        status: otpStatus,
         url: capturedOtpLogin.url(),
         body,
         json,
       };
       if (json) {
         const errObj = json.error as { code?: number; description?: string } | undefined;
+        const bodyCode = String((json as Record<string, unknown>).code ?? errObj?.code ?? "");
+        const bodyKind = classifyVfs429(bodyCode);
+        if (bodyKind) {
+          logger.error({ status: otpStatus, code: bodyCode, kind: bodyKind }, "[Login] OTP /user/login body has 429 code");
+          throwVfsRateLimited(bodyKind, bodyCode, "OTP Login API body rate-limit code");
+        }
         if (errObj && errObj.code === 413 && errObj.description === "Invalid Sender User") {
           logger.error(
             { status: capturedOtpLogin.status(), error: errObj },

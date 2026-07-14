@@ -48,6 +48,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     ],
     egy: [{label: "Portugal", value: "prt"}],
     sau: [{label: "Portugal", value: "prt"}],
+    uzb: [{ label: "Latvia", value: "lva" }],
   };
 
   const centerCategoryMap = {
@@ -153,6 +154,19 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
         { value: "Apel", label: "Appeal against the decision" },
       ]},
     ],
+    "uzb-lva": [
+      { value: "TAS", label: "VFS GLOBAL SERVICES UBKN", categories: [
+        { value: "LNGWORKTJK", label: "Cargo drivers (Visa D) Tajik" },
+        { value: "LNGWORK", label: "Cargo drivers (Visa D) Uzbek, Turkmen" },
+        { value: "OCMA T", label: "OCMA decision Tajik" },
+        { value: "LNGOTHR", label: "OCMA decision Uzbek, Turkmen" },
+        { value: "Visa D SW", label: "Seasonal Works" },
+        { value: "STT", label: "Students Tajik" },
+        { value: "LNGSTUD", label: "Students Uzbek, Turkmen" },
+        { value: "LSHMEDCL", label: "Work (Visa D) Uzbek, Turkmen" },
+        { value: "LNGRSDTJK", label: "Work(D Visa) Tajik" },
+      ]},
+    ],
   };
 
   var manualApplicantRoutes = { "egy-prt": true };
@@ -179,6 +193,14 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     wrap.style.display = getRouteKey() === "ind-lva" ? "" : "none";
   }
 
+  function updateUzbLvaApplicantFields() {
+    var wrap = document.getElementById("uzbLvaApplicantFields");
+    if (!wrap) return;
+    wrap.style.display = getRouteKey() === "uzb-lva" ? "" : "none";
+  }
+
+  var uzbLvaFieldIds = ["firstNameUzbLva", "lastNameUzbLva", "passportNumberUzbLva"];
+
   function updateMissionOptions() {
     const countryEl = document.getElementById("countryCode");
     const missionEl = document.getElementById("missionCode");
@@ -197,6 +219,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     updateCenterOptions();
     updateManualApplicantFields();
     updateIndLvaExtraFields();
+    updateUzbLvaApplicantFields();
   }
 
   function populateCenterSelect(selectId, placeholderText, centers, prevValue) {
@@ -240,6 +263,14 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     var prevVac2 = (document.getElementById("vacCode2") || {}).value || "";
     populateCenterSelect("vacCode", "-- Select Centre --", centers, prevVac1);
     populateCenterSelect("vacCode2", "-- No Second Centre --", centers, prevVac2);
+
+    // Auto-select the only center for the primary slot when nothing was previously picked,
+    // so single-center portals (e.g. uzb-lva) don't require an extra click.
+    if (!prevVac1 && centers.length === 1) {
+      var vac1El = document.getElementById("vacCode");
+      if (vac1El) vac1El.value = centers[0].value;
+    }
+
     updateCategoryOptions("vacCode", "selectedSubvisaCategory");
     updateCategoryOptions("vacCode2", "selectedSubvisaCategory2");
   }
@@ -259,6 +290,12 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       }
     }
     populateCategorySelect(categorySelectId, categories, prevCat);
+
+    // Auto-select the only category for the primary slot when nothing was previously picked.
+    if (centerSelectId === "vacCode" && !prevCat && categories.length === 1) {
+      var catEl = document.getElementById(categorySelectId);
+      if (catEl) catEl.value = categories[0].value;
+    }
   }
 
   let autoSaveTimeout = null;
@@ -317,7 +354,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
         "selectedSubvisaCategory2",
         "helloVerifyNumber",
         "juridictionCode",
-      ].concat(manualApplicantFieldIds);
+      ].concat(manualApplicantFieldIds).concat(uzbLvaFieldIds);
       for (let fi = 0; fi < fieldsToClear.length; fi++) {
         const el = document.getElementById(fieldsToClear[fi]);
         if (el) el.value = "";
@@ -347,7 +384,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       "selectedSubvisaCategory2",
       "helloVerifyNumber",
       "juridictionCode",
-    ].concat(manualApplicantFieldIds);
+    ].concat(manualApplicantFieldIds).concat(uzbLvaFieldIds);
     for (let ai = 0; ai < allFields.length; ai++) {
       const el = document.getElementById(allFields[ai]);
       if (el) el.value = "";
@@ -393,8 +430,19 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       updateCategoryOptions("vacCode2", "selectedSubvisaCategory2");
       var sc2El = document.getElementById("selectedSubvisaCategory2");
       if (sc2El && inst.details.selectedSubvisaCategory2) sc2El.value = String(inst.details.selectedSubvisaCategory2);
+
+      var routeKeyForLoad = String(inst.details.countryCode || "") + "-" + String(inst.details.missionCode || "");
+      if (routeKeyForLoad === "uzb-lva") {
+        var fnUzb = document.getElementById("firstNameUzbLva");
+        if (fnUzb && inst.details.firstName) fnUzb.value = String(inst.details.firstName);
+        var lnUzb = document.getElementById("lastNameUzbLva");
+        if (lnUzb && inst.details.lastName) lnUzb.value = String(inst.details.lastName);
+        var pnUzb = document.getElementById("passportNumberUzbLva");
+        if (pnUzb && inst.details.passportNumber) pnUzb.value = String(inst.details.passportNumber);
+      }
     }
     updateIndLvaExtraFields();
+    updateUzbLvaApplicantFields();
     applyInstanceScheduleRangeToForm(inst.details || {});
 
     // Global settings (instance 0): postLoginPollDelay.
@@ -413,9 +461,21 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
   async function saveFormData(showFeedback) {
     const form = document.getElementById("f");
     const fd = new FormData(form);
+    const cc = String(fd.get("countryCode") || "ind");
+    const mc = String(fd.get("missionCode") || "bgr");
+    const isUzbLva = cc + "-" + mc === "uzb-lva";
+    const firstNameRaw = isUzbLva
+      ? String(fd.get("firstNameUzbLva") || "").trim()
+      : String(fd.get("firstName") || "").trim();
+    const lastNameRaw = isUzbLva
+      ? String(fd.get("lastNameUzbLva") || "").trim()
+      : String(fd.get("lastName") || "").trim();
+    const passportRaw = isUzbLva
+      ? String(fd.get("passportNumberUzbLva") || "").trim()
+      : String(fd.get("passportNumber") || "").trim();
     const body = {
-      countryCode: fd.get("countryCode") || "ind",
-      missionCode: fd.get("missionCode") || "bgr",
+      countryCode: cc,
+      missionCode: mc,
       passportExpirtyDate: fd.get("passportExpirtyDate"),
       nationalityCode: String(fd.get("nationalityCode") || "").trim(),
       vacCode: fd.get("vacCode"),
@@ -423,10 +483,10 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       selectedSubvisaCategory: fd.get("selectedSubvisaCategory"),
       vacCode2: fd.get("vacCode2") || undefined,
       selectedSubvisaCategory2: fd.get("selectedSubvisaCategory2") || undefined,
-      firstName: String(fd.get("firstName") || "").trim() || undefined,
-      lastName: String(fd.get("lastName") || "").trim() || undefined,
+      firstName: firstNameRaw || undefined,
+      lastName: lastNameRaw || undefined,
       dateOfBirth: String(fd.get("dateOfBirth") || "").trim() || undefined,
-      passportNumber: String(fd.get("passportNumber") || "").trim() || undefined,
+      passportNumber: passportRaw || undefined,
       dialCode: String(fd.get("dialCode") || "").trim() || undefined,
       contactNumber: String(fd.get("contactNumber") || "").trim() || undefined,
       scheduleDateRangeStart: String(fd.get("scheduleDateRangeStart") ?? "").trim(),
@@ -501,6 +561,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
         missionCodeSelect.addEventListener("change", function () {
           updateCenterOptions();
           updateIndLvaExtraFields();
+          updateUzbLvaApplicantFields();
           scheduleAutoSave();
         });
       }
@@ -580,20 +641,51 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     const msg = document.getElementById("msg");
     msg.textContent = "";
     const fd = new FormData(e.target);
+    const cc = String(fd.get("countryCode") || "ind");
+    const mc = String(fd.get("missionCode") || "bgr");
+    const isUzbLva = cc + "-" + mc === "uzb-lva";
+    const firstNameRaw = isUzbLva
+      ? String(fd.get("firstNameUzbLva") || "").trim()
+      : String(fd.get("firstName") || "").trim();
+    const lastNameRaw = isUzbLva
+      ? String(fd.get("lastNameUzbLva") || "").trim()
+      : String(fd.get("lastName") || "").trim();
+    const passportRaw = isUzbLva
+      ? String(fd.get("passportNumberUzbLva") || "").trim()
+      : String(fd.get("passportNumber") || "").trim();
+    const nationalityRaw = String(fd.get("nationalityCode") || "").trim();
+    const vacCodeRaw = String(fd.get("vacCode") || "").trim();
+    const subvisaRaw = String(fd.get("selectedSubvisaCategory") || "").trim();
+
+    const missing = [];
+    if (!vacCodeRaw) missing.push("Visa Application Centre");
+    if (!subvisaRaw) missing.push("Visa Category");
+    if (isUzbLva) {
+      if (!firstNameRaw) missing.push("First name");
+      if (!lastNameRaw) missing.push("Last name");
+      if (!nationalityRaw) missing.push("Nationality");
+      if (!passportRaw) missing.push("Passport number");
+    }
+    if (missing.length > 0) {
+      msg.className = "err";
+      msg.textContent = "Please fill required fields: " + missing.join(", ");
+      return;
+    }
+
     const body = {
-      countryCode: fd.get("countryCode") || "ind",
-      missionCode: fd.get("missionCode") || "bgr",
+      countryCode: cc,
+      missionCode: mc,
       passportExpirtyDate: fd.get("passportExpirtyDate"),
-      nationalityCode: String(fd.get("nationalityCode") || "").trim(),
+      nationalityCode: nationalityRaw,
       vacCode: fd.get("vacCode"),
       gender: parseInt(String(fd.get("gender") || "1"), 10),
       selectedSubvisaCategory: fd.get("selectedSubvisaCategory"),
       vacCode2: fd.get("vacCode2") || undefined,
       selectedSubvisaCategory2: fd.get("selectedSubvisaCategory2") || undefined,
-      firstName: String(fd.get("firstName") || "").trim() || undefined,
-      lastName: String(fd.get("lastName") || "").trim() || undefined,
+      firstName: firstNameRaw || undefined,
+      lastName: lastNameRaw || undefined,
       dateOfBirth: String(fd.get("dateOfBirth") || "").trim() || undefined,
-      passportNumber: String(fd.get("passportNumber") || "").trim() || undefined,
+      passportNumber: passportRaw || undefined,
       dialCode: String(fd.get("dialCode") || "").trim() || undefined,
       contactNumber: String(fd.get("contactNumber") || "").trim() || undefined,
       scheduleDateRangeStart: String(fd.get("scheduleDateRangeStart") ?? "").trim(),

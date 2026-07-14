@@ -11,7 +11,7 @@ import { config, setCurrentInstanceId } from "./config/config";
 import { classifyVfsFirstTabUrl } from "./flows/vfsTabUrl";
 import { logger } from "./utils/logger";
 import { PollingService } from "./services/polling.service";
-import { BrowserService, VfsForbiddenError, VfsUserIdRestrictedError } from "./services/browser.service";
+import { BrowserService, VfsForbiddenError, VfsGatewayTimeoutError, VfsRateLimitedError } from "./services/browser.service";
 import { TelegramService } from "./services/telegram.service";
 import {
   runApplicantFormWithSubmitHandler,
@@ -143,6 +143,124 @@ async function relaunchChromeAfterCredentialSwapLogout(): Promise<void> {
   await browser.disconnectCdp();
   await killChromeOnPort(getRemoteDebuggingPort());
   await ensureChromeWithDevTools();
+}
+
+/**
+ * After a soft (4292XX) IP rotate, the next 429 of any kind triggers full relogin + cache clear.
+ * Cleared on successful recovery escalations and on account-block stop.
+ */
+let softIpRotateAwaitingSecond429 = false;
+
+function clearSoftIpRotateFlag(): void {
+  softIpRotateAwaitingSecond429 = false;
+}
+
+/**
+ * Rotate proxy / Chrome without VFS logout or session wipe.
+ * Used for first 4292XX. Returns false if session could not be restored (caller should escalate).
+ */
+async function rotateIpWithoutRelogin(context: string): Promise<boolean> {
+  logger.info({ context }, "[429 IP] Rotating IP without logout/relogin (preserve Chrome auth session)");
+  let snap: { pageUrl: string; authorize: string | null; clientsource: string | null } | null = null;
+  try {
+    snap = await browser.snapshotVfsAuthForIpRotate();
+  } catch (err) {
+    logger.warn({ err, context }, "[429 IP] Could not snapshot VFS auth before rotate");
+  }
+
+  await closeActiveAnonymizedProxyTunnel();
+  await browser.disconnectCdp();
+  await killChromeOnPort(getRemoteDebuggingPort());
+  await ensureChromeWithDevTools({ preserveSession: true });
+
+  try {
+    if (snap) {
+      await browser.restoreVfsSessionAfterIpRotate(snap);
+    } else {
+      // Reconnect only — cookies may still restore a logged-in tab on goto login URL.
+      await browser.restoreVfsSessionAfterIpRotate({
+        pageUrl: config.loginPageUrl,
+        authorize: null,
+        clientsource: null,
+      });
+    }
+    await browser.resolveApplicantIpForPayload().catch(() => { });
+    softIpRotateAwaitingSecond429 = true;
+    return true;
+  } catch (err) {
+    logger.warn(
+      { err, context },
+      "[429 IP] Session restore after IP rotate failed — escalating to full relogin"
+    );
+    clearSoftIpRotateFlag();
+    return false;
+  }
+}
+
+/**
+ * Handle 4292XX / soft IP rate-limit.
+ * First hit → rotate IP only. Second hit (or failed soft restore) → full relogin with cache clear.
+ */
+async function handleIpRateLimitRecovery(
+  instanceId: number | undefined,
+  context: string,
+  code?: string
+): Promise<"soft_rotated" | "full_relogin"> {
+  const label = code ?? "4292xx";
+  if (!softIpRotateAwaitingSecond429) {
+    await telegram
+      .alert(
+        "error",
+        `Bot ${instanceId ?? "?"} got IP rate-limit ${label} (${context}). Rotating IP without relogin...`
+      )
+      .catch(() => { });
+    const ok = await rotateIpWithoutRelogin(context);
+    if (ok) {
+      logger.info({ instanceId, context, code: label }, "[429 IP] Soft rotate done — resuming without relogin");
+      await telegram
+        .alert("info", `Bot ${instanceId ?? "?"} IP rotated (no relogin) after ${label} — resuming.`)
+        .catch(() => { });
+      return "soft_rotated";
+    }
+  } else {
+    logger.warn(
+      { instanceId, context, code: label },
+      "[429 IP] Second 429 after soft IP rotate — full relogin + clear caches"
+    );
+    await telegram
+      .alert(
+        "error",
+        `Bot ${instanceId ?? "?"} still rate-limited (${label}) after IP rotate. Full relogin + cache clear...`
+      )
+      .catch(() => { });
+  }
+
+  clearSoftIpRotateFlag();
+  await performPollStyleRelogin(instanceId, `${context}-escalate`);
+  logger.info({ instanceId, context, code: label }, "[429 IP] Full relogin after escalate complete");
+  await telegram
+    .alert("info", `Bot ${instanceId ?? "?"} recovered from ${label} via full relogin — resuming.`)
+    .catch(() => { });
+  return "full_relogin";
+}
+
+async function stopForAccountRateLimit(
+  instanceId: number | undefined,
+  context: string,
+  code?: string
+): Promise<void> {
+  clearSoftIpRotateFlag();
+  const label = code ?? "4290xx";
+  logger.error(
+    { instanceId, context, code: label },
+    "4290XX account/User ID rate-limit — stopping bot"
+  );
+  await telegram
+    .alert(
+      "error",
+      `Bot ${instanceId ?? "?"} account blocked (${label}) during ${context}. Stopping — User ID / account rate-limit.`
+    )
+    .catch(() => { });
 }
 
 async function getProxyChainModule(): Promise<ProxyChainModule> {
@@ -520,7 +638,7 @@ async function computeChromeGridPosition(instanceIdx: number, totalInstances: nu
   return { width: w, height: h, x: col * w, y: row * h };
 }
 
-async function ensureChromeWithDevTools(): Promise<void> {
+async function ensureChromeWithDevTools(opts?: { preserveSession?: boolean }): Promise<void> {
   const userDataDir = resolveChromeUserDataDir();
   const instanceId = getBotInstanceId(userDataDir);
   const debugPort = getRemoteDebuggingPort();
@@ -540,7 +658,9 @@ async function ensureChromeWithDevTools(): Promise<void> {
     }
   }
 
-  await clearChromeSessionDataBeforeLaunch(userDataDir);
+  await clearChromeSessionDataBeforeLaunch(userDataDir, {
+    preserveAuthSession: opts?.preserveSession === true,
+  });
 
   const selectedProxy = resolveProxyForInstance(instanceId);
   bumpProxyRotationForProfile(instanceId);
@@ -549,6 +669,7 @@ async function ensureChromeWithDevTools(): Promise<void> {
       {
         instanceId,
         proxyRotationStep: proxyRotationOffsetByProfileId.get(instanceId) ?? 0,
+        preserveSession: opts?.preserveSession === true,
       },
       "[Chrome] New launch — using next PROXY_URLS entry (per-instance cyclic rotation)"
     );
@@ -883,13 +1004,22 @@ async function runPollLoop(
           `Checking Center ${center.centerNumber}`
         );
 
-        const { slot, response, centerNumber, centerCode, visaCategoryCode, unauthorized, rateLimited, forbidden } = await polling.checkSlotsInBrowser(browser, {
+        const { slot, response, centerNumber, centerCode, visaCategoryCode, unauthorized, accountBlocked, rateLimitedIp, rateLimitCode, forbidden, gatewayTimeout } = await polling.checkSlotsInBrowser(browser, {
           centerCode: center.vacCode,
           visaCategoryCode: center.visaCategoryCode,
           centerNumber: center.centerNumber,
         });
 
         console.log(`[Poll Center ${center.centerNumber}]`, JSON.stringify(response, null, 2));
+
+        if (gatewayTimeout) {
+          logger.error({ instanceId }, "504 Gateway Timeout — restarting browser with IP rotation and re-login...");
+          await telegram.alert("error", `Bot ${instanceId ?? "?"} got 504 Gateway Timeout during polling. Restarting browser + rotating IP + re-login...`).catch(() => { });
+          await performPollStyleRelogin(instanceId, "504-gateway-timeout-recovery");
+          logger.info({ instanceId }, "[504 Recovery] Browser restarted, IP rotated, re-logged in — resuming polling");
+          await telegram.alert("info", `Bot ${instanceId ?? "?"} recovered from 504 — polling resumed.`).catch(() => { });
+          continue;
+        }
 
         if (forbidden) {
           logger.error({ instanceId }, "403 Forbidden — IP/session blocked. Restarting browser with IP rotation...");
@@ -906,11 +1036,18 @@ async function runPollLoop(
           return false;
         }
 
-        if (rateLimited) {
-          logger.error({ instanceId }, "429 Too Many Requests — rate limited by VFS API. Stopping polling.");
-          await telegram.alert("error", "429 Too Many Requests — rate limited. Polling stopped.").catch(() => { });
+        if (accountBlocked) {
+          await stopForAccountRateLimit(instanceId, "polling", rateLimitCode);
           return false;
         }
+
+        if (rateLimitedIp) {
+          await handleIpRateLimitRecovery(instanceId, "polling", rateLimitCode);
+          continue;
+        }
+
+        // A non-429 poll result means soft IP rotate (if any) succeeded — allow soft rotate again later.
+        clearSoftIpRotateFlag();
 
         if (slot) {
           slotFound = true;
@@ -1003,7 +1140,7 @@ async function runPollLoop(
   }
 }
 
-const MAX_SAVE_APPLICANTS_RETRIES = 3;
+const MAX_SAVE_APPLICANTS_RETRIES = 8;
 
 function isSaveApplicants422(err: unknown): boolean {
   return err instanceof Error && err.message.includes("Save applicants API error:") && err.message.includes("422");
@@ -1023,7 +1160,7 @@ function isSaveApplicants10673(err: unknown): boolean {
   }
 }
 
-/** Final save-applicants failure — do not restart polling after this. */
+/** Save-applicants API / HTTP failure (excluding 10673, which has its own retry loop). */
 function isSaveApplicantsFailure(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   const m = err.message;
@@ -1092,6 +1229,7 @@ function deriveCalendarDateFromPollingRaw(raw?: string): string | null {
 async function performPollStyleRelogin(instanceId?: number, context?: string): Promise<void> {
   const pollReloginInterval = config.pollReloginInterval;
   const ctx = context ?? "poll-relogin";
+  clearSoftIpRotateFlag();
 
   logger.info(
     { instanceId, pollReloginInterval, ctx },
@@ -1105,6 +1243,70 @@ async function performPollStyleRelogin(instanceId?: number, context?: string): P
   await performVfsLoginFromStore(instanceId);
   await browser.resolveApplicantIpForPayload();
   await browser.preparePollingAfterLogin({ skipDashboardNavigate: true });
+}
+
+/**
+ * Full session recovery after save-applicants failure:
+ * logout, close Chrome, clear cache/cookies, rotate IP, login, prepare polling, poll again.
+ * Only clears this instance's in-memory overrides — does NOT delete slot-state.json
+ * because other instances may still be booking based on that shared signal.
+ * Returns whether a slot was found (self or peer) and polling should resume booking.
+ */
+async function recoverFromSaveApplicantsFailure(
+  instanceId: number | undefined,
+  context: string,
+  err: unknown
+): Promise<boolean> {
+  const msg = err instanceof Error ? err.message : String(err);
+  logger.warn(
+    { err, instanceId, context },
+    "Save applicants failed — full relogin (clear cache, rotate IP) and resuming poll"
+  );
+  await telegram
+    .alert("error", `Save applicants failed (instance ${instanceId ?? 1}), full relogin: ${msg}`)
+    .catch(() => { });
+  clearSlotCenterOverride();
+  clearSlotDate();
+  await performPollStyleRelogin(instanceId, context);
+  return runPollLoop(instanceId);
+}
+
+/** 504 on any booking API: close browser, clear caches, rotate IP, re-login, poll, restart booking chain. */
+async function recoverBookingChainFromGatewayTimeout(
+  instanceId: number | undefined,
+  context: string,
+  err: unknown,
+  slotStateCache?: SlotFoundState
+): Promise<boolean> {
+  logger.warn(
+    { instanceId, context, err: err instanceof Error ? err.message : String(err) },
+    "504 Gateway Timeout — full relogin and restarting booking chain"
+  );
+  if (!(await recoverFromSaveApplicantsFailure(instanceId, context, err))) {
+    return false;
+  }
+  return runBookingChainWithRetry(instanceId, slotStateCache);
+}
+
+/** 4292XX on booking APIs: soft IP rotate first, else full relogin; then restart booking chain. */
+async function recoverBookingChainFromIpRateLimit(
+  instanceId: number | undefined,
+  context: string,
+  err: VfsRateLimitedError,
+  slotStateCache?: SlotFoundState
+): Promise<boolean> {
+  const outcome = await handleIpRateLimitRecovery(instanceId, context, err.code);
+  if (outcome === "soft_rotated") {
+    // Session preserved — retry booking without re-poll if we still have slot cache.
+    return runBookingChainWithRetry(instanceId, slotStateCache);
+  }
+  // Full relogin already completed inside handleIpRateLimitRecovery — poll for a fresh slot, then book.
+  clearSlotCenterOverride();
+  clearSlotDate();
+  if (!(await runPollLoop(instanceId))) {
+    return false;
+  }
+  return runBookingChainWithRetry(instanceId, slotStateCache);
 }
 
 const MAX_FORBIDDEN_RETRIES = 3;
@@ -1139,6 +1341,43 @@ async function openLoginWithForbiddenRecovery(instanceId?: number): Promise<void
         }
         continue;
       }
+      if (err instanceof VfsGatewayTimeoutError) {
+        logger.error({ instanceId, attempt, maxRetries: MAX_FORBIDDEN_RETRIES }, "504 Gateway Timeout on login page — restarting browser + rotating IP");
+        await telegram.alert("error", `Bot ${instanceId ?? "?"} got 504 on login page (attempt ${attempt}/${MAX_FORBIDDEN_RETRIES}). Restarting browser + rotating IP...`).catch(() => { });
+        clearApplicantIpCache();
+        await relaunchChromeAfterCredentialSwapLogout();
+        if (attempt === MAX_FORBIDDEN_RETRIES) {
+          throw new Error(`Login page still 504 after ${MAX_FORBIDDEN_RETRIES} browser restarts — giving up.`);
+        }
+        continue;
+      }
+      if (err instanceof VfsRateLimitedError) {
+        if (err.isAccountBlock) {
+          await stopForAccountRateLimit(instanceId, "open-login", err.code);
+          throw new Error(`Login page account rate-limit ${err.code} — stopping.`);
+        }
+        logger.error(
+          { instanceId, attempt, maxRetries: MAX_FORBIDDEN_RETRIES, code: err.code, escalate: softIpRotateAwaitingSecond429 },
+          "4292XX IP rate-limit on login page — rotating IP"
+        );
+        await telegram
+          .alert(
+            "error",
+            `Bot ${instanceId ?? "?"} got IP rate-limit ${err.code} on login page (attempt ${attempt}/${MAX_FORBIDDEN_RETRIES}). Rotating IP...`
+          )
+          .catch(() => { });
+        if (softIpRotateAwaitingSecond429) {
+          clearSoftIpRotateFlag();
+        } else {
+          softIpRotateAwaitingSecond429 = true;
+        }
+        clearApplicantIpCache();
+        await relaunchChromeAfterCredentialSwapLogout();
+        if (attempt === MAX_FORBIDDEN_RETRIES) {
+          throw new Error(`Login page still 429 after ${MAX_FORBIDDEN_RETRIES} recoveries — giving up.`);
+        }
+        continue;
+      }
       throw err;
     }
   }
@@ -1170,6 +1409,50 @@ async function loginWithForbiddenRecovery(instanceId?: number): Promise<void> {
         continue;
       }
 
+      if (err instanceof VfsGatewayTimeoutError) {
+        logger.error(
+          { instanceId, reason: err.message },
+          "[Login] 504 Gateway Timeout — closing browser, clearing cache, rotating IP, retrying from login"
+        );
+        await telegram.alert(
+          "error",
+          `Bot ${instanceId ?? "?"} got 504 Gateway Timeout during login. Restarting browser + rotating IP...`
+        ).catch(() => { });
+        clearApplicantIpCache();
+        await relaunchChromeAfterCredentialSwapLogout();
+        await browser.openLoginInFirstTab();
+        continue;
+      }
+
+      if (err instanceof VfsRateLimitedError) {
+        if (err.isAccountBlock) {
+          await stopForAccountRateLimit(instanceId, "login", err.code);
+          throw new Error(`Login account rate-limit ${err.code} — stopping.`);
+        }
+        const escalate = softIpRotateAwaitingSecond429;
+        logger.error(
+          { instanceId, reason: err.message, code: err.code, escalate },
+          "[Login] 4292XX IP rate-limit — rotating IP" + (escalate ? " (second hit / clear caches)" : " (soft)")
+        );
+        await telegram
+          .alert(
+            "error",
+            escalate
+              ? `Bot ${instanceId ?? "?"} still rate-limited (${err.code}) during login after IP rotate. Clearing caches + rotating IP again...`
+              : `Bot ${instanceId ?? "?"} got IP rate-limit ${err.code} during login. Rotating IP...`
+          )
+          .catch(() => { });
+        if (escalate) {
+          clearSoftIpRotateFlag();
+        } else {
+          softIpRotateAwaitingSecond429 = true;
+        }
+        clearApplicantIpCache();
+        await relaunchChromeAfterCredentialSwapLogout();
+        await browser.openLoginInFirstTab();
+        continue;
+      }
+
       if (isOtpRelatedLoginFailure(err)) {
         otpAttempts++;
         const reason = err instanceof Error ? err.message : String(err);
@@ -1193,8 +1476,15 @@ async function loginWithForbiddenRecovery(instanceId?: number): Promise<void> {
 }
 
 /**
- * Try save-applicants; on 422 "Invalid request", retry by re-polling then re-calling save.
- * On 10673 ("no appointment slots"), retry up to `VFS_POLL_RELOGIN_INTERVAL` times at poll interval, then poll-style relogin + slot poll, forever until save succeeds.
+ * Try save-applicants with a unified retry strategy:
+ *
+ * - **10673** ("no appointment slots"): retry up to `pollReloginInterval` times at poll interval,
+ *   then poll-style relogin + slot poll, forever until save succeeds.
+ *
+ * - **Any other error** (422, HTTP non-2xx, bad JSON, no URN, etc.): retry up to
+ *   MAX_SAVE_APPLICANTS_RETRIES (8) times with poll interval delay between attempts.
+ *   After 8 failures → full relogin (clear cache, rotate IP) + poll, then retry the whole
+ *   cycle from attempt 1.  Never stops the bot.
  */
 async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: SlotFoundState): Promise<boolean> {
   const pollIntervalMs = getFixedTimingForInstance(instanceId).pollIntervalMs;
@@ -1207,6 +1497,8 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
     return false;
   }
 
+  let nonRecoverableAttempts = 0; // tracks consecutive non-10673 failures across the retry loop
+
   applicants10673Recovery: while (true) {
     // Check abort before each Applicants API attempt so superseded chains don't waste a request.
     if (pollingAbortSeq !== chainAbortSeq) {
@@ -1215,47 +1507,73 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
     }
     for (let phase1Idx = 0; phase1Idx < phase1Attempts; phase1Idx++) {
       let saw10673ThisPhase = false;
-      for (let attempt = 1; attempt <= MAX_SAVE_APPLICANTS_RETRIES; attempt++) {
-        try {
-          await browser.saveApplicantsViaLiftApi();
-          break applicants10673Recovery;
-        } catch (err) {
-          if (isSaveApplicants10673(err)) {
-            saw10673ThisPhase = true;
-            logger.warn(
-              {
-                instanceId,
-                phase1Round: phase1Idx + 1,
-                phase1Attempts,
-                err: err instanceof Error ? err.message : String(err),
-              },
-              "Save applicants returned 10673 (no appointment slots in response) — phase-1 retry or relogin"
-            );
-            break;
-          }
-          if (!isSaveApplicants422(err) || attempt === MAX_SAVE_APPLICANTS_RETRIES) throw err;
-          logger.warn(
-            { attempt, maxRetries: MAX_SAVE_APPLICANTS_RETRIES, instanceId },
-            "Save applicants returned 422 — retrying after re-poll"
-          );
-          await browser.preparePollingAfterLogin({ skipDashboardNavigate: true });
-          const stillAvailable = await runPollLoop(instanceId);
-          if (!stillAvailable) {
-            logger.warn({ instanceId }, "Slot no longer available on retry poll — aborting booking chain");
+      try {
+        await browser.saveApplicantsViaLiftApi();
+
+        // Verify URN was set; if not, treat as a retryable failure.
+        const urnAfterSave = getApplicationUrn();
+        if (!urnAfterSave?.trim()) {
+          throw new Error("Save applicants did not set URN");
+        }
+
+        break applicants10673Recovery;
+      } catch (err) {
+        if (err instanceof VfsRateLimitedError) {
+          if (err.isAccountBlock) {
+            await stopForAccountRateLimit(instanceId, "save-applicants", err.code);
             return false;
           }
+          return recoverBookingChainFromIpRateLimit(instanceId, "429-ip-save-applicants", err, slotStateCache);
+        }
+        if (err instanceof VfsGatewayTimeoutError) {
+          return recoverBookingChainFromGatewayTimeout(instanceId, "504-gateway-timeout-save-applicants", err, slotStateCache);
+        }
+        if (isSaveApplicants10673(err)) {
+          saw10673ThisPhase = true;
+          logger.warn(
+            {
+              instanceId,
+              phase1Round: phase1Idx + 1,
+              phase1Attempts,
+              err: err instanceof Error ? err.message : String(err),
+            },
+            "Save applicants returned 10673 (no appointment slots in response) — phase-1 retry or relogin"
+          );
+        } else {
+          nonRecoverableAttempts += 1;
+          const errMsg = err instanceof Error ? err.message : String(err);
+
+          if (nonRecoverableAttempts >= MAX_SAVE_APPLICANTS_RETRIES) {
+            logger.warn(
+              { instanceId, attempt: nonRecoverableAttempts, maxRetries: MAX_SAVE_APPLICANTS_RETRIES, err: errMsg },
+              "Save applicants failed after max retries — full relogin and resuming poll"
+            );
+            nonRecoverableAttempts = 0;
+            if (!(await recoverFromSaveApplicantsFailure(instanceId, "save-applicants-max-retries", err))) {
+              return false;
+            }
+            continue applicants10673Recovery;
+          }
+
+          logger.warn(
+            { instanceId, attempt: nonRecoverableAttempts, maxRetries: MAX_SAVE_APPLICANTS_RETRIES, err: errMsg },
+            "Save applicants failed — waiting poll interval before retry"
+          );
         }
       }
-      if (saw10673ThisPhase && phase1Idx < phase1Attempts - 1) {
-        logger.info({ instanceId, delayMs: pollIntervalMs, phase1Round: phase1Idx + 1 }, "10673 — waiting poll interval before next save applicants attempt");
-        await Promise.race([
-          new Promise<void>((r) => setTimeout(r, pollIntervalMs)),
-          waitForPollingAbort(chainAbortSeq),
-        ]);
-        if (pollingAbortSeq !== chainAbortSeq) {
-          logger.info({ instanceId }, "[ForceBook] 10673 retry delay interrupted by new force-book — exiting booking chain");
-          return false;
-        }
+
+      // Delay before next attempt (shared by both 10673 phase-1 retries and non-10673 retries).
+      if (saw10673ThisPhase && phase1Idx >= phase1Attempts - 1) {
+        // 10673 exhausted phase-1 — skip delay, fall through to relogin below.
+        continue;
+      }
+      await Promise.race([
+        new Promise<void>((r) => setTimeout(r, pollIntervalMs)),
+        waitForPollingAbort(chainAbortSeq),
+      ]);
+      if (pollingAbortSeq !== chainAbortSeq) {
+        logger.info({ instanceId }, "[ForceBook] Save-applicants retry delay interrupted — exiting booking chain");
+        return false;
       }
     }
 
@@ -1265,11 +1583,6 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
     );
     await performPollStyleRelogin(instanceId, "save-applicants-10673");
     await runPollLoop(instanceId);
-  }
-
-  const urnAfterSave = getApplicationUrn();
-  if (!urnAfterSave?.trim()) {
-    throw new Error("Save applicants did not set URN — aborting booking chain");
   }
 
   const fastSkipCalendar = (instanceId ?? 1) <= FAST_SKIP_CALENDAR_UP_TO_INSTANCE;
@@ -1284,6 +1597,7 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
 
   let usedCalendarForTimeslot = false;
 
+  try {
   if (!hasScheduleFilter) {
     if (fastSkipCalendar) {
       const derived = deriveCalendarDateFromPollingRaw(shared.slot?.rawDate ?? shared.slot?.date);
@@ -1334,6 +1648,16 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
   try {
     await browser.postTimeslotLiftApi();
   } catch (err) {
+    if (err instanceof VfsRateLimitedError) {
+      if (err.isAccountBlock) {
+        await stopForAccountRateLimit(instanceId, "timeslot", err.code);
+        return false;
+      }
+      return recoverBookingChainFromIpRateLimit(instanceId, "429-ip-timeslot", err, slotStateCache);
+    }
+    if (err instanceof VfsGatewayTimeoutError) {
+      return recoverBookingChainFromGatewayTimeout(instanceId, "504-gateway-timeout-timeslot", err, slotStateCache);
+    }
     // Requested fallback: if fast mode skipped calendar and timeslot fails, call calendar then retry once.
     if (fastSkipCalendar && !usedCalendarForTimeslot) {
       logger.warn({ err, instanceId }, "Timeslot failed in fast mode - calling calendar and retrying timeslot once");
@@ -1359,6 +1683,16 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
       await browser.postScheduleLiftApi();
       break;
     } catch (schedErr) {
+      if (schedErr instanceof VfsRateLimitedError) {
+        if (schedErr.isAccountBlock) {
+          await stopForAccountRateLimit(instanceId, "schedule", schedErr.code);
+          return false;
+        }
+        return recoverBookingChainFromIpRateLimit(instanceId, "429-ip-schedule", schedErr, slotStateCache);
+      }
+      if (schedErr instanceof VfsGatewayTimeoutError) {
+        return recoverBookingChainFromGatewayTimeout(instanceId, "504-gateway-timeout-schedule", schedErr, slotStateCache);
+      }
       if (schedAttempt === MAX_SCHEDULE_RETRIES_FROM_CALENDAR) throw schedErr;
       logger.warn(
         { err: schedErr, attempt: schedAttempt, maxRetries: MAX_SCHEDULE_RETRIES_FROM_CALENDAR, instanceId },
@@ -1379,6 +1713,19 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
     );
   }
   return true;
+  } catch (err) {
+    if (err instanceof VfsRateLimitedError) {
+      if (err.isAccountBlock) {
+        await stopForAccountRateLimit(instanceId, "booking-chain", err.code);
+        return false;
+      }
+      return recoverBookingChainFromIpRateLimit(instanceId, "429-ip-booking", err, slotStateCache);
+    }
+    if (err instanceof VfsGatewayTimeoutError) {
+      return recoverBookingChainFromGatewayTimeout(instanceId, "504-gateway-timeout-booking", err, slotStateCache);
+    }
+    throw err;
+  }
 }
 
 type SubmitMeta = { firstSubmit: boolean; instanceId?: number };
@@ -1488,8 +1835,16 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
   // Detect block pages on any URL — WAF JSON, "Access Restricted", "Session Expired", or "User ID Restricted".
   // The URL may look normal (/login, /dashboard) but the body is a block/error page.
   if (kind === "login" || kind === "dashboard" || kind === "vfs_other") {
-    const isWafBlocked = await browser.detectWafJsonBlock(); // throws VfsUserIdRestrictedError for permanent bans
-    if (isWafBlocked) {
+    const blockKind = await browser.detectPageBlockKind();
+    if (blockKind === "account_429") {
+      await stopForAccountRateLimit(instanceId, "startup-page-block", "4290xx");
+      return;
+    }
+    if (blockKind === "ip_429") {
+      await handleIpRateLimitRecovery(instanceId, "startup-page-block", "4292xx");
+      firstUrl = await browser.getFirstTabUrl();
+      kind = classifyVfsFirstTabUrl(firstUrl);
+    } else if (blockKind === "forbidden") {
       logger.error({ instanceId, url: firstUrl }, "[Chrome] Page shows block/error page — closing browser, clearing caches, rotating IP, reopening...");
       await telegram.alert("error", `Bot ${instanceId ?? "?"} blocked page detected — restarting browser + rotating IP`).catch(() => { });
       clearApplicantIpCache();
@@ -1610,18 +1965,37 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
     );
 
     if (remainingMs > 0) {
-      await Promise.race([
-        new Promise((r) => setTimeout(r, remainingMs)),
-        waitForPollingAbort(cycleAbortSeq),
-      ]);
-      if (pollingAbortSeq !== cycleAbortSeq) {
-        logger.info({ instanceId }, "[SyncGate] Offset delay aborted (force-book or config update)");
-        return;
+      const syncGateSlotWatcher = createSlotFoundWatcher(instanceId);
+      try {
+        const timerPromise = new Promise<void>((r) => setTimeout(r, remainingMs));
+        const woke = await Promise.race([
+          timerPromise.then(() => "timer" as const),
+          syncGateSlotWatcher.wait().then(() => "slot" as const),
+          waitForPollingAbort(cycleAbortSeq).then(() => "abort" as const),
+        ]);
+
+        if (woke === "abort" || pollingAbortSeq !== cycleAbortSeq) {
+          logger.info({ instanceId }, "[SyncGate] Offset delay aborted (force-book or config update)");
+          return;
+        }
+
+        if (woke === "slot" && (await checkPeerFoundSlotAndJoinBooking(instanceId, syncGateSlotWatcher.cachedState()))) {
+          logger.info(
+            { instanceId },
+            "[SyncGate] Woken by peer slot during offset delay — skipping remainder and proceeding to booking"
+          );
+          slotFoundDuringPoll = true;
+        } else if (woke === "slot") {
+          // Peer slot signal but this instance cannot join yet — honour the full offset delay.
+          await timerPromise;
+        }
+      } finally {
+        syncGateSlotWatcher.dispose();
       }
     }
   }
 
-  {
+  if (!slotFoundDuringPoll) {
     // All instances poll actively after login.
     await telegram.notify("VFS bot run: polling for slots.").catch(() => { });
     logger.info({ skipDashboardNavigate, instanceId }, "Starting slot polling");
@@ -1657,20 +2031,11 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
       } catch (err) {
         instanceBookingActive = false; // Release booking lock so new slot finds can reach this instance again.
         if (isSaveApplicantsFailure(err)) {
-          logger.error(
-            { err, instanceId },
-            "Save applicants failed — stopping polling (fix applicant payload / session and restart the bot)"
-          );
-          await telegram
-            .alert(
-              "error",
-              `Save applicants failed (instance ${instanceId ?? 1}) — polling stopped: ${err instanceof Error ? err.message : String(err)}`
-            )
-            .catch(() => { });
-          clearSlotState();
-          clearSlotCenterOverride();
-          clearSlotDate();
-          break;
+          if (!(await recoverFromSaveApplicantsFailure(instanceId, "save-applicants-failure", err))) {
+            logger.info({ instanceId }, "Save applicants recovery poll ended without slot — stopping booking chain");
+            break;
+          }
+          continue;
         }
         const noDates =
           err instanceof NoDatesInScheduleRangeError ||
@@ -1682,21 +2047,19 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
           const msg = `no slot from ${startDate} to ${endDate}`;
           logger.warn(
             { instanceId, ...scheduleConstraintLogValue(range) },
-            "No calendar dates match schedule date range — clearing slot state and stopping bot cycle"
+            "No calendar dates match schedule date range — clearing local state and stopping bot cycle"
           );
           await telegram.alert("no_slot_found", msg).catch(() => { });
-          clearSlotState();
           clearSlotCenterOverride();
           clearSlotDate();
           break;
         }
 
-        // Any other booking error: log, notify, clear state, restart polling instead of stopping.
-        logger.error({ err, instanceId }, "Booking chain error — clearing slot state and restarting poll");
+        // Any other booking error: log, notify, clear local state, restart polling instead of stopping.
+        logger.error({ err, instanceId }, "Booking chain error — clearing local state and restarting poll");
         await telegram
           .alert("error", `Booking error (instance ${instanceId ?? 1}), restarting poll: ${err instanceof Error ? err.message : String(err)}`)
           .catch(() => { });
-        clearSlotState();
         clearSlotCenterOverride();
         clearSlotDate();
         await browser.preparePollingAfterLogin({ skipDashboardNavigate: true });
@@ -1813,7 +2176,6 @@ async function start(): Promise<void> {
                   instanceBookingActive = false;
                   logger.error({ err, instanceId: myInstanceId }, "[ForceBook] Booking chain failed");
                   await telegram.alert("error", `Bot ${myInstanceId} force-book booking failed: ${err instanceof Error ? err.message : String(err)}`).catch(() => { });
-                  clearSlotState();
                   clearSlotCenterOverride();
                   clearSlotDate();
                 }
@@ -1907,7 +2269,6 @@ async function start(): Promise<void> {
               instanceBookingActive = false;
               logger.error({ err }, "[ForceBook] Booking chain failed");
               await telegram.alert("error", `Force-book failed: ${err instanceof Error ? err.message : String(err)}`).catch(() => { });
-              clearSlotState();
               clearSlotCenterOverride();
               clearSlotDate();
             }

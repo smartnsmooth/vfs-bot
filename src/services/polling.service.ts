@@ -2,7 +2,9 @@ import { config } from "../config/config";
 import { Slot } from "../types/slot.type";
 import type { CheckIsSlotAvailableResponse } from "../types/slot.type";
 import { logger } from "../utils/logger";
+import { classifyVfs429 } from "../utils/vfsRateLimit";
 import type { BrowserService } from "./browser.service";
+import { VfsGatewayTimeoutError, VfsRateLimitedError } from "./browser.service";
 
 export interface PollResult {
   slot: Slot | null;
@@ -11,8 +13,15 @@ export interface PollResult {
   centerCode?: string;
   visaCategoryCode?: string;
   unauthorized?: boolean;  // true when API returns 401 — polling must stop
-  rateLimited?: boolean;   // true when API returns 429 — polling must stop
+  /** @deprecated Prefer accountBlocked / rateLimitedIp */
+  rateLimited?: boolean;
+  /** 4290XX — account / User ID restricted; stop the bot */
+  accountBlocked?: boolean;
+  /** 4292XX (or other 429) — IP rotate path */
+  rateLimitedIp?: boolean;
+  rateLimitCode?: string;
   forbidden?: boolean;     // true when API returns 403 — needs full browser restart + IP rotation
+  gatewayTimeout?: boolean; // true when API returns 504 — needs full browser restart + IP rotation + re-login
 }
 
 /**
@@ -38,6 +47,7 @@ export class PollingService {
         data = JSON.parse(body) as CheckIsSlotAvailableResponse;
       } catch {
         logger.warn({ status, url, bodySnippet: body.slice(0, 200) }, "Slot API returned non-JSON");
+        const rateKind = status === 429 ? classifyVfs429(null, 429) : null;
         return {
           slot: null,
           response: {
@@ -48,16 +58,34 @@ export class PollingService {
               description: status === 401
                 ? "401 Unauthorized. Keep a tab on visa.vfsglobal.com open and stay logged in."
                 : status === 429
-                  ? "429 Too Many Requests. Rate limited by VFS API."
+                  ? "429 Too Many Requests."
                   : status === 403
                     ? "403 Forbidden. IP/session blocked by Cloudflare or VFS."
-                    : `API returned non-JSON (status ${status}).`,
+                    : status === 504
+                      ? "504 Gateway Timeout. Restarting browser + rotating IP."
+                      : `API returned non-JSON (status ${status}).`,
               type: "Error",
             },
           },
           unauthorized: status === 401,
-          rateLimited: status === 429,
+          rateLimited: rateKind === "ip",
+          accountBlocked: rateKind === "account",
+          rateLimitedIp: rateKind === "ip",
+          rateLimitCode: status === 429 ? "429" : undefined,
           forbidden: status === 403,
+          gatewayTimeout: status === 504,
+        };
+      }
+      if (status === 504) {
+        logger.warn({ status, url, bodySnippet: body.slice(0, 200) }, "504 Gateway Timeout from slot API — need browser restart + IP rotation + re-login");
+        return {
+          slot: null,
+          gatewayTimeout: true,
+          response: {
+            earliestDate: null,
+            earliestSlotLists: [],
+            error: { code: -1, description: "504 Gateway Timeout. Restarting browser + rotating IP.", type: "Error" },
+          },
         };
       }
       if (status === 403) {
@@ -83,14 +111,21 @@ export class PollingService {
           },
         };
       }
+      // HTTP 429 is thrown from postLiftJsonFromPage; this is a safety net if throwing is bypassed.
       if (status === 429) {
+        const code = String((data as { code?: string | number }).code ?? data.error?.code ?? "429");
+        const kind = classifyVfs429(code, 429) ?? "ip";
+        logger.warn({ status, url, code, kind, bodySnippet: body.slice(0, 200) }, "429 from slot API");
         return {
           slot: null,
-          rateLimited: true,
+          rateLimited: kind === "ip",
+          accountBlocked: kind === "account",
+          rateLimitedIp: kind === "ip",
+          rateLimitCode: code,
           response: {
             earliestDate: null,
             earliestSlotLists: [],
-            error: { code: -1, description: "429 Too Many Requests. Rate limited by VFS API.", type: "Error" },
+            error: { code: -1, description: `429 rate-limit (${code}).`, type: "Error" },
           },
         };
       }
@@ -125,7 +160,10 @@ export class PollingService {
         return {
           slot: null,
           unauthorized: apiError.unauthorized,
-          rateLimited: apiError.rateLimited,
+          rateLimited: apiError.rateLimitedIp,
+          accountBlocked: apiError.accountBlocked,
+          rateLimitedIp: apiError.rateLimitedIp,
+          rateLimitCode: apiError.rateLimitCode,
           forbidden: apiError.forbidden,
           response: {
             earliestDate: null,
@@ -143,6 +181,36 @@ export class PollingService {
         visaCategoryCode: options?.visaCategoryCode,
       };
     } catch (err) {
+      if (err instanceof VfsRateLimitedError) {
+        logger.warn(
+          { err: err.message, code: err.code, kind: err.kind, url },
+          "429 rate-limit from slot API"
+        );
+        return {
+          slot: null,
+          rateLimited: err.isIpBlock,
+          accountBlocked: err.isAccountBlock,
+          rateLimitedIp: err.isIpBlock,
+          rateLimitCode: err.code,
+          response: {
+            earliestDate: null,
+            earliestSlotLists: [],
+            error: { code: -1, description: err.message, type: "Error" },
+          },
+        };
+      }
+      if (err instanceof VfsGatewayTimeoutError) {
+        logger.warn({ err, url }, "504 Gateway Timeout from slot API — need browser restart + IP rotation + re-login");
+        return {
+          slot: null,
+          gatewayTimeout: true,
+          response: {
+            earliestDate: null,
+            earliestSlotLists: [],
+            error: { code: -1, description: "504 Gateway Timeout. Restarting browser + rotating IP.", type: "Error" },
+          },
+        };
+      }
       logger.debug({ err, url }, "Browser slot check failed");
       return {
         slot: null,
@@ -167,7 +235,14 @@ function isSlotsAvailableErrorCode(code: number | undefined | null): boolean {
   return typeof code === "number" && SLOTS_AVAILABLE_ERROR_CODES.has(code);
 }
 
-function normalizeApiError(data: CheckIsSlotAvailableResponse & { code?: string | number }): { message: string; unauthorized: boolean; rateLimited: boolean; forbidden: boolean } | null {
+function normalizeApiError(data: CheckIsSlotAvailableResponse & { code?: string | number }): {
+  message: string;
+  unauthorized: boolean;
+  accountBlocked: boolean;
+  rateLimitedIp: boolean;
+  rateLimitCode?: string;
+  forbidden: boolean;
+} | null {
   if (data.earliestSlotLists != null && Array.isArray(data.earliestSlotLists)) return null;
   const code = data.code ?? data.error?.code;
   const desc = (data as { description?: string }).description ?? data.error?.description;
@@ -175,9 +250,18 @@ function normalizeApiError(data: CheckIsSlotAvailableResponse & { code?: string 
     const msg = [code, desc].filter(Boolean).join(" ");
     const codeStr = String(code);
     const unauthorized = codeStr.startsWith("401");
-    const rateLimited = codeStr.startsWith("429");
+    const rateKind = classifyVfs429(codeStr);
     const forbidden = codeStr.startsWith("403");
-    return msg ? { message: `${msg}. Check center/category in setup form.`, unauthorized, rateLimited, forbidden } : null;
+    return msg
+      ? {
+          message: `${msg}. Check center/category in setup form.`,
+          unauthorized,
+          accountBlocked: rateKind === "account",
+          rateLimitedIp: rateKind === "ip",
+          rateLimitCode: rateKind ? codeStr : undefined,
+          forbidden,
+        }
+      : null;
   }
   return null;
 }

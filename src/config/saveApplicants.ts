@@ -199,6 +199,7 @@ function finalizeApplicantForLiftApiPost(body: Record<string, unknown>): void {
     delete a.applicantImageData;
     delete a.countryCode;
     delete a.missionCode;
+    a.gender = 0;
   } else {
     if (!Object.prototype.hasOwnProperty.call(a, "visaSubClass")) {
       a.visaSubClass = null;
@@ -255,6 +256,7 @@ function mergeVfsLoginProfileIntoSaveApplicantsBody(body: Record<string, unknown
   const rc = typeof body.countryCode === "string" ? body.countryCode.trim().toLowerCase() : "";
   const rm = typeof body.missionCode === "string" ? body.missionCode.trim().toLowerCase() : "";
   const isIndLva = rc === "ind" && rm === "lva";
+  const isUzbLva = rc === "uzb" && rm === "lva";
 
   const setApplicant = (key: string, val: unknown): void => {
     if (val === undefined || val === null) return;
@@ -267,12 +269,27 @@ function mergeVfsLoginProfileIntoSaveApplicantsBody(body: Record<string, unknown
     a[key] = val;
   };
 
-  setApplicant("firstName", p.firstName);
-  setApplicant("lastName", p.lastName);
+  // For uzb-lva, the form supplies firstName / lastName / passportNumber / nationalityCode.
+  // Only fall back to the VFS login profile when the form left those fields empty.
+  const setApplicantIfEmpty = (key: string, val: unknown): void => {
+    const cur = a[key];
+    const hasVal = typeof cur === "string" ? cur.trim() !== "" : cur !== undefined && cur !== null;
+    if (hasVal) return;
+    setApplicant(key, val);
+  };
+
+  if (isUzbLva) {
+    setApplicantIfEmpty("firstName", p.firstName);
+    setApplicantIfEmpty("lastName", p.lastName);
+    setApplicantIfEmpty("passportNumber", p.passportNumber);
+  } else {
+    setApplicant("firstName", p.firstName);
+    setApplicant("lastName", p.lastName);
+    setApplicant("passportNumber", p.passportNumber);
+  }
   setApplicant("middleName", pr.middleName);
   setApplicant("salutation", pr.salutation);
   setApplicant("dateOfBirth", p.dateOfBirth);
-  setApplicant("passportNumber", p.passportNumber);
   if (!isIndLva) {
     setApplicant("passportExpirtyDate", pr.passportExpirtyDate);
   }
@@ -286,15 +303,22 @@ function mergeVfsLoginProfileIntoSaveApplicantsBody(body: Record<string, unknown
 
   const nat = typeof pr.nationalityCode === "string" ? pr.nationalityCode.trim() : "";
   if (nat) {
-    a.nationalityCode = nat.toUpperCase();
+    if (isUzbLva) {
+      const cur = typeof a.nationalityCode === "string" ? a.nationalityCode.trim() : "";
+      if (!cur) a.nationalityCode = nat.toUpperCase();
+    } else {
+      a.nationalityCode = nat.toUpperCase();
+    }
   }
 
-  const g = pr.gender;
-  if (typeof g === "number" && Number.isFinite(g)) {
-    a.gender = g;
-  } else if (typeof g === "string" && g.trim()) {
-    const n = parseInt(g, 10);
-    if (Number.isFinite(n)) a.gender = n;
+  if (!isIndLva) {
+    const g = pr.gender;
+    if (typeof g === "number" && Number.isFinite(g)) {
+      a.gender = g;
+    } else if (typeof g === "string" && g.trim()) {
+      const n = parseInt(g, 10);
+      if (Number.isFinite(n)) a.gender = n;
+    }
   }
 
   const lu = typeof p.loginUser === "string" ? p.loginUser.trim() : "";
