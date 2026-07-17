@@ -133,9 +133,6 @@ export const config = {
   /** Screen height for grid calculation. 0 = auto-detect via PowerShell (fallback 1040 = 1080 - taskbar). */
   screenHeight: Math.max(0, parseInt(process.env.SCREEN_HEIGHT ?? "0", 10) || 0),
 
-  capmonsterApiKey: (process.env.CAPMONSTER_API_KEY ?? "").trim(),
-  capmonsterTimeoutMs: Math.max(10_000, parseInt(process.env.CAPMONSTER_TIMEOUT_MS ?? "120000", 10) || 120_000),
-
   mailTmOtpEnabled: process.env.ENABLE_MAIL_TM_OTP === "true",
   /** Max time to poll mail.tm after OTP step appears. */
   mailTmOtpTimeoutMs: Math.max(300_000, Number.isFinite(MAIL_TM_OTP_TIMEOUT_MS) ? MAIL_TM_OTP_TIMEOUT_MS : 120_000),

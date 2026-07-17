@@ -34,8 +34,7 @@ import {
 } from "./browser.errors";
 
 import type { BrowserServiceCore } from "./browser.core";
-import { solveTurnstile } from "./capmonster.service";
-import { discoverTurnstile } from "./turnstile.discover";
+import { clickTurnstile } from "./turnstile.click";
 
 // ── Block-page detection ────────────────────────────────────────────────
 
@@ -477,56 +476,14 @@ async function submitLoginImmediately(
 
   if (existingToken) {
     logger.info({ tokenLength: existingToken.length }, "[Login] ✓ Using existing Turnstile token");
-  } else if (config.capmonsterApiKey) {
-    logger.info("[Login] Solving Turnstile via CapMonster...");
-    try {
-      const discovered = await discoverTurnstile(page);
-      if (discovered) {
-        const result = await solveTurnstile({
-          clientKey: config.capmonsterApiKey,
-          websiteURL: page.url(),
-          websiteKey: discovered.sitekey,
-          action: discovered.action ?? undefined,
-          cData: discovered.cData ?? undefined,
-          timeoutMs: config.capmonsterTimeoutMs,
-        });
-        await page.evaluate(injectTurnstileTokenInPage, result.token);
-        logger.info({ ms: result.ms, taskId: result.taskId }, "[Login] CapMonster solved Turnstile");
-      } else {
-        logger.warn("[Login] Could not discover Turnstile sitekey on page — proceeding without token");
-      }
-    } catch (e) {
-      logger.error({ err: e }, "[Login] CapMonster solve failed — proceeding without token");
-    }
   } else {
-    logger.info("[Login] Waiting up to 10s for Turnstile to auto-resolve...");
-    const waitStart = Date.now();
-    const deadline = waitStart + 10_000;
-    let tokenValue = "";
-
-    while (Date.now() < deadline) {
-      tokenValue = await page
-        .evaluate(() => {
-          const el =
-            document.querySelector<HTMLTextAreaElement>('textarea[name="cf-turnstile-response"]') ??
-            document.querySelector<HTMLInputElement>('input[name="cf-turnstile-response"]');
-          return (el as HTMLInputElement | null)?.value?.trim() ?? "";
-        })
-        .catch(() => "");
-
-      if (tokenValue) {
-        logger.info(
-          { tokenLength: tokenValue.length, elapsedMs: Date.now() - waitStart },
-          "[Login] ✓ Turnstile auto-resolved within wait window"
-        );
-        break;
-      }
-
-      await page.waitForTimeout(200);
-    }
-
-    if (!tokenValue) {
-      logger.warn("[Login] Turnstile did not auto-resolve within 10s — proceeding anyway (no CAPMONSTER_API_KEY)");
+    logger.info("[Login] Solving Turnstile by clicking the checkbox...");
+    const token = await clickTurnstile(page).catch((e) => {
+      logger.error({ err: e }, "[Login] Turnstile click solve threw");
+      return "";
+    });
+    if (!token) {
+      logger.warn("[Login] Turnstile not solved — proceeding anyway");
       await page.waitForTimeout(2000);
     }
   }
@@ -803,47 +760,14 @@ async function resubmitLoginAfterOtp(page: Page, core: BrowserServiceCore): Prom
 
       if (tsToken) {
         logger.info({ tokenLength: tsToken.length }, "[OTP] ✓ Using existing Turnstile token");
-      } else if (config.capmonsterApiKey) {
-        logger.info("[OTP] Solving Turnstile via CapMonster...");
-        try {
-          const discovered = await discoverTurnstile(page);
-          if (discovered) {
-            const result = await solveTurnstile({
-              clientKey: config.capmonsterApiKey,
-              websiteURL: page.url(),
-              websiteKey: discovered.sitekey,
-              action: discovered.action ?? undefined,
-              cData: discovered.cData ?? undefined,
-              timeoutMs: config.capmonsterTimeoutMs,
-            });
-            await page.evaluate(injectTurnstileTokenInPage, result.token);
-            tsToken = result.token;
-            logger.info({ ms: result.ms, taskId: result.taskId }, "[OTP] CapMonster solved Turnstile");
-          } else {
-            logger.warn("[OTP] Could not discover Turnstile sitekey on page — proceeding without token");
-          }
-        } catch (e) {
-          logger.error({ err: e }, "[OTP] CapMonster solve failed — proceeding without token");
-        }
       } else {
-        logger.info("[OTP] Waiting up to 10s for Turnstile to auto-resolve...");
-        const otpTsWaitStart = Date.now();
-        const otpTsDeadline = otpTsWaitStart + 10_000;
-
-        while (Date.now() < otpTsDeadline) {
-          tsToken = await readTurnstileResponse();
-          if (tsToken) {
-            logger.info(
-              { tokenLength: tsToken.length, elapsedMs: Date.now() - otpTsWaitStart },
-              "[OTP] ✓ Turnstile auto-resolved within wait window"
-            );
-            break;
-          }
-          await page.waitForTimeout(200);
-        }
-
+        logger.info("[OTP] Solving Turnstile by clicking the checkbox...");
+        tsToken = await clickTurnstile(page).catch((e) => {
+          logger.error({ err: e }, "[OTP] Turnstile click solve threw");
+          return "";
+        });
         if (!tsToken) {
-          logger.warn("[OTP] Turnstile did not auto-resolve within 10s — proceeding anyway (no CAPMONSTER_API_KEY)");
+          logger.warn("[OTP] Turnstile not solved — proceeding anyway");
           await page.waitForTimeout(2000);
         }
       }
