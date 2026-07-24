@@ -13,11 +13,11 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     const fromInput = (el instanceof HTMLInputElement && typeof el.valueAsNumber === "number" && Number.isFinite(el.valueAsNumber) && el.valueAsNumber >= 1)
       ? Math.floor(el.valueAsNumber)
       : NaN;
-    if (Number.isFinite(fromInput)) return Math.min(50, fromInput);
+    if (Number.isFinite(fromInput)) return Math.min(100, fromInput);
     const parsed = parseInt(String(el.value).trim(), 10);
-    if (Number.isFinite(parsed) && parsed >= 1) return Math.min(50, parsed);
+    if (Number.isFinite(parsed) && parsed >= 1) return Math.min(100, parsed);
     const fromAttr = parseInt(String(el.getAttribute("value") || "").trim(), 10);
-    if (Number.isFinite(fromAttr) && fromAttr >= 1) return Math.min(50, fromAttr);
+    if (Number.isFinite(fromAttr) && fromAttr >= 1) return Math.min(100, fromAttr);
     return 1;
   }
 
@@ -445,12 +445,17 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     updateUzbLvaApplicantFields();
     applyInstanceScheduleRangeToForm(inst.details || {});
 
-    // Global settings (instance 0): postLoginPollDelay.
+    // Global settings (instance 0): postLoginPollDelay + staggerIntervalSec.
     const globalInst = data.instances["0"];
     const plpdEl = document.getElementById("postLoginPollDelay");
     if (plpdEl) {
       const src = (globalInst && globalInst.details) || (inst && inst.details) || {};
       plpdEl.value = src.postLoginPollDelay != null ? String(src.postLoginPollDelay) : "30";
+    }
+    const sisEl = document.getElementById("staggerIntervalSec");
+    if (sisEl) {
+      const gsrc = (globalInst && globalInst.details) || {};
+      sisEl.value = gsrc.staggerIntervalSec != null ? String(gsrc.staggerIntervalSec) : "6";
     }
 
     if (showAlert) {
@@ -494,6 +499,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       numInstances: getNumInstances(),
       userPollInterval: parseInt(String(fd.get("userPollInterval") || "60"), 10) || 60,
       postLoginPollDelay: parseInt(String(fd.get("postLoginPollDelay") || "30"), 10),
+      staggerIntervalSec: parseInt(String(fd.get("staggerIntervalSec") || "6"), 10),
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
       helloVerifyNumber: String(fd.get("helloVerifyNumber") ?? "").trim() || undefined,
       juridictionCode: String(fd.get("juridictionCode") ?? "").trim() || undefined,
@@ -693,6 +699,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       numInstances: getNumInstances(),
       userPollInterval: parseInt(String(fd.get("userPollInterval") || "60"), 10) || 60,
       postLoginPollDelay: parseInt(String(fd.get("postLoginPollDelay") || "30"), 10),
+      staggerIntervalSec: parseInt(String(fd.get("staggerIntervalSec") || "6"), 10),
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
       helloVerifyNumber: String(fd.get("helloVerifyNumber") ?? "").trim() || undefined,
       juridictionCode: String(fd.get("juridictionCode") ?? "").trim() || undefined,

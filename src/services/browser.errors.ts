@@ -1,5 +1,16 @@
 import { type Vfs429Kind } from "../utils/vfsRateLimit";
 
+/**
+ * VFS redirected to page-not-found / session-expired. The bot cycle wrapper rotates IP
+ * and restarts the full cycle (skipping the fleet poll gate).
+ */
+export class PageNotFoundRestartError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PageNotFoundRestartError";
+  }
+}
+
 /** Thrown when a VFS page or API returns HTTP 403 Forbidden — caller should restart browser + rotate IP. */
 export class VfsForbiddenError extends Error {
   constructor(message: string) {

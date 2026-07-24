@@ -10,6 +10,8 @@ import {
 } from "../utils/applicantDetails.store";
 import { getSessionLoginCredentials, setSessionLoginCredentials, getAllInstanceCredentials } from "../utils/sessionLogin.store";
 import { buildApplicantFormPageScript } from "./applicantDetailsFormClientScript";
+import { buildMonitorTabHtml } from "./monitorTab";
+import type { MonitorHooks } from "../monitoring/status.types";
 
 const APPLICANT_UI_PORT = 3847;
 
@@ -225,6 +227,12 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
     const v = parseInt(j.postLoginPollDelay, 10);
     if (Number.isFinite(v) && v >= 0) out.postLoginPollDelay = v;
   }
+  if (typeof j.staggerIntervalSec === "number" && Number.isFinite(j.staggerIntervalSec) && j.staggerIntervalSec >= 0) {
+    out.staggerIntervalSec = Math.floor(j.staggerIntervalSec);
+  } else if (typeof j.staggerIntervalSec === "string" && j.staggerIntervalSec.trim() !== "") {
+    const v = parseInt(j.staggerIntervalSec, 10);
+    if (Number.isFinite(v) && v >= 0) out.staggerIntervalSec = v;
+  }
   if (typeof out.helloVerifyNumber === "string") {
     const digits = out.helloVerifyNumber.replace(/\D/g, "").slice(0, 6);
     if (digits.length > 0) out.helloVerifyNumber = digits;
@@ -233,7 +241,7 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
   return out;
 }
 
-function buildPageHtml(collectLogin: boolean): string {
+function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
   /** Per-instance date range row in the applicant column. */
   const scheduleDateRangeRow = `
   <div class="schedule-range-row" role="group" aria-label="Appointment date range">
@@ -266,7 +274,9 @@ function buildPageHtml(collectLogin: boolean): string {
     <label for="postLoginPollDelay" style="margin-top:0.75rem">Post-login poll delay (seconds)</label>
     <input type="number" id="postLoginPollDelay" name="postLoginPollDelay" min="0" value="30" />
     <label for="numInstances">Number of instances</label>
-    <input type="number" id="numInstances" name="numInstances" min="1" max="50" value="1" />
+    <input type="number" id="numInstances" name="numInstances" min="1" max="100" value="1" />
+    <label for="staggerIntervalSec" style="margin-top:0.75rem">Start interval between bots (seconds)</label>
+    <input type="number" id="staggerIntervalSec" name="staggerIntervalSec" min="0" max="120" value="6" />
     <div id="instanceSelectWrapper" style="display:block">
       <label for="instanceId" style="margin-top:0.75rem">Select instance to configure (each uses a different Chrome profile / IP)</label>
       <select id="instanceId" name="instanceId">
@@ -304,7 +314,10 @@ function buildPageHtml(collectLogin: boolean): string {
   <title>${title}</title>
   <style>
     :root { font-family: system-ui, sans-serif; background: #0f1419; color: #e7e9ea; }
-    body { max-width: 1040px; margin: 2rem auto; padding: 0 1.25rem; }
+    body { max-width: none; margin: 0; padding: 0.5rem 0.9rem 1rem; }
+    /* Keep the configuration form readable; let the monitor grid use full width. */
+    #tab-configure { max-width: 1040px; margin: 0 auto; }
+    #tab-monitor { max-width: none; }
     h1 { font-size: 1.25rem; margin-bottom: 0.5rem; }
     p.hint { color: #8b98a5; font-size: 0.9rem; margin-top: 0; }
     label { display: block; margin-top: 0.75rem; font-size: 0.85rem; color: #8b98a5; }
@@ -369,9 +382,19 @@ function buildPageHtml(collectLogin: boolean): string {
     .section-title { margin: 0 0 0.5rem; font-size: 0.92rem; font-weight: 600; color: #c4cdd4; }
     .ok { color: #00ba7c; margin-top: 1rem; }
     .err { color: #f4212e; margin-top: 1rem; }
+    .tabbar { display: flex; gap: 0.35rem; border-bottom: 1px solid #38444d; margin-bottom: 1.25rem; }
+    .tabbtn { width: auto; margin: 0; background: transparent; color: #8b98a5; border: none; border-bottom: 2px solid transparent; border-radius: 0; padding: 0.6rem 1rem; font-size: 0.95rem; font-weight: 600; }
+    .tabbtn:hover { filter: none; color: #e7e9ea; }
+    .tabbtn.active { color: #1d9bf0; border-bottom-color: #1d9bf0; }
+    .tabpanel[hidden] { display: none; }
   </style>
 </head>
 <body>
+  <div class="tabbar" role="tablist">
+    <button type="button" class="tabbtn active" data-tab="configure">Configure bots</button>
+    ${hasMonitor ? `<button type="button" class="tabbtn" data-tab="monitor">Monitor bots</button>` : ""}
+  </div>
+  <div id="tab-configure" class="tabpanel">
   <form id="f">
     <div class="form-layout">
       <div class="form-col form-col--setup">
@@ -710,6 +733,24 @@ function buildPageHtml(collectLogin: boolean): string {
     </div>
   </form>
   <p id="msg"></p>
+  </div>
+  ${hasMonitor ? `<div id="tab-monitor" class="tabpanel" hidden>${buildMonitorTabHtml()}</div>` : ""}
+  <script>
+  (function(){
+    var btns = Array.prototype.slice.call(document.querySelectorAll('.tabbtn'));
+    btns.forEach(function(b){
+      b.addEventListener('click', function(){
+        btns.forEach(function(x){ x.classList.remove('active'); });
+        b.classList.add('active');
+        var t = b.getAttribute('data-tab');
+        Array.prototype.slice.call(document.querySelectorAll('.tabpanel')).forEach(function(p){
+          p.hidden = (p.id !== 'tab-' + t);
+        });
+        if (t === 'monitor' && window.__monitorInit) window.__monitorInit();
+      });
+    });
+  })();
+  </script>
   ${buildApplicantFormPageScript(collectLoginJs)}
 </body>
 </html>`;
@@ -738,6 +779,8 @@ export type ApplicantFormOptions = {
    * from its own logged-in Chrome tab (cluster); single-process returns one result row.
    */
   onTestApplicantsApi?: () => Promise<TestApplicantsApiBatchResult>;
+  /** Monitoring dashboard hooks. When set, the page shows a "Monitor bots" tab. */
+  monitor?: MonitorHooks;
 };
 
 export type FormSubmitInfo = { firstSubmit: boolean;[key: string]: unknown };
@@ -820,8 +863,83 @@ export function runApplicantFormWithSubmitHandler(
         const path = u.pathname;
 
         if (req.method === "GET" && path === "/") {
-          html(res, buildPageHtml(collectLogin));
+          html(res, buildPageHtml(collectLogin, Boolean(options?.monitor)));
           return;
+        }
+
+        // ── Monitoring dashboard API (only when monitor hooks provided) ──
+        if (options?.monitor && (path === "/api/monitor/events" || path.startsWith("/api/monitor/"))) {
+          const monitor = options.monitor;
+
+          if (req.method === "GET" && path === "/api/monitor/control") {
+            json(res, 200, { ok: true, control: monitor.getControl() });
+            return;
+          }
+          if (req.method === "GET" && path === "/api/monitor/snapshot") {
+            json(res, 200, { ok: true, instances: monitor.snapshot() });
+            return;
+          }
+          if (req.method === "GET" && path === "/api/monitor/events") {
+            // Keep the streaming socket open indefinitely (no idle timeout) so the
+            // dashboard stays "live" instead of dropping to "reconnecting…".
+            req.socket.setTimeout(0);
+            req.socket.setNoDelay(true);
+            req.socket.setKeepAlive(true);
+            res.writeHead(200, {
+              "Content-Type": "text/event-stream; charset=utf-8",
+              "Cache-Control": "no-cache, no-transform",
+              Connection: "keep-alive",
+              "X-Accel-Buffering": "no",
+            });
+            res.flushHeaders?.();
+            res.write("retry: 3000\n\n");
+            for (const s of monitor.snapshot()) {
+              res.write(`data: ${JSON.stringify(s)}\n\n`);
+            }
+            const unsub = monitor.subscribe((s) => {
+              try { res.write(`data: ${JSON.stringify(s)}\n\n`); } catch { /* client gone */ }
+            });
+            const ping = setInterval(() => {
+              try { res.write(": ping\n\n"); } catch { /* client gone */ }
+            }, 20_000);
+            const cleanup = (): void => { clearInterval(ping); unsub(); };
+            req.on("close", cleanup);
+            req.on("error", cleanup);
+            return;
+          }
+          if (req.method === "POST") {
+            const raw = await readBody(req);
+            let mj: Record<string, unknown> = {};
+            try { mj = raw ? (JSON.parse(raw) as Record<string, unknown>) : {}; }
+            catch { json(res, 400, { ok: false, error: "Invalid JSON" }); return; }
+            const toNum = (v: unknown): number => (typeof v === "number" ? v : parseInt(String(v ?? ""), 10));
+            const id = toNum(mj.instanceId);
+            const action = path.slice("/api/monitor/".length);
+            try {
+              if (action === "focus") { json(res, 200, await monitor.focus(id)); return; }
+              if (action === "devtools") { json(res, 200, await monitor.devtools(id)); return; }
+              if (action === "stop") { json(res, 200, monitor.stopInstance(id)); return; }
+              if (action === "restart") { json(res, 200, monitor.restartInstance(id)); return; }
+              if (action === "pause") { json(res, 200, monitor.pauseRollout()); return; }
+              if (action === "resume") { json(res, 200, monitor.resumeRollout()); return; }
+              if (action === "stagger") {
+                const ms = toNum(mj.intervalMs);
+                json(res, 200, monitor.setStaggerInterval(Number.isFinite(ms) ? ms : 6000));
+                return;
+              }
+              if (action === "start") {
+                const count = toNum(mj.count);
+                const ms = toNum(mj.intervalMs);
+                json(res, 200, monitor.start({ count: Number.isFinite(count) ? count : 1, intervalMs: Number.isFinite(ms) ? ms : 6000 }));
+                return;
+              }
+            } catch (e) {
+              json(res, 500, { ok: false, error: e instanceof Error ? e.message : String(e) });
+              return;
+            }
+            json(res, 404, { ok: false, error: "Unknown monitor action" });
+            return;
+          }
         }
 
         if (req.method === "GET" && path === "/api/defaults") {
@@ -916,13 +1034,14 @@ export function runApplicantFormWithSubmitHandler(
             ...rest
           } = j;
           const fields = parseApplicantFields(rest);
-          const { userPollInterval: upi, postLoginPollDelay: plpd, ...instanceFields } = fields;
+          const { userPollInterval: upi, postLoginPollDelay: plpd, staggerIntervalSec: sis, ...instanceFields } = fields;
 
           {
             const global0 = getApplicantDetailsOverrides(0) ?? {};
             let changed = false;
             if (typeof upi === "number") { global0.userPollInterval = upi; changed = true; }
             if (typeof plpd === "number") { global0.postLoginPollDelay = plpd; changed = true; }
+            if (typeof sis === "number") { global0.staggerIntervalSec = sis; changed = true; }
             if (typeof instanceFields.countryCode === "string") { global0.countryCode = instanceFields.countryCode; changed = true; }
             if (typeof instanceFields.missionCode === "string") { global0.missionCode = instanceFields.missionCode; changed = true; }
             if (changed) setApplicantDetailsOverrides(global0, 0);
@@ -948,6 +1067,14 @@ export function runApplicantFormWithSubmitHandler(
             typeof j.numInstances === "number" && j.numInstances > 0
               ? Math.floor(j.numInstances)
               : 1;
+
+          const submittedStaggerSec =
+            typeof j.staggerIntervalSec === "number" && j.staggerIntervalSec >= 0
+              ? Math.floor(j.staggerIntervalSec)
+              : (() => {
+                  const v = parseInt(String(j.staggerIntervalSec ?? ""), 10);
+                  return Number.isFinite(v) && v >= 0 ? v : undefined;
+                })();
 
           const credentials = getAllInstanceCredentials();
           const details = getAllInstanceApplicantDetails();
@@ -979,6 +1106,7 @@ export function runApplicantFormWithSubmitHandler(
               firstSubmit: !seenSubmit,
               instanceId,
               numInstances: actualInstanceCount,
+              staggerIntervalSec: submittedStaggerSec,
               ...credentials.get(instanceId),
               ...details.get(instanceId),
             }))

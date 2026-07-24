@@ -3,7 +3,7 @@ import dotenv from "dotenv";
 dotenv.config({ override: false });
 import { exec, spawn } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
 import { get as httpGet } from "node:http";
 import { get as httpsGet } from "node:https";
 import path from "node:path";
@@ -37,7 +37,7 @@ import {
   scheduleConstraintIsActive,
   scheduleConstraintLogValue,
 } from "./utils/scheduleAllowedDates.js";
-import { clearApplicantIpCache } from "./utils/applicantIp";
+import { clearApplicantIpCache, getApplicantIpForPayload } from "./utils/applicantIp";
 import { clearChromeSessionDataBeforeLaunch, resolveChromeProfileFolderName } from "./utils/chromeProfileSessionClean";
 import { killChromeTreeByCdpPortSync } from "./utils/killChromeByCdpPort";
 import {
@@ -48,10 +48,43 @@ import {
   clearPollReadyState,
   stampGateOpened,
 } from "./utils/pollReadyState";
+import { reporter } from "./monitoring/statusReporter";
+import { registry } from "./monitoring/statusRegistry";
+import { focusChromeByPort, getDevtoolsInfo } from "./utils/chromeWindow";
+import type { MonitorHooks } from "./monitoring/status.types";
+import { isPageNotFoundUrl } from "./flows/pageNotFound";
+import { PageNotFoundRestartError } from "./services/browser.errors";
 
 const polling = new PollingService();
 const browser = new BrowserService();
 const telegram = new TelegramService();
+
+const MAX_PAGE_NOT_FOUND_RESTARTS = 12;
+let pageNotFoundRestartRequested = false;
+
+/** Passive URL sampler — defined after page-not-found helpers (see below). */
+function startPageSampler(_instanceId?: number): void {
+  const timer = setInterval(() => {
+    void (async () => {
+      try {
+        const u = await browser.peekFirstTabUrl();
+        if (!u) return;
+        reporter.setPage(u);
+        if (isPageNotFoundUrl(u)) {
+          schedulePageNotFoundRestart(_instanceId);
+        }
+      } catch {
+        /* ignore — monitoring must never affect the bot */
+      }
+    })();
+  }, 3000);
+  timer.unref?.();
+}
+
+async function resolveAndReportEgressIp(): Promise<void> {
+  await browser.resolveApplicantIpForPayload().catch(() => { });
+  reporter.setEgressIp(getApplicantIpForPayload());
+}
 
 const DEFAULT_POST_LOGIN_POLL_DELAY_SEC = 30;
 const FAST_SKIP_CALENDAR_UP_TO_INSTANCE = Math.max(
@@ -184,7 +217,7 @@ async function rotateIpWithoutRelogin(context: string): Promise<boolean> {
         clientsource: null,
       });
     }
-    await browser.resolveApplicantIpForPayload().catch(() => { });
+    await resolveAndReportEgressIp();
     softIpRotateAwaitingSecond429 = true;
     return true;
   } catch (err) {
@@ -207,6 +240,8 @@ async function handleIpRateLimitRecovery(
   code?: string
 ): Promise<"soft_rotated" | "full_relogin"> {
   const label = code ?? "4292xx";
+  reporter.setPhase("recovering", `IP rate-limit ${label} — rotating IP`);
+  reporter.setPoll({ code: label });
   if (!softIpRotateAwaitingSecond429) {
     await telegram
       .alert(
@@ -251,6 +286,9 @@ async function stopForAccountRateLimit(
 ): Promise<void> {
   clearSoftIpRotateFlag();
   const label = code ?? "4290xx";
+  reporter.setAttention("blocked", `account rate-limit ${label} — stopped`);
+  reporter.setPhase("stopped", `account rate-limit ${label}`);
+  reporter.setPoll({ code: label });
   logger.error(
     { instanceId, context, code: label },
     "4290XX account/User ID rate-limit — stopping bot"
@@ -298,6 +336,43 @@ function requestPollingAbort(reason: string, instanceId?: number): void {
     }
   }
   logger.info({ instanceId, reason, pollingAbortSeq }, "[poll] Abort requested");
+}
+
+function schedulePageNotFoundRestart(instanceId?: number): void {
+  if (pageNotFoundRestartRequested) return;
+  pageNotFoundRestartRequested = true;
+  requestPollingAbort("page-not-found", instanceId);
+}
+
+async function throwIfPageNotFoundRestartRequested(context: string): Promise<void> {
+  if (!pageNotFoundRestartRequested) return;
+  pageNotFoundRestartRequested = false;
+  throw new PageNotFoundRestartError(context);
+}
+
+/** When the page sampler aborts a wait, restart the bot if the abort was for page-not-found. */
+async function throwIfAbortedForPageNotFound(abortSeq: number, context: string): Promise<void> {
+  if (pollingAbortSeq !== abortSeq) {
+    await throwIfPageNotFoundRestartRequested(context);
+  }
+}
+
+async function checkUrlForPageNotFound(url: string, context: string): Promise<void> {
+  if (isPageNotFoundUrl(url)) {
+    throw new PageNotFoundRestartError(`${context}: ${url}`);
+  }
+}
+
+async function rotateIpForPageNotFound(instanceId?: number, context?: string): Promise<void> {
+  logger.error({ instanceId, context }, "[page-not-found] Rotating IP and restarting bot cycle");
+  reporter.setPhase("recovering", "page-not-found — rotating IP + restart");
+  reporter.setAttention("blocked", "page-not-found — restarting bot");
+  await telegram
+    .alert("error", `Bot ${instanceId ?? "?"} page-not-found — rotating IP + restart`)
+    .catch(() => { });
+  clearApplicantIpCache();
+  await browser.disconnectCdp().catch(() => { });
+  await relaunchChromeAfterCredentialSwapLogout();
 }
 function waitForPollingAbort(currentSeq: number): Promise<void> {
   if (pollingAbortSeq !== currentSeq) return Promise.resolve();
@@ -424,27 +499,47 @@ function getBotInstanceId(userDataDir: string): string {
 }
 
 /**
- * Remove saved window placement from Chrome's Preferences file so Chrome
- * doesn't restore an off-screen or wrong-sized window from a previous run.
- * Must be called before Chrome starts (profile not locked).
+ * Patch Chrome Preferences before launch:
+ * - drop saved window placement (off-screen / wrong size from prior runs)
+ * - mark clean exit so "Restore pages?" / crash bubble does not appear
+ * - disable password manager so "Save password?" never pops up
+ * Must run while Chrome for this profile is not running.
  */
-function clearChromeWindowPlacement(userDataDir: string): void {
+function patchChromeProfilePrefsBeforeLaunch(userDataDir: string): void {
   try {
     const profile = resolveChromeProfileFolderName();
-    const prefsPath = path.join(userDataDir, profile, "Preferences");
-    if (!existsSync(prefsPath)) return;
-    const raw = readFileSync(prefsPath, "utf-8");
-    const prefs = JSON.parse(raw);
-    let changed = false;
-    if (prefs.browser?.window_placement) {
-      delete prefs.browser.window_placement;
-      changed = true;
+    const profileDir = path.join(userDataDir, profile);
+    mkdirSync(profileDir, { recursive: true });
+    const prefsPath = path.join(profileDir, "Preferences");
+    let prefs: Record<string, unknown> = {};
+    if (existsSync(prefsPath)) {
+      try {
+        prefs = JSON.parse(readFileSync(prefsPath, "utf-8")) as Record<string, unknown>;
+      } catch {
+        prefs = {};
+      }
     }
-    if (changed) {
-      writeFileSync(prefsPath, JSON.stringify(prefs), "utf-8");
-    }
+
+    const browser = (prefs.browser ?? {}) as Record<string, unknown>;
+    delete browser.window_placement;
+    prefs.browser = browser;
+
+    const profilePrefs = (prefs.profile ?? {}) as Record<string, unknown>;
+    profilePrefs.exit_type = "Normal";
+    profilePrefs.exited_cleanly = true;
+    profilePrefs.password_manager_enabled = false;
+    prefs.profile = profilePrefs;
+
+    prefs.credentials_enable_service = false;
+    prefs.credentials_enable_autosignin = false;
+
+    const passwordManager = (prefs.password_manager ?? {}) as Record<string, unknown>;
+    passwordManager.saving_and_filling_passwords_enabled = false;
+    prefs.password_manager = passwordManager;
+
+    writeFileSync(prefsPath, JSON.stringify(prefs), "utf-8");
   } catch {
-    // Non-critical — Chrome will just use its default placement
+    // Non-critical — flags below still suppress most dialogs
   }
 }
 
@@ -683,7 +778,7 @@ async function ensureChromeWithDevTools(opts?: { preserveSession?: boolean }): P
   const totalInstances = parseInt(process.env.BOT_TOTAL_INSTANCES ?? "1", 10) || 1;
   const grid = await computeChromeGridPosition(numericInstanceId, totalInstances);
 
-  clearChromeWindowPlacement(userDataDir);
+  patchChromeProfilePrefsBeforeLaunch(userDataDir);
 
   const chromeArgs = [
     `--remote-debugging-port=${debugPort}`,
@@ -691,6 +786,12 @@ async function ensureChromeWithDevTools(opts?: { preserveSession?: boolean }): P
     `--user-data-dir=${userDataDir}`,
     "--no-first-run",
     "--no-default-browser-check",
+    // Suppress "Save password?" and "Restore pages?" / crash-restore bubbles
+    "--disable-save-password-bubble",
+    "--disable-session-crashed-bubble",
+    "--hide-crash-restore-bubble",
+    "--disable-features=PasswordManagerOnboarding,PasswordLeakDetection",
+    "--password-store=basic",
   ];
   const profileDirectory = process.env.CHROME_PROFILE_DIRECTORY?.trim();
   if (profileDirectory) {
@@ -906,6 +1007,64 @@ function restoreChromeWindow(): Promise<void> {
   return chromeWindowShowCommand(getRemoteDebuggingPort(), 9, "RESTORE");
 }
 
+/** Fixed settle time on dashboard after a mid-workflow restart/relogin. */
+const RESTART_DASHBOARD_WAIT_MS = 30_000;
+
+/**
+ * After a successful dashboard landing: minimize Chrome (operator doesn't need it
+ * while polling). Optionally wait (restart/relogin settle) before continuing.
+ */
+async function settleOnDashboard(opts: {
+  instanceId?: number;
+  waitMs?: number;
+  abortSeq?: number;
+  reason?: string;
+}): Promise<"ok" | "abort"> {
+  await minimizeChromeWindow().catch((err) => {
+    logger.warn({ err, instanceId: opts.instanceId }, "[Chrome] Minimize after dashboard failed");
+  });
+  logger.info({ instanceId: opts.instanceId, reason: opts.reason }, "[Chrome] Minimized after dashboard");
+
+  const waitMs = opts.waitMs ?? 0;
+  if (waitMs <= 0) return "ok";
+
+  reporter.setPhase("polling", `on dashboard — waiting ${Math.round(waitMs / 1000)}s`);
+  logger.info(
+    { instanceId: opts.instanceId, waitMs, reason: opts.reason },
+    "[Dashboard] Waiting before next step after restart/relogin"
+  );
+
+  const abortSeq = opts.abortSeq;
+  if (abortSeq == null) {
+    await new Promise((r) => setTimeout(r, waitMs));
+    return "ok";
+  }
+  await Promise.race([
+    new Promise((r) => setTimeout(r, waitMs)),
+    waitForPollingAbort(abortSeq),
+  ]);
+  if (pollingAbortSeq !== abortSeq) {
+    await throwIfAbortedForPageNotFound(abortSeq, "dashboard-settle-abort");
+    return "abort";
+  }
+  return "ok";
+}
+
+/** Mark payment page reached and bring Chrome forward so the operator can pay. */
+async function enterPaymentPageMode(instanceId?: number): Promise<void> {
+  instanceOnPaymentPage = true;
+  reporter.setPhase("payment", "on payment page — pay manually");
+  reporter.setAttention(null);
+  const focused = await focusChromeByPort(getRemoteDebuggingPort()).catch(() => false);
+  if (!focused) {
+    await restoreChromeWindow().catch(() => { });
+  }
+  logger.info(
+    { instanceId, focused },
+    "[Booking] Complete — Chrome focused on payment page and will stay there permanently"
+  );
+}
+
 /**
  * If another instance wrote `slot-state.json`, adopt their center/category and treat polling as a hit.
  * Must run after each slot check (and between centers): peers can mark the file while this instance is in-flight.
@@ -966,6 +1125,7 @@ async function runPollLoop(
   try {
     while (limit === 0 || completed < limit) {
       if (pollingAbortSeq !== myAbortSeq) {
+        await throwIfAbortedForPageNotFound(myAbortSeq, "polling-loop-abort");
         logger.info({ instanceId }, "[poll] Aborting poll loop (config updated)");
         return false;
       }
@@ -993,7 +1153,31 @@ async function runPollLoop(
         }
 
         const currentUrl = await browser.getFirstTabUrl();
+        reporter.setPage(currentUrl);
+        await throwIfPageNotFoundRestartRequested("polling-loop");
         if (!/\/(applications|dashboard|home|application-detail|your-details)/i.test(currentUrl)) {
+          // Not on a normal VFS page. If it's a block/error page (403201 "Access
+          // Restricted", page-not-found, session-expired, or a 429 body), recover
+          // instead of silently stopping — this is the post-login block case.
+          if (isPageNotFoundUrl(currentUrl)) {
+            throw new PageNotFoundRestartError(`polling: ${currentUrl}`);
+          }
+          const blockKind = await browser.detectPageBlockKind();
+          if (blockKind === "account_429") {
+            await stopForAccountRateLimit(instanceId, "polling-page-block", "4290xx");
+            return false;
+          }
+          if (blockKind === "ip_429") {
+            await handleIpRateLimitRecovery(instanceId, "polling-page-block", "4292xx");
+            continue;
+          }
+          if (blockKind === "forbidden") {
+            logger.error({ instanceId, currentUrl }, "Block/error page during polling — restarting browser + rotating IP + relogin");
+            reporter.setAttention("blocked", "block page after login — rotating IP + relogin");
+            await telegram.alert("error", `Bot ${instanceId ?? "?"} hit a block page during polling (${currentUrl || "unknown"}). Restarting browser + rotating IP + relogin...`).catch(() => { });
+            await performPollStyleRelogin(instanceId, "polling-block-page");
+            continue;
+          }
           logger.error({ instanceId, currentUrl }, "Browser is not on a supported VFS page for polling. Stopping polling.");
           await telegram.alert("error", `Not on a supported VFS page for polling (${currentUrl || "unknown"}). Polling stopped.`).catch(() => { });
           return false;
@@ -1003,6 +1187,8 @@ async function runPollLoop(
           { instanceId, centerNumber: center.centerNumber, vacCode: center.vacCode, visaCategoryCode: center.visaCategoryCode, poll: completed + 1 },
           `Checking Center ${center.centerNumber}`
         );
+        reporter.setPhase("polling", `checking center ${center.centerNumber} (${center.vacCode})`);
+        reporter.setPoll({ center: `${center.centerNumber}:${center.vacCode}`, pollCount: completed + 1 });
 
         const { slot, response, centerNumber, centerCode, visaCategoryCode, unauthorized, accountBlocked, rateLimitedIp, rateLimitCode, forbidden, gatewayTimeout } = await polling.checkSlotsInBrowser(browser, {
           centerCode: center.vacCode,
@@ -1051,6 +1237,8 @@ async function runPollLoop(
 
         if (slot) {
           slotFound = true;
+          reporter.setPoll({ slotFound: true, code: "slot" });
+          reporter.setDetail(`slot found in center ${centerNumber}`);
 
           markSlotFound(instanceId ?? 0, centerCode!, visaCategoryCode!, slot);
           setSlotCenterOverride(centerCode!, visaCategoryCode!);
@@ -1230,6 +1418,7 @@ async function performPollStyleRelogin(instanceId?: number, context?: string): P
   const pollReloginInterval = config.pollReloginInterval;
   const ctx = context ?? "poll-relogin";
   clearSoftIpRotateFlag();
+  reporter.setPhase("recovering", `relogin (${ctx})`);
 
   logger.info(
     { instanceId, pollReloginInterval, ctx },
@@ -1241,7 +1430,13 @@ async function performPollStyleRelogin(instanceId?: number, context?: string): P
   clearApplicantIpCache();
   await relaunchChromeAfterCredentialSwapLogout();
   await performVfsLoginFromStore(instanceId);
-  await browser.resolveApplicantIpForPayload();
+  await resolveAndReportEgressIp();
+  // Mid-workflow restart/relogin: settle on dashboard (minimize + 30s) before polling again.
+  await settleOnDashboard({
+    instanceId,
+    waitMs: RESTART_DASHBOARD_WAIT_MS,
+    reason: ctx,
+  });
   await browser.preparePollingAfterLogin({ skipDashboardNavigate: true });
 }
 
@@ -1396,8 +1591,12 @@ async function loginWithForbiddenRecovery(instanceId?: number): Promise<void> {
       await performVfsLoginFromStore(instanceId);
       return;
     } catch (err) {
+      if (err instanceof PageNotFoundRestartError) {
+        throw err;
+      }
       if (err instanceof VfsForbiddenError) {
         forbiddenAttempts++;
+        reporter.setPhase("recovering", `403 block — rotating IP + relogin (attempt ${forbiddenAttempts})`);
         logger.error({ instanceId, forbiddenAttempts, maxRetries: MAX_FORBIDDEN_RETRIES }, "403 Forbidden during login — restarting browser + rotating IP");
         await telegram.alert("error", `Bot ${instanceId ?? "?"} got 403 during login (attempt ${forbiddenAttempts}/${MAX_FORBIDDEN_RETRIES}). Restarting browser + rotating IP...`).catch(() => { });
         clearApplicantIpCache();
@@ -1493,6 +1692,7 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
 
   // If a newer force-book arrived before this chain even started, exit immediately.
   if (pollingAbortSeq !== chainAbortSeq) {
+    await throwIfAbortedForPageNotFound(chainAbortSeq, "booking-chain-abort");
     logger.info({ instanceId }, "[ForceBook] Booking chain superseded before start — skipping");
     return false;
   }
@@ -1502,12 +1702,14 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
   applicants10673Recovery: while (true) {
     // Check abort before each Applicants API attempt so superseded chains don't waste a request.
     if (pollingAbortSeq !== chainAbortSeq) {
+      await throwIfAbortedForPageNotFound(chainAbortSeq, "booking-save-abort");
       logger.info({ instanceId }, "[ForceBook] Booking chain superseded — exiting before save-applicants");
       return false;
     }
     for (let phase1Idx = 0; phase1Idx < phase1Attempts; phase1Idx++) {
       let saw10673ThisPhase = false;
       try {
+        reporter.setBookingStep("save applicants");
         await browser.saveApplicantsViaLiftApi();
 
         // Verify URN was set; if not, treat as a retryable failure.
@@ -1572,6 +1774,7 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
         waitForPollingAbort(chainAbortSeq),
       ]);
       if (pollingAbortSeq !== chainAbortSeq) {
+        await throwIfAbortedForPageNotFound(chainAbortSeq, "booking-retry-delay-abort");
         logger.info({ instanceId }, "[ForceBook] Save-applicants retry delay interrupted — exiting booking chain");
         return false;
       }
@@ -1646,6 +1849,7 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
   }
 
   try {
+    reporter.setBookingStep("timeslot");
     await browser.postTimeslotLiftApi();
   } catch (err) {
     if (err instanceof VfsRateLimitedError) {
@@ -1675,11 +1879,13 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
     await browser.postMapVasLiftApi();
   }
 
+  reporter.setBookingStep("fees");
   await browser.postFeesLiftApi();
 
   const MAX_SCHEDULE_RETRIES_FROM_CALENDAR = 3;
   for (let schedAttempt = 1; schedAttempt <= MAX_SCHEDULE_RETRIES_FROM_CALENDAR; schedAttempt++) {
     try {
+      reporter.setBookingStep("schedule");
       await browser.postScheduleLiftApi();
       break;
     } catch (schedErr) {
@@ -1728,7 +1934,26 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
   }
 }
 
-type SubmitMeta = { firstSubmit: boolean; instanceId?: number };
+type SubmitMeta = { firstSubmit: boolean; instanceId?: number; pollStartAt?: number | null; skipPollGate?: boolean };
+
+async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
+  let m = meta;
+  for (let attempt = 0; attempt < MAX_PAGE_NOT_FOUND_RESTARTS; attempt++) {
+    try {
+      await runOneBotCycleCore(m);
+      return;
+    } catch (err) {
+      if (err instanceof PageNotFoundRestartError) {
+        pageNotFoundRestartRequested = false;
+        await rotateIpForPageNotFound(m.instanceId, err.message);
+        m = { ...m, firstSubmit: false, skipPollGate: true };
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw new Error(`page-not-found persisted after ${MAX_PAGE_NOT_FOUND_RESTARTS} restarts`);
+}
 
 async function performVfsLoginFromStore(instanceId?: number): Promise<void> {
   const u = resolveLoginUsername(instanceId);
@@ -1766,7 +1991,7 @@ async function performVfsLoginFromStore(instanceId?: number): Promise<void> {
  * fresh VFS session that cycle, e.g. relogin or new browser).
  */
 
-async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
+async function runOneBotCycleCore(meta: SubmitMeta): Promise<void> {
   // Reload .env changes for submit-driven runs (so toggles like TURNSTILE_DEMO_MODE take effect
   // without restarting). In cluster mode the parent sets instance-specific env vars
   // (BROWSER_CDP_URL, CHROME_USER_DATA_DIR, BOT_INSTANCE_ID) via spawn — never let dotenv
@@ -1788,6 +2013,9 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
   // Set current instance ID for config getters (e.g., loginUser)
   setCurrentInstanceId(instanceId);
 
+  reporter.setPhase("launching", "starting cycle");
+  reporter.setAccount(resolveLoginUsername(instanceId), getPendingCredentialSlot(instanceId));
+
   if (
     /^true|1|yes$/i.test((process.env.VFS_CLEAR_APPLICANT_IP_CACHE_EACH_CYCLE ?? "").trim())
   ) {
@@ -1798,11 +2026,13 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
     );
   }
 
-  // Clear shared slot state at the start of a new cycle
-  if (meta.firstSubmit) {
+  // Clear shared slot state once per batch (single-instance). Cluster parent clears on first Submit.
+  if (meta.firstSubmit && !isClusterChild) {
     clearSlotState();
     clearSlotCenterOverride();
   }
+
+  await throwIfPageNotFoundRestartRequested("cycle-start");
 
   // 1) Drop old Playwright CDP attachment; 2) ensure Chrome + DevTools; 3) reconnect
   await browser.disconnectCdp();
@@ -1810,19 +2040,16 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
 
   // Log outbound IP as soon as CDP can attach (Chrome proxy egress). A later call reuses cache; if this fails
   // (no tab yet), the post-login resolve retries.
-  await browser.resolveApplicantIpForPayload();
+  await resolveAndReportEgressIp();
 
   let firstUrl = await browser.getFirstTabUrl();
+  reporter.setPage(firstUrl);
+  await checkUrlForPageNotFound(firstUrl, "after-chrome-launch");
 
   let kind = classifyVfsFirstTabUrl(firstUrl);
 
   if (kind === "page_not_found") {
-    logger.error({ instanceId, url: firstUrl }, "[Chrome] Page-not-found — IP/session blocked. Closing browser, clearing caches, rotating IP, reopening...");
-    await telegram.alert("error", `Bot ${instanceId ?? "?"} landed on page-not-found — restarting browser + rotating IP`).catch(() => { });
-    clearApplicantIpCache();
-    await relaunchChromeAfterCredentialSwapLogout();
-    firstUrl = await browser.getFirstTabUrl();
-    kind = classifyVfsFirstTabUrl(firstUrl);
+    throw new PageNotFoundRestartError(`startup tab: ${firstUrl}`);
   }
 
   if (kind === "blank") {
@@ -1857,14 +2084,23 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
   let didLoginThisCycle = false;
   if (kind === "login") {
     try {
+      reporter.setPhase("login", "logging in");
       await loginWithForbiddenRecovery(instanceId);
       firstUrl = await browser.getFirstTabUrl();
+      reporter.setPage(firstUrl);
       kind = classifyVfsFirstTabUrl(firstUrl);
+      await checkUrlForPageNotFound(firstUrl, "after-login");
       didLoginThisCycle = true;
     } catch (loginErr) {
+      if (loginErr instanceof PageNotFoundRestartError) {
+        throw loginErr;
+      }
       const reason = loginErr instanceof Error ? loginErr.message : String(loginErr);
       logger.error({ err: loginErr, instanceId }, "[Login] Login failed — instance stopping");
       instanceStopped = true;
+      reporter.setError(reason);
+      reporter.setAttention("login_failed", "login failed — handle in Chrome");
+      reporter.setPhase("stopped", "login failed");
       await telegram
         .alert("error", `Bot ${instanceId ?? "?"} login failed — stopped.\nReason: ${reason}`)
         .catch(() => { });
@@ -1877,7 +2113,7 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
   }
 
   /** Retry or confirm IP after navigation/login (cached if early resolve already succeeded). */
-  await browser.resolveApplicantIpForPayload();
+  await resolveAndReportEgressIp();
 
   const skipDashboardNavigate = !meta.firstSubmit || kind === "vfs_other";
 
@@ -1888,20 +2124,33 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
 
   const cycleAbortSeq = pollingAbortSeq;
   let slotFoundDuringPoll = false;
-  if (didLoginThisCycle) {
-    const globalDet0 = getApplicantDetailsOverrides(0);
-    const postLoginDelaySec =
-      globalDet0 && typeof globalDet0.postLoginPollDelay === "number" && globalDet0.postLoginPollDelay >= 0
-        ? globalDet0.postLoginPollDelay
-        : DEFAULT_POST_LOGIN_POLL_DELAY_SEC;
-    const postLoginDelayMs = postLoginDelaySec * 1000;
-    logger.info({ instanceId, postLoginDelayMs }, "Post-login base delay before polling");
-    await Promise.race([
-      new Promise((r) => setTimeout(r, postLoginDelayMs)),
-      waitForPollingAbort(cycleAbortSeq),
-    ]);
-    if (pollingAbortSeq !== cycleAbortSeq) {
-      logger.info({ instanceId }, "[poll] Post-login delay aborted (force-book or config update)");
+  const isWorkflowRestart = !meta.firstSubmit || meta.skipPollGate === true;
+
+  // After a successful dashboard landing (login or already on dashboard), minimize Chrome.
+  // Mid-workflow restarts also wait 30s on the dashboard before continuing.
+  if (kind === "dashboard" || didLoginThisCycle) {
+    let waitMs = 0;
+    if (didLoginThisCycle) {
+      const globalDet0 = getApplicantDetailsOverrides(0);
+      const postLoginDelaySec =
+        globalDet0 && typeof globalDet0.postLoginPollDelay === "number" && globalDet0.postLoginPollDelay >= 0
+          ? globalDet0.postLoginPollDelay
+          : DEFAULT_POST_LOGIN_POLL_DELAY_SEC;
+      waitMs = postLoginDelaySec * 1000;
+    }
+    if (isWorkflowRestart && didLoginThisCycle) {
+      waitMs = Math.max(waitMs, RESTART_DASHBOARD_WAIT_MS);
+    } else if (isWorkflowRestart && kind === "dashboard") {
+      waitMs = RESTART_DASHBOARD_WAIT_MS;
+    }
+    const settled = await settleOnDashboard({
+      instanceId,
+      waitMs,
+      abortSeq: cycleAbortSeq,
+      reason: isWorkflowRestart ? "workflow-restart" : "post-login",
+    });
+    if (settled === "abort") {
+      logger.info({ instanceId }, "[poll] Dashboard settle aborted (force-book or config update)");
       return;
     }
   }
@@ -1911,92 +2160,71 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
   // Check if force-book or config-update fired during preparePolling — exit early so the
   // queued attack cycle can start immediately.
   if (pollingAbortSeq !== cycleAbortSeq) {
+    await throwIfAbortedForPageNotFound(cycleAbortSeq, "pre-poll-abort");
     logger.info({ instanceId }, "[poll] Cycle aborted before entering poll loop (force-book or config update)");
     return;
   }
 
-  // --- Synchronized polling gate (first submit only, cluster mode) ---
-  // Mark this instance as dashboard-ready. Wait for all instances to reach
-  // the dashboard (or 30s timeout), then compute a gap-free sequential offset
-  // based on only the instances that actually made it.
-  // All instances use a shared `gateOpenedAt` timestamp so the offsets are
-  // measured from the same reference point regardless of file-watcher latency.
-  if (meta.firstSubmit && isClusterChild && instanceId != null) {
-    markInstanceReady(instanceId);
-
-    const READY_TIMEOUT_MS = 30_000;
-    logger.info(
-      { instanceId, timeoutMs: READY_TIMEOUT_MS },
-      "[SyncGate] Waiting for all instances to reach dashboard (or timeout)"
-    );
-    const abortSignal = { aborted: false };
-    const readyWait = waitForAllReady(READY_TIMEOUT_MS, abortSignal);
-    const readyResult = await Promise.race([
-      readyWait,
-      waitForPollingAbort(cycleAbortSeq).then(() => null),
-    ]);
-    abortSignal.aborted = true;
-
-    if (readyResult === null || pollingAbortSeq !== cycleAbortSeq) {
-      logger.info({ instanceId }, "[SyncGate] Aborted during ready-wait (force-book or config update)");
-      return;
-    }
-
-    // Stamp the shared reference time (first writer wins, others read it).
-    const gateOpenedAt = stampGateOpened();
-
+  // --- Coordinated poll-start gate (first submit only, cluster mode) ---
+  // The parent computed one fleet-wide poll-start time = rolloutStart +
+  // startInterval×instances + 60s buffer. This instance waits until
+  //   pollStartAt + (instanceId-1) × pollInterval
+  // before its first poll. Net effect: every bot logs in during the staggered
+  // ramp, then — once the whole fleet is up — polling begins evenly spaced
+  // (bot 1, then bot 2 one poll-interval later, …), i.e. the tuned round-robin
+  // schedule with all bots present. A bot that logs in late (remainingMs ≤ 0)
+  // simply polls immediately, so the schedule is self-correcting.
+  if (meta.firstSubmit && !meta.skipPollGate && isClusterChild && instanceId != null && typeof meta.pollStartAt === "number") {
     const globalDet = getApplicantDetailsOverrides(0);
     const userPollIntervalSec =
       globalDet && typeof globalDet.userPollInterval === "number" && globalDet.userPollInterval >= 1
         ? globalDet.userPollInterval
         : DEFAULT_POLL_INTERVAL_SEC;
     const stepMs = Math.max(1000, userPollIntervalSec * 1000);
-    const offsetMs = getReadyInstanceOffset(instanceId, stepMs);
+    const offsetMs = (instanceId - 1) * stepMs;
+    const targetPollAt = meta.pollStartAt + offsetMs;
+    const remainingMs = Math.max(0, targetPollAt - Date.now());
 
-    // Compute how long to sleep: target time is gateOpenedAt + offset,
-    // minus the time already elapsed since the gate opened.
-    const now = Date.now();
-    const targetPollAt = gateOpenedAt + offsetMs;
-    const remainingMs = Math.max(0, targetPollAt - now);
-
+    reporter.setPhase(
+      "polling",
+      remainingMs > 0 ? `ready — fleet polls in ${Math.round(remainingMs / 1000)}s` : "starting poll"
+    );
     logger.info(
-      { instanceId, readyInstances: readyResult, offsetMs, remainingMs, gateOpenedAt },
-      "[SyncGate] All-ready gate passed — applying sequential offset before first poll"
+      { instanceId, pollStartAt: meta.pollStartAt, offsetMs, remainingMs },
+      "[PollGate] Waiting for fleet poll-start + sequential offset before first poll"
     );
 
     if (remainingMs > 0) {
-      const syncGateSlotWatcher = createSlotFoundWatcher(instanceId);
+      const pollGateSlotWatcher = createSlotFoundWatcher(instanceId);
       try {
         const timerPromise = new Promise<void>((r) => setTimeout(r, remainingMs));
         const woke = await Promise.race([
           timerPromise.then(() => "timer" as const),
-          syncGateSlotWatcher.wait().then(() => "slot" as const),
+          pollGateSlotWatcher.wait().then(() => "slot" as const),
           waitForPollingAbort(cycleAbortSeq).then(() => "abort" as const),
         ]);
 
         if (woke === "abort" || pollingAbortSeq !== cycleAbortSeq) {
-          logger.info({ instanceId }, "[SyncGate] Offset delay aborted (force-book or config update)");
+          await throwIfAbortedForPageNotFound(cycleAbortSeq, "poll-gate-abort");
+          logger.info({ instanceId }, "[PollGate] Wait aborted (force-book or config update)");
           return;
         }
 
-        if (woke === "slot" && (await checkPeerFoundSlotAndJoinBooking(instanceId, syncGateSlotWatcher.cachedState()))) {
-          logger.info(
-            { instanceId },
-            "[SyncGate] Woken by peer slot during offset delay — skipping remainder and proceeding to booking"
-          );
+        if (woke === "slot" && (await checkPeerFoundSlotAndJoinBooking(instanceId, pollGateSlotWatcher.cachedState()))) {
+          logger.info({ instanceId }, "[PollGate] Woken by peer slot during wait — proceeding to booking");
           slotFoundDuringPoll = true;
         } else if (woke === "slot") {
-          // Peer slot signal but this instance cannot join yet — honour the full offset delay.
           await timerPromise;
         }
       } finally {
-        syncGateSlotWatcher.dispose();
+        pollGateSlotWatcher.dispose();
       }
     }
   }
 
   if (!slotFoundDuringPoll) {
     // All instances poll actively after login.
+    reporter.setPhase("polling", "polling for slots");
     await telegram.notify("VFS bot run: polling for slots.").catch(() => { });
     logger.info({ skipDashboardNavigate, instanceId }, "Starting slot polling");
 
@@ -2017,16 +2245,14 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
       // slot-state.json do not break this instance's calendar / timeslot lookup.
       const slotStateSnapshot = isSlotFoundByAnyInstance();
       instanceBookingActive = true;
+      reporter.setPhase("booking", "booking chain");
       logger.info({ instanceId }, "[Booking] Started — this instance will not be interrupted by new slot finds");
       try {
         const bookingCompleted = await runBookingChainWithRetry(instanceId, slotStateSnapshot);
         instanceBookingActive = false;
         if (!bookingCompleted) break; // Aborted/superseded — do not mark payment page
         // Booking chain completed (schedule API called) — payment page is now open.
-        instanceOnPaymentPage = true;
-        // await restoreChromeWindow();
-        // logger.info({ instanceId }, "[Chrome] Restored browser for payment page");
-        logger.info({ instanceId }, "[Booking] Complete — Chrome is on the payment page and will stay there permanently");
+        await enterPaymentPageMode(instanceId);
         return; // Leave Chrome on the payment page; do not fall through to cycle end.
       } catch (err) {
         instanceBookingActive = false; // Release booking lock so new slot finds can reach this instance again.
@@ -2087,6 +2313,10 @@ async function start(): Promise<void> {
 
   if (isClusterMode) {
     const myInstanceId = parseInt(process.env.BOT_INSTANCE_ID ?? "1", 10);
+
+    // Monitoring: start reporting status to the parent (fire-and-forget IPC).
+    reporter.init(myInstanceId, { debugPort: getRemoteDebuggingPort() });
+    startPageSampler(myInstanceId);
 
     // Listen for IPC messages from parent process
     if (process.send) {
@@ -2167,8 +2397,7 @@ async function start(): Promise<void> {
                   const bookingCompleted = await runBookingChainWithRetry(myInstanceId, slotStateSnapshot);
                   instanceBookingActive = false;
                   if (bookingCompleted) {
-                    instanceOnPaymentPage = true;
-                    logger.info({ instanceId: myInstanceId }, "[ForceBook] Booking complete — on payment page");
+                    await enterPaymentPageMode(myInstanceId);
                   } else {
                     logger.info({ instanceId: myInstanceId }, "[ForceBook] Booking chain superseded/aborted — not marking payment page");
                   }
@@ -2202,7 +2431,7 @@ async function start(): Promise<void> {
           if (msg?.type === "run-bot-cycle") {
             syncInstanceStoresFromDisk();
             try {
-              await runOneBotCycle({ firstSubmit: true, instanceId: myInstanceId });
+              await runOneBotCycle({ firstSubmit: true, instanceId: myInstanceId, pollStartAt: msg.pollStartAt });
               process.send?.({ type: "bot-cycle-complete", instanceId: myInstanceId });
             } catch (err) {
               const reason = err instanceof Error ? err.message : String(err);
@@ -2220,12 +2449,39 @@ async function start(): Promise<void> {
     return;
   }
 
+  // Single-instance monitoring: feed status into a local registry so the
+  // Monitor tab works without a cluster parent, and let the reporter focus
+  // this process's own Chrome window on captcha attention.
+  reporter.init(1, { debugPort: getRemoteDebuggingPort() });
+  startPageSampler();
+  registry.start();
+  reporter.setLocalSink((s) => registry.applyStatus(s));
+  reporter.setLocalFocus(() => { void focusChromeByPort(getRemoteDebuggingPort()); });
+
+  const singleMonitor: MonitorHooks = {
+    snapshot: () => registry.snapshot(),
+    subscribe: (cb) => registry.subscribe(cb),
+    focus: async () => {
+      const ok = await focusChromeByPort(getRemoteDebuggingPort());
+      return ok ? { ok: true } : { ok: false, error: "No Chrome window found" };
+    },
+    devtools: async () => getDevtoolsInfo(getRemoteDebuggingPort()),
+    start: () => ({ ok: false, error: "Single-instance mode — use Submit & Run to start." }),
+    pauseRollout: () => ({ ok: true }),
+    resumeRollout: () => ({ ok: true }),
+    stopInstance: () => ({ ok: false, error: "Not available in single-instance mode." }),
+    restartInstance: () => ({ ok: false, error: "Not available in single-instance mode." }),
+    setStaggerInterval: () => ({ ok: true }),
+    getControl: () => ({ intervalMs: 0, rolloutActive: false, total: 1 }),
+  };
+
   await ensureChromeWithDevTools();
 
   await runApplicantFormWithSubmitHandler((info) => {
     const instanceId = typeof info.instanceId === "number" ? info.instanceId : undefined;
     enqueueSubmitTask(() => runOneBotCycle({ firstSubmit: info.firstSubmit, instanceId }));
   }, {
+    monitor: singleMonitor,
     onForceBook: () => {
       if (instanceStopped) {
         return { ok: false, error: "Instance is stopped (login failed). Cannot book." };
@@ -2260,8 +2516,7 @@ async function start(): Promise<void> {
               const bookingCompleted = await runBookingChainWithRetry(undefined, slotStateSnapshot);
               instanceBookingActive = false;
               if (bookingCompleted) {
-                instanceOnPaymentPage = true;
-                logger.info("[ForceBook] Booking complete — on payment page");
+                await enterPaymentPageMode(undefined);
               } else {
                 logger.info("[ForceBook] Booking chain superseded/aborted — not marking payment page");
               }

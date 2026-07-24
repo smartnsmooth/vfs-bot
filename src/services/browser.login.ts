@@ -26,23 +26,70 @@ import {
   VfsForbiddenError,
   VfsGatewayTimeoutError,
   VfsRateLimitedError,
+  PageNotFoundRestartError,
   isTargetClosedError,
   throwVfsRateLimited,
   responseIsLiftUserLoginPost,
   injectTurnstileTokenInPage,
   type PostOtpLoginCapture,
 } from "./browser.errors";
+import { isPageNotFoundUrl } from "../flows/pageNotFound";
 
 import type { BrowserServiceCore } from "./browser.core";
-import { clickTurnstile } from "./turnstile.click";
+import { clickTurnstile, waitForManualTurnstile } from "./turnstile.click";
+import { reporter } from "../monitoring/statusReporter";
 
 // ── Block-page detection ────────────────────────────────────────────────
 
 function throwIfBlockPage(page: Page): void {
   const url = page.url();
-  if (/\/page-not-found\b/i.test(url) || /\/session-expired\b/i.test(url)) {
-    throw new VfsForbiddenError(`Page redirected to ${url} — IP/session blocked.`);
+  if (isPageNotFoundUrl(url)) {
+    throw new PageNotFoundRestartError(`redirected to ${url}`);
   }
+}
+
+/**
+ * Throttled block-page checker for use during the Turnstile wait. Throws (so the
+ * login flow bails out to its 403/429 recovery instead of spinning on a captcha
+ * that will never appear) when the page becomes a block/error page — by URL
+ * redirect (page-not-found / session-expired) or by body content (403201
+ * "Access Restricted", 403101 "Permission Issues", "Session Expired", 429).
+ */
+function makeBlockCheck(page: Page): () => Promise<void> {
+  let lastBody = 0;
+  return async () => {
+    // URL redirect — instant.
+    try {
+      throwIfBlockPage(page);
+    } catch (e) {
+      reporter.setAttention("blocked", "block page (redirect) during login — rotating IP");
+      throw e;
+    }
+    // Body content — throttled (innerText is heavier).
+    const now = Date.now();
+    if (now - lastBody < 2500) return;
+    lastBody = now;
+    let text = "";
+    try {
+      text = await page.locator("body").innerText({ timeout: 2000 });
+    } catch {
+      return;
+    }
+    const t = text.trim();
+    if (
+      /Access Restricted Due to Unusual Activity/i.test(t) || /403201/.test(t) ||
+      /Permission Issues/i.test(t) || /403101/.test(t) ||
+      /Session Expired or Invalid/i.test(t)
+    ) {
+      reporter.setAttention("blocked", "block page during login — rotating IP");
+      throw new VfsForbiddenError("Block page detected during login (403201/403101/session-expired)");
+    }
+    const rate = classifyVfs429FromPageText(t);
+    if (rate) {
+      reporter.setAttention("rate_limit", `rate-limit ${rate.code} during login`);
+      throwVfsRateLimited(rate.kind, rate.code, "block page during login");
+    }
+  };
 }
 
 async function waitForLoginFormOrThrowBlock(page: Page, usernameSelectors: string, timeoutMs: number): Promise<void> {
@@ -61,8 +108,8 @@ async function waitForLoginFormOrThrowBlock(page: Page, usernameSelectors: strin
     }
 
     const nowUrl = page.url();
-    if (/\/page-not-found\b/i.test(nowUrl) || /\/session-expired\b/i.test(nowUrl)) {
-      throw new VfsForbiddenError(`Login page redirected to ${nowUrl} — IP/session blocked.`);
+    if (isPageNotFoundUrl(nowUrl)) {
+      throw new PageNotFoundRestartError(`login page redirected to ${nowUrl}`);
     }
 
     try {
@@ -475,16 +522,28 @@ async function submitLoginImmediately(
     .catch(() => "");
 
   if (existingToken) {
+    reporter.captchaResult("passed");
     logger.info({ tokenLength: existingToken.length }, "[Login] ✓ Using existing Turnstile token");
   } else {
+    reporter.setPhase("turnstile", "solving captcha (auto)");
+    reporter.captchaWaiting(null);
     logger.info("[Login] Solving Turnstile by clicking the checkbox...");
-    const token = await clickTurnstile(page).catch((e) => {
+    const blockCheck = makeBlockCheck(page);
+    let token = "";
+    try {
+      token = await clickTurnstile(page, { check: blockCheck });
+    } catch (e) {
+      if (e instanceof VfsForbiddenError || e instanceof VfsRateLimitedError) throw e;
       logger.error({ err: e }, "[Login] Turnstile click solve threw");
-      return "";
-    });
-    if (!token) {
-      logger.warn("[Login] Turnstile not solved — proceeding anyway");
-      await page.waitForTimeout(2000);
+    }
+    if (token) {
+      reporter.captchaResult("passed");
+    } else {
+      const manual = await waitForManualTurnstile(page, { check: blockCheck });
+      if (!manual) {
+        logger.warn("[Login] Turnstile not solved — proceeding anyway");
+        reporter.captchaResult("failed");
+      }
     }
   }
 
@@ -759,16 +818,27 @@ async function resubmitLoginAfterOtp(page: Page, core: BrowserServiceCore): Prom
       let tsToken = await readTurnstileResponse();
 
       if (tsToken) {
+        reporter.captchaResult("passed");
         logger.info({ tokenLength: tsToken.length }, "[OTP] ✓ Using existing Turnstile token");
       } else {
+        reporter.setPhase("turnstile", "solving captcha (auto, OTP step)");
+        reporter.captchaWaiting(null);
         logger.info("[OTP] Solving Turnstile by clicking the checkbox...");
-        tsToken = await clickTurnstile(page).catch((e) => {
+        const blockCheck = makeBlockCheck(page);
+        try {
+          tsToken = await clickTurnstile(page, { check: blockCheck });
+        } catch (e) {
+          if (e instanceof VfsForbiddenError || e instanceof VfsRateLimitedError) throw e;
           logger.error({ err: e }, "[OTP] Turnstile click solve threw");
-          return "";
-        });
-        if (!tsToken) {
-          logger.warn("[OTP] Turnstile not solved — proceeding anyway");
-          await page.waitForTimeout(2000);
+        }
+        if (tsToken) {
+          reporter.captchaResult("passed");
+        } else {
+          tsToken = await waitForManualTurnstile(page, { check: blockCheck });
+          if (!tsToken) {
+            logger.warn("[OTP] Turnstile not solved — proceeding anyway");
+            reporter.captchaResult("failed");
+          }
         }
       }
     }
@@ -977,6 +1047,7 @@ export async function performLoginOnFirstTab(
   const page = await core.getVfsPageOrAnyNonSetup();
   if (!page) throw new Error("No tab. Open Chrome with at least one tab, or open the VFS login page.");
   await page.bringToFront().catch(() => { });
+  reporter.setPage(page.url());
 
   throwIfBlockPage(page);
 

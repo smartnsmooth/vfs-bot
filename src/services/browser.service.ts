@@ -176,6 +176,27 @@ export class BrowserService implements BrowserServiceCore {
     }
   }
 
+  /**
+   * Passive current-URL read for monitoring. Never launches/reconnects CDP and
+   * never brings a tab to front — returns "" if the browser isn't connected yet,
+   * so it can be polled frequently without affecting the bot.
+   */
+  async peekFirstTabUrl(): Promise<string> {
+    try {
+      const browser = this.browser;
+      if (!browser || !browser.isConnected()) return "";
+      const pages = this.collectAllPagesFromBrowser(browser);
+      const vfs =
+        this.findPreferredVfsPage(pages, { excludeApplicantSetup: true }) ??
+        pages.find((p) => { try { return !isApplicantFormServerUrl(p.url()); } catch { return false; } }) ??
+        pages[0];
+      if (!vfs) return "";
+      return vfs.url();
+    } catch {
+      return "";
+    }
+  }
+
   private async getVfsPage(): Promise<Page> {
     const browser = await this.ensureBrowser();
     const pages = this.collectAllPagesFromBrowser(browser);

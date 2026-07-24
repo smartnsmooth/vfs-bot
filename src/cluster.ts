@@ -8,14 +8,19 @@ import {
   type TestApplicantsApiBatchResult,
   type TestApplicantsApiInstanceResult,
 } from "./ui/applicantDetailsFormServer";
-import { setSessionLoginCredentials } from "./utils/sessionLogin.store";
-import { setApplicantDetailsOverrides } from "./utils/applicantDetails.store";
+import { setSessionLoginCredentials, getAllInstanceCredentials } from "./utils/sessionLogin.store";
+import { setApplicantDetailsOverrides, getAllInstanceApplicantDetails } from "./utils/applicantDetails.store";
 import { TelegramService } from "./services/telegram.service";
 import {
   killChromeTreeByCdpPortRangeSync,
+  killChromeTreeByCdpPortSync,
 } from "./utils/killChromeByCdpPort";
 import { clearSlotState } from "./utils/slotState";
+import { clearSlotCenterOverride } from "./utils/slotCenterOverride.store";
 import { clearPollReadyState, initPollReadyState } from "./utils/pollReadyState";
+import { registry } from "./monitoring/statusRegistry";
+import { focusChromeByPort, getDevtoolsInfo, warmupWindowHelper } from "./utils/chromeWindow";
+import { makeInitialStatus, type MonitorHooks, type InstanceStatus } from "./monitoring/status.types";
 
 /** How many bot instances are currently running. Set by ensureInstances(). */
 let currentNumInstances = 0;
@@ -37,21 +42,153 @@ const instances: BotInstance[] = [];
 /** Parent waits for `test-applicants-result` from a child (same `requestId`). */
 const pendingTestApplicants = new Map<string, (msg: Record<string, unknown>) => void>();
 
-function enqueueTaskForInstance(instanceId: number, task: () => Promise<void>): void {
-  const inst = instances.find((i) => i.id === instanceId);
-  if (!inst) {
-    logger.warn({ instanceId }, "Instance not found for task");
+// ── Staggered launch controller (dashboard-controlled) ──────────────────────
+let staggerIntervalMs = Math.max(0, parseInt(process.env.STAGGER_INTERVAL_MS ?? "6000", 10) || 6000);
+let pendingStarts: number[] = [];
+let rolloutActive = false;
+let rolloutPaused = false;
+/**
+ * Fleet-wide poll-start timestamp (ms). Computed once per first-submit batch as
+ * rolloutStart + startInterval×instances + 60s buffer. Every instance waits until
+ * this time + its own (id-1)×pollInterval offset before its first poll, so polling
+ * begins evenly spaced only after the whole fleet has had time to log in.
+ */
+let rolloutPollStartAt: number | null = null;
+/** Buffer after the staggered login ramp before the fleet starts polling. */
+const POLL_START_BUFFER_MS = 60_000;
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+function debugPortForInstance(id: number): number {
+  return BASE_DEBUGGING_PORT + id - 1;
+}
+
+/** Ensure a placeholder tile exists so the dashboard shows every instance immediately. */
+function seedRegistry(id: number): void {
+  if (!registry.get(id)) {
+    registry.applyStatus(makeInitialStatus(id, debugPortForInstance(id)));
+  }
+}
+
+/** Send the run-bot-cycle now (spawns Chrome for this instance). */
+function sendStartNow(id: number): void {
+  const inst = instances.find((i) => i.id === id);
+  if (!inst || !inst.process || inst.process.killed) {
+    logger.warn({ instanceId: id }, "[Stagger] Instance process not available to start");
     return;
   }
-
-  if (!inst.process || inst.process.killed) {
-    logger.warn({ instanceId }, "Instance process not available");
-    return;
+  seedRegistry(id);
+  const cur = registry.get(id);
+  if (cur) {
+    registry.applyStatus({ ...cur, phase: "launching", detail: "starting…", heartbeatAt: Date.now(), updatedAt: Date.now() });
   }
+  inst.process.send({ type: "config-updated", instanceId: id });
+  inst.process.send({ type: "run-bot-cycle", instanceId: id, pollStartAt: rolloutPollStartAt });
+}
 
-  inst.queue = inst.queue.then(task).catch((err) => {
-    logger.error({ err, instanceId }, "Instance task failed");
-  });
+async function runScheduler(): Promise<void> {
+  if (rolloutActive) return;
+  rolloutActive = true;
+  try {
+    while (pendingStarts.length) {
+      if (rolloutPaused) {
+        await sleep(400);
+        continue;
+      }
+      const id = pendingStarts.shift()!;
+      sendStartNow(id);
+      // Always wait the full interval after a send. The form enqueues instances
+      // synchronously one-by-one, so without an unconditional sleep the queue is
+      // momentarily empty after each shift and every bot would start in the same
+      // tick. Sleeping here also lets later enqueues (same tick) accumulate.
+      await sleep(staggerIntervalMs);
+    }
+  } finally {
+    rolloutActive = false;
+  }
+}
+
+/** Queue an instance for staggered start (one every `staggerIntervalMs`). */
+function enqueueStart(id: number): void {
+  seedRegistry(id);
+  const cur = registry.get(id);
+  if (cur) registry.applyStatus({ ...cur, detail: "queued to start", updatedAt: Date.now() });
+  if (!pendingStarts.includes(id)) pendingStarts.push(id);
+  void runScheduler();
+}
+
+function buildMonitorHooks(): MonitorHooks {
+  return {
+    snapshot: () => registry.snapshot(),
+    subscribe: (cb) => registry.subscribe(cb),
+    focus: async (id) => {
+      const port = debugPortForInstance(id);
+      const ok = await focusChromeByPort(port);
+      return ok ? { ok: true } : { ok: false, error: `No Chrome window found on port ${port}` };
+    },
+    devtools: async (id) => getDevtoolsInfo(debugPortForInstance(id)),
+    start: ({ count, intervalMs }) => {
+      if (intervalMs != null && intervalMs >= 0) staggerIntervalMs = Math.floor(intervalMs);
+      const creds = getAllInstanceCredentials();
+      const details = getAllInstanceApplicantDetails();
+      const ids: number[] = [];
+      for (let id = 1; id <= count; id++) {
+        if (creds.get(id) && details.get(id)) ids.push(id);
+      }
+      if (ids.length === 0) {
+        return { ok: false, error: "No saved instances with credentials + details. Configure & Save first." };
+      }
+      ensureInstances(Math.max(...ids));
+      rolloutPaused = false;
+      for (const id of ids) enqueueStart(id);
+      return { ok: true };
+    },
+    pauseRollout: () => { rolloutPaused = true; return { ok: true }; },
+    resumeRollout: () => { rolloutPaused = false; void runScheduler(); return { ok: true }; },
+    stopInstance: (id) => {
+      const inst = instances.find((i) => i.id === id);
+      if (inst?.process && !inst.process.killed) inst.process.kill("SIGTERM");
+      pendingStarts = pendingStarts.filter((x) => x !== id);
+      registry.markStopped(id, "stopped by operator");
+      return { ok: true };
+    },
+    restartInstance: (id) => {
+      const idx = instances.findIndex((i) => i.id === id);
+      if (idx >= 0) {
+        const inst = instances[idx]!;
+        if (inst.process && !inst.process.killed) inst.process.kill("SIGTERM");
+      }
+      // Close this instance's Chrome so the respawned child gets a clean launch.
+      try {
+        killChromeTreeByCdpPortSync(debugPortForInstance(id));
+      } catch {
+        /* ignore */
+      }
+      const total = Math.max(currentNumInstances, id);
+      const child = spawnBotInstance(id, total);
+      if (idx >= 0) {
+        instances[idx]!.process = child;
+      } else {
+        instances.push({ id, process: child, debugPort: debugPortForInstance(id), profileDir: `${BASE_PROFILE_DIR}-${id}`, queue: Promise.resolve() });
+      }
+      seedRegistry(id);
+      const cur = registry.get(id);
+      if (cur) {
+        registry.applyStatus({
+          ...cur,
+          phase: "launching",
+          detail: "restarting…",
+          attention: null,
+          lastError: null,
+          heartbeatAt: Date.now(),
+          updatedAt: Date.now(),
+        });
+      }
+      setTimeout(() => sendStartNow(id), 1500);
+      return { ok: true };
+    },
+    setStaggerInterval: (ms) => { if (ms >= 0) staggerIntervalMs = Math.floor(ms); return { ok: true }; },
+    getControl: () => ({ intervalMs: staggerIntervalMs, rolloutActive, total: currentNumInstances }),
+  };
 }
 
 /**
@@ -59,7 +196,7 @@ function enqueueTaskForInstance(instanceId: number, task: () => Promise<void>): 
  * Safe to call multiple times — only creates/kills the delta.
  */
 function ensureInstances(targetCount: number): void {
-  const count = Math.max(1, Math.min(50, targetCount));
+  const count = Math.max(1, Math.min(100, targetCount));
 
   // Spawn new instances as needed
   for (let i = currentNumInstances + 1; i <= count; i++) {
@@ -71,6 +208,7 @@ function ensureInstances(targetCount: number): void {
       profileDir: `${BASE_PROFILE_DIR}-${i}`,
       queue: Promise.resolve(),
     });
+    seedRegistry(i);
     logger.info({ instanceId: i }, "Spawned bot instance");
   }
 
@@ -97,11 +235,33 @@ async function startFormServer(): Promise<void> {
       : currentNumInstances || 1;
     ensureInstances(submittedCount);
 
+    // Staggered start interval set on the Configure tab (seconds → ms).
+    const sis = formData.staggerIntervalSec;
+    if (typeof sis === "number" && Number.isFinite(sis) && sis >= 0) {
+      staggerIntervalMs = Math.floor(sis) * 1000;
+    }
+
+    // Compute the fleet-wide poll-start time once, on the first submit batch:
+    //   rolloutStart + startInterval × instances + 60s buffer.
+    // Every instance polls at this time + (id-1)×pollInterval, so the whole fleet
+    // finishes its staggered login first, then polls on the tuned round-robin schedule.
+    if (formData.firstSubmit && rolloutPollStartAt == null) {
+      rolloutPollStartAt = Date.now() + staggerIntervalMs * submittedCount + POLL_START_BUFFER_MS;
+      logger.info(
+        { submittedCount, staggerIntervalMs, bufferMs: POLL_START_BUFFER_MS, pollStartAt: rolloutPollStartAt },
+        "[PollGate] Fleet poll-start scheduled (login ramp then coordinated polling)"
+      );
+    }
+
     // Initialize the synchronized polling gate on the very first submit batch
     // so child instances know how many peers to wait for before polling starts.
     // Guard with a flag to avoid re-initializing when the handler is called
     // once per instance in the same batch.
     const isFirstSubmit = formData.firstSubmit === true;
+    if (isFirstSubmit) {
+      clearSlotState();
+      clearSlotCenterOverride();
+    }
     if (isFirstSubmit && !pollReadyInitializedForBatch) {
       pollReadyInitializedForBatch = true;
       clearPollReadyState();
@@ -164,18 +324,12 @@ async function startFormServer(): Promise<void> {
     }
     setApplicantDetailsOverrides(applicantData, instanceId);
 
-    // The async task only sends IPC — no disk writes, eliminating the race.
-    enqueueTaskForInstance(instanceId, async () => {
-      const inst = instances.find((i) => i.id === instanceId);
-      if (inst?.process && !inst.process.killed) {
-        inst.process.send({ type: "config-updated", instanceId });
-        inst.process.send({ type: "run-bot-cycle", instanceId });
-      } else {
-        logger.warn({ instanceId }, "Cannot send message to instance process");
-      }
-    });
+    // Queue this instance for staggered start (one every `staggerIntervalMs`, default 6s).
+    // config-updated + run-bot-cycle are sent by the scheduler when this instance's turn comes.
+    enqueueStart(instanceId);
   }, {
     collectLogin: true,
+    monitor: buildMonitorHooks(),
     onTestApplicantsApi: async (): Promise<TestApplicantsApiBatchResult> => {
       const running = instances.filter((i) => i.process && !i.process.killed);
       if (running.length === 0) {
@@ -255,7 +409,11 @@ function spawnBotInstance(instanceId: number, totalInstances: number): ChildProc
   child.on("exit", (code) => {
     logger.warn({ instanceId, code }, "Bot instance exited");
     const inst = instances.find((i) => i.id === instanceId);
-    if (inst) inst.process = null;
+    // Only clear if this exit is still the active process (restart replaces the child).
+    if (inst && inst.process === child) {
+      inst.process = null;
+      registry.markStopped(instanceId, code != null && code !== 0 ? `exited (code ${code})` : "process exited");
+    }
   });
 
   child.on("message", (msg: any) => {
@@ -271,6 +429,19 @@ function spawnBotInstance(instanceId: number, totalInstances: number): ChildProc
       }
       return;
     }
+    // ── Monitoring: status push from child ──
+    if (msg?.type === "status-update" && msg.status) {
+      registry.applyStatus(msg.status as InstanceStatus);
+      return;
+    }
+    // ── Monitoring: child asks to bring its Chrome window forward (e.g. captcha stuck) ──
+    if (msg?.type === "request-focus" && typeof msg.instanceId === "number") {
+      const port = debugPortForInstance(msg.instanceId);
+      void focusChromeByPort(port).then((ok) => {
+        logger.warn({ instanceId: msg.instanceId, reason: msg.reason, focused: ok }, "[Monitor] Auto-focusing Chrome for attention");
+      });
+      return;
+    }
   });
 
   return child;
@@ -282,6 +453,12 @@ async function main(): Promise<void> {
   // Wipe stale shared state from previous sessions so new instances start clean.
   clearSlotState();
   clearPollReadyState();
+
+  // Start the monitoring registry (staleness sweep + subscriber notifications).
+  registry.start();
+
+  // Pre-compile the window-activation helper so the first Focus click is instant.
+  warmupWindowHelper();
 
   // Start the shared form server. Instances are spawned lazily on first Submit,
   // not at startup — so the user can choose the count from the UI.
