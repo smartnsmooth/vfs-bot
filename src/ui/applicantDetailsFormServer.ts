@@ -922,6 +922,14 @@ export function runApplicantFormWithSubmitHandler(
               if (action === "restart") { json(res, 200, monitor.restartInstance(id)); return; }
               if (action === "pause") { json(res, 200, monitor.pauseRollout()); return; }
               if (action === "resume") { json(res, 200, monitor.resumeRollout()); return; }
+              if (action === "pause-polling") {
+                json(res, 200, monitor.pausePolling(Number.isFinite(id) && id >= 1 ? id : undefined));
+                return;
+              }
+              if (action === "resume-polling") {
+                json(res, 200, monitor.resumePolling(Number.isFinite(id) && id >= 1 ? id : undefined));
+                return;
+              }
               if (action === "stagger") {
                 const ms = toNum(mj.intervalMs);
                 json(res, 200, monitor.setStaggerInterval(Number.isFinite(ms) ? ms : 6000));

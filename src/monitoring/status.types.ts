@@ -62,6 +62,17 @@ export interface InstanceStatus {
   egressIp: string | null;
   debugPort: number | null;
   lastError: { message: string; at: number } | null;
+  /** True when this bot's slot polling is paused from the Monitor tab. */
+  pollingPaused: boolean;
+  /**
+   * When true, auto-focus from a stale captcha request must not restore the window
+   * (set after dashboard minimize until payment / new captcha attention).
+   */
+  preferMinimized: boolean;
+  /** Parent probe: DevTools port responds (Chrome process up). null = not probed yet. */
+  chromeAlive: boolean | null;
+  /** Parent: child Node process is running. */
+  processAlive: boolean;
   startedAt: number;
   heartbeatAt: number;
   updatedAt: number;
@@ -88,6 +99,10 @@ export function makeInitialStatus(instanceId: number, debugPort: number | null):
     egressIp: null,
     debugPort,
     lastError: null,
+    pollingPaused: false,
+    preferMinimized: false,
+    chromeAlive: null,
+    processAlive: true,
     startedAt: now,
     heartbeatAt: now,
     updatedAt: now,
@@ -116,6 +131,10 @@ export interface MonitorControlState {
   intervalMs: number;
   rolloutActive: boolean;
   total: number;
+  /** Fleet-wide slot polling paused from the Monitor tab. */
+  pollingPaused: boolean;
+  /** Configured user poll interval (ms) used for staggered resume. */
+  pollIntervalMs: number;
 }
 
 /**
@@ -133,6 +152,14 @@ export interface MonitorHooks {
   start(opts: { count: number; intervalMs: number }): { ok: boolean; error?: string };
   pauseRollout(): { ok: boolean };
   resumeRollout(): { ok: boolean };
+  /** Pause slot polling on one bot (`instanceId`) or every running bot when omitted. */
+  pausePolling(instanceId?: number): { ok: boolean; error?: string };
+  /**
+   * Resume slot polling for one bot or the whole fleet.
+   * Resume is staggered by the configured fleet poll interval
+   * (bot N waits (N-1)×interval from resumeAt).
+   */
+  resumePolling(instanceId?: number): { ok: boolean; error?: string };
   stopInstance(instanceId: number): { ok: boolean; error?: string };
   restartInstance(instanceId: number): { ok: boolean; error?: string };
   setStaggerInterval(ms: number): { ok: boolean };

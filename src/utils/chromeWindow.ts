@@ -400,11 +400,19 @@ Write-Output OK
   });
 }
 
-/** Activate (bring to front, like the taskbar) the instance's Chrome window. No resize. */
-export async function focusChromeByPort(debugPort: number): Promise<boolean> {
+/** Activate (bring to front, like the taskbar) the instance's Chrome window. No resize.
+ *  `shouldAbort` — polled before activation so a late captcha-focus cannot undo dashboard minimize.
+ */
+export async function focusChromeByPort(
+  debugPort: number,
+  opts?: { shouldAbort?: () => boolean }
+): Promise<boolean> {
+  if (opts?.shouldAbort?.()) return false;
   const viaHelper = await sendCmd("focus", debugPort);
+  if (opts?.shouldAbort?.()) return false;
   if (viaHelper) return true;
   logger.info({ debugPort }, "[Monitor] Resident focus helper failed — trying one-shot taskbar focus");
+  if (opts?.shouldAbort?.()) return false;
   return focusChromeByPortOneShot(debugPort);
 }
 

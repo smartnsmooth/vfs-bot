@@ -57,6 +57,24 @@ class StatusReporter {
   setPhase(phase: BotPhase, detail?: string): void {
     this.status.phase = phase;
     if (detail != null) this.status.detail = detail;
+    // Clear sticky error blink once the bot moves into a normal workflow phase.
+    // Do NOT clear on turnstile/otp — those overlap with captcha attention.
+    if (
+      phase === "launching" ||
+      phase === "login" ||
+      phase === "polling" ||
+      phase === "booking" ||
+      phase === "payment" ||
+      phase === "recovering" ||
+      phase === "idle"
+    ) {
+      this.status.attention = null;
+      if (this.status.captcha.last === "waiting") {
+        this.status.captcha.last = "n/a";
+        this.status.captcha.waitingUntil = null;
+      }
+      this.status.lastError = null;
+    }
     this.flushNow();
   }
 
@@ -122,12 +140,34 @@ class StatusReporter {
     }
     this.status.attention = { reason, since: Date.now() };
     this.status.phase = "needs_attention";
+    // Captcha / manual issues need the window up — cancel minimize preference.
+    this.status.preferMinimized = false;
     if (detail != null) this.status.detail = detail;
+    this.flushNow();
+  }
+
+  setPreferMinimized(prefer: boolean): void {
+    if (this.status.preferMinimized === prefer) return;
+    this.status.preferMinimized = prefer;
+    this.flushNow();
+  }
+
+  /** Full reset used on operator Restart so the card stops blinking immediately. */
+  resetForRestart(instanceId: number, opts?: { debugPort?: number | null }): void {
+    this.status = makeInitialStatus(instanceId, opts?.debugPort ?? this.status.debugPort);
+    this.status.phase = "launching";
+    this.status.detail = "restarting…";
     this.flushNow();
   }
 
   setError(message: string): void {
     this.status.lastError = { message: message.slice(0, 400), at: Date.now() };
+    this.flushNow();
+  }
+
+  setPollingPaused(paused: boolean): void {
+    if (this.status.pollingPaused === paused) return;
+    this.status.pollingPaused = paused;
     this.flushNow();
   }
 

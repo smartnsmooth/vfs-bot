@@ -9,7 +9,7 @@ import {
   type TestApplicantsApiInstanceResult,
 } from "./ui/applicantDetailsFormServer";
 import { setSessionLoginCredentials, getAllInstanceCredentials } from "./utils/sessionLogin.store";
-import { setApplicantDetailsOverrides, getAllInstanceApplicantDetails } from "./utils/applicantDetails.store";
+import { setApplicantDetailsOverrides, getAllInstanceApplicantDetails, getApplicantDetailsOverrides } from "./utils/applicantDetails.store";
 import { TelegramService } from "./services/telegram.service";
 import {
   killChromeTreeByCdpPortRangeSync,
@@ -19,6 +19,7 @@ import { clearSlotState } from "./utils/slotState";
 import { clearSlotCenterOverride } from "./utils/slotCenterOverride.store";
 import { clearPollReadyState, initPollReadyState } from "./utils/pollReadyState";
 import { registry } from "./monitoring/statusRegistry";
+import { startChromeStatusProbe } from "./monitoring/chromeProbe";
 import { focusChromeByPort, getDevtoolsInfo, warmupWindowHelper } from "./utils/chromeWindow";
 import { makeInitialStatus, type MonitorHooks, type InstanceStatus } from "./monitoring/status.types";
 
@@ -56,7 +57,33 @@ let rolloutPaused = false;
 let rolloutPollStartAt: number | null = null;
 /** Buffer after the staggered login ramp before the fleet starts polling. */
 const POLL_START_BUFFER_MS = 60_000;
+/** Fleet-wide pause for slot polling (Monitor tab Stop/Resume). */
+let fleetPollingPaused = false;
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+function getFleetPollIntervalMs(): number {
+  const globalDet = getApplicantDetailsOverrides(0);
+  const sec =
+    globalDet && typeof globalDet.userPollInterval === "number" && globalDet.userPollInterval >= 1
+      ? globalDet.userPollInterval
+      : 60;
+  return Math.max(1000, Math.floor(sec) * 1000);
+}
+
+function broadcastToActiveChildren(msg: Record<string, unknown>): number {
+  let n = 0;
+  for (const inst of instances) {
+    if (inst.process && !inst.process.killed) {
+      try {
+        inst.process.send({ ...msg, instanceId: inst.id });
+        n++;
+      } catch {
+        /* child gone */
+      }
+    }
+  }
+  return n;
+}
 
 function debugPortForInstance(id: number): number {
   return BASE_DEBUGGING_PORT + id - 1;
@@ -65,7 +92,10 @@ function debugPortForInstance(id: number): number {
 /** Ensure a placeholder tile exists so the dashboard shows every instance immediately. */
 function seedRegistry(id: number): void {
   if (!registry.get(id)) {
-    registry.applyStatus(makeInitialStatus(id, debugPortForInstance(id)));
+    registry.applyStatus({
+      ...makeInitialStatus(id, debugPortForInstance(id)),
+      processAlive: false,
+    });
   }
 }
 
@@ -116,6 +146,17 @@ function enqueueStart(id: number): void {
   void runScheduler();
 }
 
+function sendToChild(id: number, msg: Record<string, unknown>): boolean {
+  const inst = instances.find((i) => i.id === id);
+  if (!inst?.process || inst.process.killed) return false;
+  try {
+    inst.process.send({ ...msg, instanceId: id });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function buildMonitorHooks(): MonitorHooks {
   return {
     snapshot: () => registry.snapshot(),
@@ -144,10 +185,41 @@ function buildMonitorHooks(): MonitorHooks {
     },
     pauseRollout: () => { rolloutPaused = true; return { ok: true }; },
     resumeRollout: () => { rolloutPaused = false; void runScheduler(); return { ok: true }; },
+    pausePolling: (instanceId) => {
+      const pollIntervalMs = getFleetPollIntervalMs();
+      if (typeof instanceId === "number" && Number.isFinite(instanceId) && instanceId >= 1) {
+        const id = Math.floor(instanceId);
+        const ok = sendToChild(id, { type: "pause-polling" });
+        logger.info({ instanceId: id, ok }, "[Monitor] Instance polling PAUSED");
+        return ok ? { ok: true } : { ok: false, error: `Bot #${id} is not running.` };
+      }
+      fleetPollingPaused = true;
+      const n = broadcastToActiveChildren({ type: "pause-polling" });
+      logger.info({ notified: n, pollIntervalMs }, "[Monitor] Fleet polling PAUSED");
+      return n > 0 ? { ok: true } : { ok: false, error: "No active bot processes to pause." };
+    },
+    resumePolling: (instanceId) => {
+      const pollIntervalMs = getFleetPollIntervalMs();
+      const resumeAt = Date.now();
+      if (typeof instanceId === "number" && Number.isFinite(instanceId) && instanceId >= 1) {
+        const id = Math.floor(instanceId);
+        const ok = sendToChild(id, { type: "resume-polling", resumeAt, pollIntervalMs });
+        logger.info({ instanceId: id, ok, resumeAt, pollIntervalMs }, "[Monitor] Instance polling RESUMED");
+        return ok ? { ok: true } : { ok: false, error: `Bot #${id} is not running.` };
+      }
+      fleetPollingPaused = false;
+      const n = broadcastToActiveChildren({ type: "resume-polling", resumeAt, pollIntervalMs });
+      logger.info(
+        { notified: n, resumeAt, pollIntervalMs },
+        "[Monitor] Fleet polling RESUMED — bots staggered by poll interval"
+      );
+      return n > 0 ? { ok: true } : { ok: false, error: "No active bot processes to resume." };
+    },
     stopInstance: (id) => {
       const inst = instances.find((i) => i.id === id);
       if (inst?.process && !inst.process.killed) inst.process.kill("SIGTERM");
       pendingStarts = pendingStarts.filter((x) => x !== id);
+      registry.setProcessAlive(id, false);
       registry.markStopped(id, "stopped by operator");
       return { ok: true };
     },
@@ -170,24 +242,27 @@ function buildMonitorHooks(): MonitorHooks {
       } else {
         instances.push({ id, process: child, debugPort: debugPortForInstance(id), profileDir: `${BASE_PROFILE_DIR}-${id}`, queue: Promise.resolve() });
       }
-      seedRegistry(id);
-      const cur = registry.get(id);
-      if (cur) {
-        registry.applyStatus({
-          ...cur,
-          phase: "launching",
-          detail: "restarting…",
-          attention: null,
-          lastError: null,
-          heartbeatAt: Date.now(),
-          updatedAt: Date.now(),
-        });
-      }
+      // Full clean status — do not spread previous attention/captcha/error (that kept the card blinking).
+      registry.applyStatus({
+        ...makeInitialStatus(id, debugPortForInstance(id)),
+        phase: "launching",
+        detail: "restarting…",
+        processAlive: true,
+        chromeAlive: null,
+        heartbeatAt: Date.now(),
+        updatedAt: Date.now(),
+      });
       setTimeout(() => sendStartNow(id), 1500);
       return { ok: true };
     },
     setStaggerInterval: (ms) => { if (ms >= 0) staggerIntervalMs = Math.floor(ms); return { ok: true }; },
-    getControl: () => ({ intervalMs: staggerIntervalMs, rolloutActive, total: currentNumInstances }),
+    getControl: () => ({
+      intervalMs: staggerIntervalMs,
+      rolloutActive,
+      total: currentNumInstances,
+      pollingPaused: fleetPollingPaused,
+      pollIntervalMs: getFleetPollIntervalMs(),
+    }),
   };
 }
 
@@ -406,12 +481,16 @@ function spawnBotInstance(instanceId: number, totalInstances: number): ChildProc
     stdio: ["ignore", "inherit", "inherit", "ipc"],
   });
 
+  seedRegistry(instanceId);
+  registry.setProcessAlive(instanceId, true);
+
   child.on("exit", (code) => {
     logger.warn({ instanceId, code }, "Bot instance exited");
     const inst = instances.find((i) => i.id === instanceId);
     // Only clear if this exit is still the active process (restart replaces the child).
     if (inst && inst.process === child) {
       inst.process = null;
+      registry.setProcessAlive(instanceId, false);
       registry.markStopped(instanceId, code != null && code !== 0 ? `exited (code ${code})` : "process exited");
     }
   });
@@ -436,10 +515,28 @@ function spawnBotInstance(instanceId: number, totalInstances: number): ChildProc
     }
     // ── Monitoring: child asks to bring its Chrome window forward (e.g. captcha stuck) ──
     if (msg?.type === "request-focus" && typeof msg.instanceId === "number") {
-      const port = debugPortForInstance(msg.instanceId);
-      void focusChromeByPort(port).then((ok) => {
-        logger.warn({ instanceId: msg.instanceId, reason: msg.reason, focused: ok }, "[Monitor] Auto-focusing Chrome for attention");
-      });
+      const id = msg.instanceId as number;
+      const port = debugPortForInstance(id);
+      void (async () => {
+        // Status-update is sent just before request-focus; give it a moment to apply.
+        await sleep(80);
+        const before = registry.get(id);
+        // Skip if attention already cleared (captcha solved) or bot prefers minimized (post-dashboard).
+        if (!before?.attention || before.preferMinimized) {
+          logger.info(
+            { instanceId: id, reason: msg.reason, attention: !!before?.attention, preferMinimized: !!before?.preferMinimized },
+            "[Monitor] Skipping auto-focus — no longer needs foreground"
+          );
+          return;
+        }
+        const ok = await focusChromeByPort(port, {
+          shouldAbort: () => {
+            const s = registry.get(id);
+            return !s?.attention || !!s.preferMinimized;
+          },
+        });
+        logger.warn({ instanceId: id, reason: msg.reason, focused: ok }, "[Monitor] Auto-focusing Chrome for attention");
+      })();
       return;
     }
   });
@@ -456,6 +553,9 @@ async function main(): Promise<void> {
 
   // Start the monitoring registry (staleness sweep + subscriber notifications).
   registry.start();
+
+  // Parent-side read-only DevTools probe (page URL + Chrome alive) — no Playwright attach.
+  startChromeStatusProbe({ intervalMs: 2000 });
 
   // Pre-compile the window-activation helper so the first Focus click is instant.
   warmupWindowHelper();

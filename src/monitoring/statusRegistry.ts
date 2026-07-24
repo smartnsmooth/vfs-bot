@@ -4,6 +4,9 @@
  * Holds the latest status per instance, notifies subscribers (the dashboard SSE
  * stream), and marks instances "unresponsive" when their heartbeat goes stale.
  * Lives only in the parent process — never touches a child's event loop.
+ *
+ * Chrome page/window liveness is patched by `chromeProbe` (read-only HTTP to
+ * DevTools ports) so the dashboard stays accurate without affecting bots.
  */
 import { logger } from "../utils/logger";
 import type { InstanceStatus } from "./status.types";
@@ -32,15 +35,103 @@ class StatusRegistry {
   }
 
   applyStatus(status: InstanceStatus): void {
-    this.map.set(status.instanceId, status);
-    this.notify(status);
+    const prev = this.map.get(status.instanceId);
+    // Parent owns processAlive + chromeAlive probe; don't let child overwrites wipe them.
+    const merged: InstanceStatus = {
+      ...status,
+      chromeAlive: prev?.chromeAlive ?? status.chromeAlive ?? null,
+      processAlive: prev?.processAlive ?? status.processAlive ?? true,
+      preferMinimized: status.preferMinimized ?? prev?.preferMinimized ?? false,
+    };
+    this.map.set(status.instanceId, merged);
+    this.notify(merged);
+  }
+
+  setProcessAlive(instanceId: number, alive: boolean): void {
+    const cur = this.map.get(instanceId);
+    if (!cur) return;
+    if (cur.processAlive === alive) return;
+    const next: InstanceStatus = { ...cur, processAlive: alive, updatedAt: Date.now() };
+    this.map.set(instanceId, next);
+    this.notify(next);
+  }
+
+  /**
+   * Merge read-only Chrome probe results. When Chrome is gone, clear attention
+   * so the card stops blinking (operator can no longer act in that window).
+   */
+  patchChromeProbe(
+    instanceId: number,
+    patch: { chromeAlive: boolean; page?: string | null }
+  ): void {
+    const cur = this.map.get(instanceId);
+    if (!cur) return;
+
+    let changed = false;
+    const next: InstanceStatus = { ...cur, captcha: { ...cur.captcha } };
+
+    if (next.chromeAlive !== patch.chromeAlive) {
+      next.chromeAlive = patch.chromeAlive;
+      changed = true;
+    }
+
+    // Prefer live CDP page URL when Chrome is up (more instant than child sampler).
+    if (patch.chromeAlive && patch.page != null && patch.page !== next.page) {
+      next.page = patch.page;
+      changed = true;
+    }
+
+    if (!patch.chromeAlive) {
+      // Chrome closed — stop attention blink; keep lastError for history on the card.
+      if (next.attention) {
+        next.attention = null;
+        changed = true;
+      }
+      if (next.captcha.last === "waiting") {
+        next.captcha.last = "failed";
+        next.captcha.waitingUntil = null;
+        changed = true;
+      }
+      if (next.phase === "needs_attention") {
+        next.phase = next.processAlive ? "recovering" : "stopped";
+        next.detail = next.processAlive ? "Chrome closed — recovering?" : "Chrome closed";
+        changed = true;
+      } else if (!next.processAlive && next.phase !== "stopped" && next.phase !== "payment") {
+        next.phase = "stopped";
+        next.detail = next.detail?.includes("closed") ? next.detail : "Chrome closed / process stopped";
+        changed = true;
+      }
+      if (next.preferMinimized) {
+        next.preferMinimized = false;
+        changed = true;
+      }
+    }
+
+    if (!changed) return;
+    next.updatedAt = Date.now();
+    this.map.set(instanceId, next);
+    this.notify(next);
   }
 
   /** Mark an instance stopped/removed from the operator's perspective. */
   markStopped(instanceId: number, detail = "stopped"): void {
     const cur = this.map.get(instanceId);
     if (!cur) return;
-    const next: InstanceStatus = { ...cur, phase: "stopped", detail, updatedAt: Date.now() };
+    // If already relaunched (phase launching after Restart), do not overwrite with stopped+old blink state.
+    if (cur.phase === "launching" && /restart/i.test(cur.detail)) return;
+    const next: InstanceStatus = {
+      ...cur,
+      captcha: {
+        ...cur.captcha,
+        last: cur.captcha.last === "waiting" ? "n/a" : cur.captcha.last,
+        waitingUntil: null,
+      },
+      phase: "stopped",
+      detail,
+      attention: null,
+      processAlive: false,
+      updatedAt: Date.now(),
+    };
     this.map.set(instanceId, next);
     this.notify(next);
   }
@@ -79,6 +170,7 @@ class StatusRegistry {
     for (const status of this.map.values()) {
       if (status.phase === "stopped" || status.phase === "payment") continue;
       if (status.phase === "unresponsive") continue;
+      if (!status.processAlive) continue;
       if (now - status.heartbeatAt > STALE_MS) {
         const next: InstanceStatus = {
           ...status,

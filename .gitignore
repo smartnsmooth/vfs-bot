@@ -3,3 +3,4 @@ dist/
 instances-data.json
 slot-state.json
 bookings/
+register-bot/

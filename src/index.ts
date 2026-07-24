@@ -50,6 +50,7 @@ import {
 } from "./utils/pollReadyState";
 import { reporter } from "./monitoring/statusReporter";
 import { registry } from "./monitoring/statusRegistry";
+import { startChromeStatusProbe } from "./monitoring/chromeProbe";
 import { focusChromeByPort, getDevtoolsInfo } from "./utils/chromeWindow";
 import type { MonitorHooks } from "./monitoring/status.types";
 import { isPageNotFoundUrl } from "./flows/pageNotFound";
@@ -336,6 +337,88 @@ function requestPollingAbort(reason: string, instanceId?: number): void {
     }
   }
   logger.info({ instanceId, reason, pollingAbortSeq }, "[poll] Abort requested");
+}
+
+/** Fleet-wide pause from Monitor tab — bots keep Chrome/session, skip slot checks. */
+let pollingPaused = false;
+let pollingPauseWaiters: Array<() => void> = [];
+/** After resume, wait until this timestamp before the next slot check (staggered per instance). */
+let pollingResumeGateUntil = 0;
+
+function setPollingPaused(paused: boolean): void {
+  const was = pollingPaused;
+  pollingPaused = paused;
+  reporter.setPollingPaused(paused);
+  if (was && !paused) {
+    const waiters = pollingPauseWaiters;
+    pollingPauseWaiters = [];
+    for (const w of waiters) {
+      try {
+        w();
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+}
+
+function waitForPollingResume(): Promise<void> {
+  if (!pollingPaused) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    pollingPauseWaiters.push(resolve);
+  });
+}
+
+/**
+ * Hold the poll loop while fleet polling is paused; after resume, honour the
+ * staggered gate (bot N waits (N-1)×pollInterval from resumeAt).
+ */
+async function holdIfPollingPaused(
+  instanceId?: number,
+  abortSeq?: number
+): Promise<"ok" | "abort"> {
+  while (pollingPaused) {
+    if (instanceBookingActive || instanceOnPaymentPage) return "ok";
+    reporter.setPhase("polling", "paused — click Resume polling");
+    const raced = await Promise.race([
+      waitForPollingResume().then(() => "resume" as const),
+      abortSeq != null
+        ? waitForPollingAbort(abortSeq).then(() => "abort" as const)
+        : new Promise<"never">(() => { }),
+    ]);
+    if (raced === "abort" || (abortSeq != null && pollingAbortSeq !== abortSeq)) {
+      await throwIfAbortedForPageNotFound(abortSeq!, "pause-hold-abort");
+      return "abort";
+    }
+  }
+
+  const gate = pollingResumeGateUntil;
+  if (gate > Date.now() && !instanceBookingActive && !instanceOnPaymentPage) {
+    const remaining = gate - Date.now();
+    reporter.setPhase("polling", `resuming in ${Math.round(remaining / 1000)}s (fleet stagger)`);
+    logger.info({ instanceId, remaining, gate }, "[poll] Staggered resume wait");
+    await Promise.race([
+      new Promise<void>((r) => setTimeout(r, remaining)),
+      abortSeq != null ? waitForPollingAbort(abortSeq) : new Promise<void>(() => { }),
+    ]);
+    if (abortSeq != null && pollingAbortSeq !== abortSeq) {
+      await throwIfAbortedForPageNotFound(abortSeq, "resume-gate-abort");
+      return "abort";
+    }
+    pollingResumeGateUntil = 0;
+  }
+  return "ok";
+}
+
+function applyResumePollingGate(instanceId: number | undefined, resumeAt: number, pollIntervalMs: number): void {
+  const id = typeof instanceId === "number" && instanceId >= 1 ? Math.floor(instanceId) : 1;
+  const step = Math.max(1000, Math.floor(pollIntervalMs) || 60_000);
+  pollingResumeGateUntil = resumeAt + (id - 1) * step;
+  setPollingPaused(false);
+  logger.info(
+    { instanceId: id, resumeAt, pollIntervalMs: step, gateUntil: pollingResumeGateUntil },
+    "[poll] Resume — applying fleet stagger gate"
+  );
 }
 
 function schedulePageNotFoundRestart(instanceId?: number): void {
@@ -873,9 +956,10 @@ foreach ($procId in $set) {
   if ($proc -and $proc.MainWindowHandle -ne [IntPtr]::Zero) {
     $h = $proc.MainWindowHandle
     Write-Host "MOVE found window PID=$procId handle=$h title=$($proc.MainWindowTitle)"
-    # SW_RESTORE=9 restores from minimized/maximized/hidden; then move+resize
-    [Win32Move.WM]::ShowWindow($h, 9) | Out-Null
-    [Win32Move.WM]::SetForegroundWindow($h) | Out-Null
+    # Place window without stealing focus (no SetForegroundWindow — that undid dashboard minimize)
+    if ([Win32Move.WM]::IsIconic($h)) {
+      [Win32Move.WM]::ShowWindow($h, 9) | Out-Null
+    }
     $result = [Win32Move.WM]::MoveWindow($h, ${bounds.x}, ${bounds.y}, ${bounds.width}, ${bounds.height}, $true)
     Write-Host "MOVE result=$result"
     $moved = $true
@@ -1020,9 +1104,19 @@ async function settleOnDashboard(opts: {
   abortSeq?: number;
   reason?: string;
 }): Promise<"ok" | "abort"> {
+  // Stop monitor blink + tell parent to ignore late captcha auto-focus.
+  reporter.setAttention(null);
+  reporter.setPreferMinimized(true);
   await minimizeChromeWindow().catch((err) => {
     logger.warn({ err, instanceId: opts.instanceId }, "[Chrome] Minimize after dashboard failed");
   });
+  // Re-assert minimize shortly after — cancels a late SetForeground from captcha focus.
+  void (async () => {
+    await new Promise((r) => setTimeout(r, 800));
+    if (!instanceOnPaymentPage) {
+      await minimizeChromeWindow().catch(() => { });
+    }
+  })();
   logger.info({ instanceId: opts.instanceId, reason: opts.reason }, "[Chrome] Minimized after dashboard");
 
   const waitMs = opts.waitMs ?? 0;
@@ -1053,6 +1147,7 @@ async function settleOnDashboard(opts: {
 /** Mark payment page reached and bring Chrome forward so the operator can pay. */
 async function enterPaymentPageMode(instanceId?: number): Promise<void> {
   instanceOnPaymentPage = true;
+  reporter.setPreferMinimized(false);
   reporter.setPhase("payment", "on payment page — pay manually");
   reporter.setAttention(null);
   const focused = await focusChromeByPort(getRemoteDebuggingPort()).catch(() => false);
@@ -1127,6 +1222,11 @@ async function runPollLoop(
       if (pollingAbortSeq !== myAbortSeq) {
         await throwIfAbortedForPageNotFound(myAbortSeq, "polling-loop-abort");
         logger.info({ instanceId }, "[poll] Aborting poll loop (config updated)");
+        return false;
+      }
+
+      if ((await holdIfPollingPaused(instanceId, myAbortSeq)) === "abort") {
+        logger.info({ instanceId }, "[poll] Aborting poll loop during pause/resume");
         return false;
       }
 
@@ -2427,6 +2527,19 @@ async function start(): Promise<void> {
           return;
         }
 
+        if (msg?.type === "pause-polling") {
+          setPollingPaused(true);
+          logger.info({ instanceId: myInstanceId }, "[poll] Fleet pause received");
+          return;
+        }
+
+        if (msg?.type === "resume-polling") {
+          const resumeAt = typeof msg.resumeAt === "number" ? msg.resumeAt : Date.now();
+          const pollIntervalMs = typeof msg.pollIntervalMs === "number" ? msg.pollIntervalMs : 60_000;
+          applyResumePollingGate(myInstanceId, resumeAt, pollIntervalMs);
+          return;
+        }
+
         ipcChain = ipcChain.then(async () => {
           if (msg?.type === "run-bot-cycle") {
             syncInstanceStoresFromDisk();
@@ -2455,9 +2568,12 @@ async function start(): Promise<void> {
   reporter.init(1, { debugPort: getRemoteDebuggingPort() });
   startPageSampler();
   registry.start();
+  startChromeStatusProbe({ intervalMs: 2000 });
   reporter.setLocalSink((s) => registry.applyStatus(s));
+  registry.setProcessAlive(1, true);
   reporter.setLocalFocus(() => { void focusChromeByPort(getRemoteDebuggingPort()); });
 
+  let singlePollingPaused = false;
   const singleMonitor: MonitorHooks = {
     snapshot: () => registry.snapshot(),
     subscribe: (cb) => registry.subscribe(cb),
@@ -2469,10 +2585,38 @@ async function start(): Promise<void> {
     start: () => ({ ok: false, error: "Single-instance mode — use Submit & Run to start." }),
     pauseRollout: () => ({ ok: true }),
     resumeRollout: () => ({ ok: true }),
+    pausePolling: (instanceId) => {
+      singlePollingPaused = true;
+      setPollingPaused(true);
+      return { ok: true };
+    },
+    resumePolling: (instanceId) => {
+      singlePollingPaused = false;
+      const globalDet = getApplicantDetailsOverrides(0);
+      const sec =
+        globalDet && typeof globalDet.userPollInterval === "number" && globalDet.userPollInterval >= 1
+          ? globalDet.userPollInterval
+          : DEFAULT_POLL_INTERVAL_SEC;
+      applyResumePollingGate(1, Date.now(), Math.max(1000, sec * 1000));
+      return { ok: true };
+    },
     stopInstance: () => ({ ok: false, error: "Not available in single-instance mode." }),
     restartInstance: () => ({ ok: false, error: "Not available in single-instance mode." }),
     setStaggerInterval: () => ({ ok: true }),
-    getControl: () => ({ intervalMs: 0, rolloutActive: false, total: 1 }),
+    getControl: () => {
+      const globalDet = getApplicantDetailsOverrides(0);
+      const sec =
+        globalDet && typeof globalDet.userPollInterval === "number" && globalDet.userPollInterval >= 1
+          ? globalDet.userPollInterval
+          : DEFAULT_POLL_INTERVAL_SEC;
+      return {
+        intervalMs: 0,
+        rolloutActive: false,
+        total: 1,
+        pollingPaused: singlePollingPaused,
+        pollIntervalMs: Math.max(1000, sec * 1000),
+      };
+    },
   };
 
   await ensureChromeWithDevTools();

@@ -1,8 +1,8 @@
 /**
  * "Monitor bots" tab markup + client script for the setup page.
  *
- * The client connects to `/api/monitor/events` (SSE), renders one tile per
- * instance, and focuses Chrome on tile click via `/api/monitor/focus`.
+ * Per-card Stop/Resume polling + Restart. Cards needing manual action
+ * (attention / needs_attention / login_failed stop) blink their background.
  */
 export function buildMonitorTabHtml(): string {
   return `
@@ -21,9 +21,41 @@ export function buildMonitorTabHtml(): string {
   .mon-tile .mon-btn:hover { background: #253341; border-color: #4a5a68; }
   .mon-tile .mon-btn.restart { color: #ffb347; border-color: #5a4630; }
   .mon-tile .mon-btn.restart:hover { background: #2a2218; border-color: #8a6a3a; }
-  .mon-tile.attn { border-color: #f4212e; border-top-color: #f4212e; box-shadow: 0 0 0 1px #f4212e55; animation: monPulse 1.1s ease-in-out infinite; }
-  @keyframes monPulse { 0%,100% { box-shadow: 0 0 0 1px #f4212e55; } 50% { box-shadow: 0 0 8px 1px #f4212eaa; } }
-  @media (prefers-reduced-motion: reduce) { .mon-tile.attn { animation: none; } }
+  .mon-tile .mon-btn.stop { color: #ff8a80; border-color: #5a3030; }
+  .mon-tile .mon-btn.stop:hover { background: #2a1818; }
+  .mon-tile .mon-btn.resume { color: #69f0ae; border-color: #2a5040; }
+  .mon-tile .mon-btn.resume:hover { background: #1a2e24; }
+  .mon-tile.paused { opacity: 0.92; border-color: #5a4630; }
+  .mon-tile.dead {
+    background: #0f1419;
+    border-color: #2a3238;
+    border-top-color: #3a4349 !important;
+    color: #5c6770;
+    opacity: 0.55;
+    cursor: default;
+    animation: none !important;
+    box-shadow: none !important;
+  }
+  .mon-tile.dead:hover { background: #0f1419; border-color: #2a3238; }
+  .mon-tile.dead .id { color: #6b7686; }
+  .mon-tile.dead .phase { background: #1a2228; color: #6b7686; }
+  .mon-tile.dead .page,
+  .mon-tile.dead .detail,
+  .mon-tile.dead .cap { color: #55606b; }
+  .mon-tile.dead .mon-btn.stop,
+  .mon-tile.dead .mon-btn.resume { opacity: 0.4; pointer-events: none; }
+  .mon-tile.attn {
+    border-color: #f4212e;
+    border-top-color: #f4212e;
+    animation: monBlinkBg 0.9s ease-in-out infinite;
+  }
+  @keyframes monBlinkBg {
+    0%, 100% { background: #15202b; box-shadow: 0 0 0 1px #f4212e55; }
+    50% { background: #5a1520; box-shadow: 0 0 10px 1px #f4212eaa; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .mon-tile.attn { animation: none; background: #3d1520; box-shadow: 0 0 0 1px #f4212e88; }
+  }
   .mon-toast { position: fixed; right: 1rem; bottom: 1rem; background: #1c2732; border: 1px solid #38444d; color: #e7e9ea; padding: 0.6rem 0.85rem; border-radius: 8px; font-size: 0.85rem; opacity: 0; transition: opacity 0.2s; pointer-events: none; z-index: 50; max-width: 22rem; }
   .mon-toast.show { opacity: 1; }
 </style>
@@ -88,9 +120,29 @@ export function buildMonitorTabHtml(): string {
     }
   }
 
+  function isClosed(s){
+    if (!s) return false;
+    if (s.chromeAlive === false) return true;
+    if (s.processAlive === false && (s.phase === 'stopped' || s.phase === 'unresponsive')) return true;
+    return false;
+  }
+
+  /** Errors that need the operator — only while Chrome is still open so they can act. */
+  function needsManual(s){
+    if (!s) return false;
+    if (isClosed(s)) return false;
+    if (s.phase === 'launching' || s.phase === 'recovering' || s.phase === 'idle') return false;
+    if (s.phase === 'needs_attention') return true;
+    if (s.attention) return true;
+    if (s.captcha && s.captcha.last === 'waiting') return true;
+    return false;
+  }
+
   function tileHtml(s){
     var color = PHASE_COLORS[s.phase] || '#55606b';
-    var attn = (s.phase === 'needs_attention' || s.attention) ? ' attn' : '';
+    var paused = !!s.pollingPaused;
+    var closed = isClosed(s);
+    var attn = (!closed && needsManual(s)) ? ' attn' : '';
     var cap = s.captcha || {};
     var capBadge = '';
     if (cap.last === 'passed') capBadge = '<span style="color:#00ba7c">captcha ok</span>';
@@ -98,7 +150,7 @@ export function buildMonitorTabHtml(): string {
     else if (cap.last === 'waiting') capBadge = '<span style="color:#f5a623">captcha wait</span>';
     var capCounts = ' <span style="color:#6b7686">(' + (cap.solved||0) + '/' + (cap.attempts||0) + ')</span>';
     var detail = s.detail || '';
-    if (s.lastError && (s.phase === 'stopped' || s.attention)) detail = s.lastError.message || detail;
+    if (s.lastError && (s.phase === 'stopped' || s.attention || needsManual(s) || closed)) detail = s.lastError.message || detail;
     var pageShort = shortPage(s.page);
     var tip = [];
     if (s.egressIp) tip.push('ip:' + s.egressIp);
@@ -106,29 +158,48 @@ export function buildMonitorTabHtml(): string {
     if (s.center) tip.push('c:' + s.center);
     tip.push('polls:' + (s.pollCount||0));
     if (s.lastCode) tip.push('code:' + s.lastCode);
+    if (paused) tip.push('polling paused');
+    if (closed) tip.push('bot closed');
+    if (s.chromeAlive === false) tip.push('Chrome closed');
+    else if (s.chromeAlive === true) tip.push('Chrome up');
+    if (s.processAlive === false) tip.push('process dead');
+    if (needsManual(s)) tip.push('needs manual action');
 
-    return '<div class="mon-tile' + attn + '" data-id="' + s.instanceId + '" title="' + esc(tip.join(' · ') || ('Focus bot #' + s.instanceId)) + '" style="border-top-color:' + color + '">' +
-      '<span class="phase" style="color:' + color + '">' + esc(s.phase) + '</span>' +
-      '<span class="id">' + s.instanceId + '</span>' +
+    var chromeDot = closed
+      ? '<span style="color:#55606b" title="Bot closed">●</span> '
+      : (s.chromeAlive === true
+        ? '<span style="color:#00ba7c" title="Chrome DevTools up">●</span> '
+        : '<span style="color:#55606b" title="Chrome status unknown">●</span> ');
+
+    var pollBtn = closed
+      ? ''
+      : (paused
+        ? '<button type="button" class="mon-btn resume" data-action="resume-polling" title="Resume polling (fleet poll-interval stagger)">Resume</button>'
+        : '<button type="button" class="mon-btn stop" data-action="pause-polling" title="Stop polling (keep Chrome/session)">Stop</button>');
+
+    var phaseLabel = closed ? 'closed' : (paused ? 'paused' : s.phase);
+    if (!closed && needsManual(s) && !paused) phaseLabel = s.phase === 'stopped' ? 'stopped' : (s.attention && s.attention.reason) || s.phase;
+
+    var topColor = closed ? '#3a4349' : (needsManual(s) ? '#f4212e' : color);
+    var phaseColor = closed ? '#6b7686' : (needsManual(s) ? '#f4212e' : color);
+
+    return '<div class="mon-tile' + attn + (paused && !closed ? ' paused' : '') + (closed ? ' dead' : '') + '" data-id="' + s.instanceId + '" title="' + esc(tip.join(' · ') || ('Focus bot #' + s.instanceId)) + '" style="border-top-color:' + topColor + '">' +
+      '<span class="phase" style="color:' + phaseColor + '">' + esc(phaseLabel) + '</span>' +
+      '<span class="id">' + chromeDot + s.instanceId + '</span>' +
       '<div class="page" title="' + esc(s.page || '') + '">' + (pageShort ? esc(pageShort) : '<span style="color:#55606b">page —</span>') + '</div>' +
       '<div class="detail" title="' + esc(detail) + '">' + esc(detail) + '</div>' +
       '<div class="cap">' + (capBadge || '<span style="color:#6b7686">captcha —</span>') + capCounts + '</div>' +
       '<div class="actions">' +
+        pollBtn +
         '<button type="button" class="mon-btn restart" data-action="restart" title="Restart this bot">Restart</button>' +
       '</div>' +
     '</div>';
   }
 
-  var PROBLEM = { needs_attention:1, stopped:1, unresponsive:1, recovering:1 };
-
   function render(){
     rafPending = false;
     var list = Object.keys(instances).map(function(k){ return instances[k]; });
-    list.sort(function(a,b){
-      var pa = PROBLEM[a.phase] ? 0 : 1, pb = PROBLEM[b.phase] ? 0 : 1;
-      if (pa !== pb) return pa - pb;
-      return a.instanceId - b.instanceId;
-    });
+    list.sort(function(a,b){ return a.instanceId - b.instanceId; });
     var html = ''; for (var j=0;j<list.length;j++){ html += tileHtml(list[j]); }
     el('monGrid').innerHTML = html;
   }
@@ -137,9 +208,9 @@ export function buildMonitorTabHtml(): string {
 
   function onStatus(s){
     var wasAttn = prevAttn[s.instanceId];
-    var isAttn = (s.phase === 'needs_attention' || !!s.attention);
+    var isAttn = needsManual(s);
     if (isAttn && !wasAttn && Date.now() > warmupUntil){
-      var reason = (s.attention && s.attention.reason) || 'issue';
+      var reason = (s.attention && s.attention.reason) || s.phase || 'issue';
       toast('Bot #' + s.instanceId + ' needs attention: ' + reason);
       beep();
     }
@@ -169,6 +240,24 @@ export function buildMonitorTabHtml(): string {
         post('restart', { instanceId: btnId }).then(function(r){
           toast('#' + btnId + (r.ok ? ' restarting' : ': ' + (r.error || 'restart failed')));
         });
+      } else if (action === 'pause-polling') {
+        toast('Stopping polling on bot #' + btnId + '…');
+        post('pause-polling', { instanceId: btnId }).then(function(r){
+          if (r.ok && instances[btnId]) {
+            instances[btnId].pollingPaused = true;
+            scheduleRender();
+          }
+          toast('#' + btnId + (r.ok ? ' polling stopped' : ': ' + (r.error || 'stop failed')));
+        });
+      } else if (action === 'resume-polling') {
+        toast('Resuming polling on bot #' + btnId + '…');
+        post('resume-polling', { instanceId: btnId }).then(function(r){
+          if (r.ok && instances[btnId]) {
+            instances[btnId].pollingPaused = false;
+            scheduleRender();
+          }
+          toast('#' + btnId + (r.ok ? ' polling resumed' : ': ' + (r.error || 'resume failed')));
+        });
       }
       return;
     }
@@ -190,7 +279,7 @@ export function buildMonitorTabHtml(): string {
         for (var i = 0; i < d.instances.length; i++){
           var s = d.instances[i];
           instances[s.instanceId] = s;
-          prevAttn[s.instanceId] = (s.phase === 'needs_attention' || !!s.attention);
+          prevAttn[s.instanceId] = needsManual(s);
         }
         render();
       }
