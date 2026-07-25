@@ -151,6 +151,11 @@ export function buildMonitorTabHtml(): string {
     var capCounts = ' <span style="color:#6b7686">(' + (cap.solved||0) + '/' + (cap.attempts||0) + ')</span>';
     var detail = s.detail || '';
     if (s.lastError && (s.phase === 'stopped' || s.attention || needsManual(s) || closed)) detail = s.lastError.message || detail;
+    // Once slot polling has started, prefer the live poll count in this slot.
+    if (!closed && (s.phase === 'polling' || (paused && (s.pollCount || 0) > 0))) {
+      detail = 'poll #' + (s.pollCount || 0);
+      if (s.center) detail += ' · ' + s.center;
+    }
     var pageShort = shortPage(s.page);
     var tip = [];
     if (s.egressIp) tip.push('ip:' + s.egressIp);

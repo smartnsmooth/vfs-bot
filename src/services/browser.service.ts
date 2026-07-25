@@ -161,7 +161,7 @@ export class BrowserService implements BrowserServiceCore {
     const vfsPage = this.findPreferredVfsPage(pages, { excludeApplicantSetup: true });
     if (vfsPage) {
       try {
-        await vfsPage.bringToFront().catch(() => { });
+        // Do not bringToFront — that restores a minimized Chrome window on Windows.
         return vfsPage.url();
       } catch {
         return "";
@@ -215,7 +215,8 @@ export class BrowserService implements BrowserServiceCore {
       );
     }
     this.attachLiftApiClientSourceSniffer(page.context());
-    await page.bringToFront().catch(() => { });
+    // Do not bringToFront — CDP works on background tabs; bringToFront restores
+    // a minimized Chrome window after dashboard settle.
     logger.info({ cdpUrl: config.browserCdpUrl, tabUrl: page.url() }, "[lift-api] Using VFS tab for POST");
     return page;
   }

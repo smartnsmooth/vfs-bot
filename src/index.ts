@@ -1110,17 +1110,24 @@ async function settleOnDashboard(opts: {
   await minimizeChromeWindow().catch((err) => {
     logger.warn({ err, instanceId: opts.instanceId }, "[Chrome] Minimize after dashboard failed");
   });
-  // Re-assert minimize shortly after — cancels a late SetForeground from captcha focus.
-  void (async () => {
-    await new Promise((r) => setTimeout(r, 800));
+  // Re-assert minimize after settle wait (and once mid-wait) — late captcha
+  // focus / any accidental restore should not leave Chrome visible during polling.
+  const remimize = async () => {
     if (!instanceOnPaymentPage) {
       await minimizeChromeWindow().catch(() => { });
     }
+  };
+  void (async () => {
+    await new Promise((r) => setTimeout(r, 800));
+    await remimize();
   })();
   logger.info({ instanceId: opts.instanceId, reason: opts.reason }, "[Chrome] Minimized after dashboard");
 
   const waitMs = opts.waitMs ?? 0;
-  if (waitMs <= 0) return "ok";
+  if (waitMs <= 0) {
+    await remimize();
+    return "ok";
+  }
 
   reporter.setPhase("polling", `on dashboard — waiting ${Math.round(waitMs / 1000)}s`);
   logger.info(
@@ -1131,6 +1138,7 @@ async function settleOnDashboard(opts: {
   const abortSeq = opts.abortSeq;
   if (abortSeq == null) {
     await new Promise((r) => setTimeout(r, waitMs));
+    await remimize();
     return "ok";
   }
   await Promise.race([
@@ -1141,6 +1149,7 @@ async function settleOnDashboard(opts: {
     await throwIfAbortedForPageNotFound(abortSeq, "dashboard-settle-abort");
     return "abort";
   }
+  await remimize();
   return "ok";
 }
 
@@ -2256,6 +2265,11 @@ async function runOneBotCycleCore(meta: SubmitMeta): Promise<void> {
   }
 
   await browser.preparePollingAfterLogin({ skipDashboardNavigate });
+  // preparePolling used to call page.bringToFront() via getVfsPage — re-minimize
+  // in case anything else restored the window during settle → prepare.
+  if ((kind === "dashboard" || didLoginThisCycle) && !instanceOnPaymentPage) {
+    await minimizeChromeWindow().catch(() => { });
+  }
 
   // Check if force-book or config-update fired during preparePolling — exit early so the
   // queued attack cycle can start immediately.
