@@ -221,6 +221,12 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
     const v = parseInt(j.userPollInterval, 10);
     if (Number.isFinite(v) && v >= 1) out.userPollInterval = v;
   }
+  if (typeof j.applicantsIntervalSec === "number" && Number.isFinite(j.applicantsIntervalSec) && j.applicantsIntervalSec >= 1) {
+    out.applicantsIntervalSec = Math.floor(j.applicantsIntervalSec);
+  } else if (typeof j.applicantsIntervalSec === "string" && j.applicantsIntervalSec.trim() !== "") {
+    const v = parseInt(j.applicantsIntervalSec, 10);
+    if (Number.isFinite(v) && v >= 1) out.applicantsIntervalSec = v;
+  }
   if (typeof j.postLoginPollDelay === "number" && Number.isFinite(j.postLoginPollDelay) && j.postLoginPollDelay >= 0) {
     out.postLoginPollDelay = Math.floor(j.postLoginPollDelay);
   } else if (typeof j.postLoginPollDelay === "string" && j.postLoginPollDelay.trim() !== "") {
@@ -271,6 +277,10 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
     </select>
     <label for="userPollInterval" style="margin-top:0.75rem">Poll interval (seconds)</label>
     <input type="number" id="userPollInterval" name="userPollInterval" min="1" value="${defaultPollIntervalSec}" />
+    <p class="hint" style="margin-top:0.25rem">Gap between bots for CheckIsSlotAvailable (fleet round-robin).</p>
+    <label for="applicantsIntervalSec" style="margin-top:0.75rem">Applicants API interval (seconds)</label>
+    <input type="number" id="applicantsIntervalSec" name="applicantsIntervalSec" min="1" value="2" />
+    <p class="hint" style="margin-top:0.25rem">After a slot hit: bots call save-applicants one-by-one at this gap (separate from poll interval). When any bot gets a URN, all others call applicants immediately.</p>
     <label for="postLoginPollDelay" style="margin-top:0.75rem">Post-login poll delay (seconds)</label>
     <input type="number" id="postLoginPollDelay" name="postLoginPollDelay" min="0" value="30" />
     <label for="numInstances">Number of instances</label>
@@ -967,6 +977,9 @@ export function runApplicantFormWithSubmitHandler(
             if (globalDet && typeof globalDet.userPollInterval === "number") {
               defaults.userPollInterval = globalDet.userPollInterval;
             }
+            if (globalDet && typeof globalDet.applicantsIntervalSec === "number") {
+              defaults.applicantsIntervalSec = globalDet.applicantsIntervalSec;
+            }
             if (globalDet && typeof globalDet.postLoginPollDelay === "number") {
               defaults.postLoginPollDelay = globalDet.postLoginPollDelay;
             }
@@ -1042,12 +1055,13 @@ export function runApplicantFormWithSubmitHandler(
             ...rest
           } = j;
           const fields = parseApplicantFields(rest);
-          const { userPollInterval: upi, postLoginPollDelay: plpd, staggerIntervalSec: sis, ...instanceFields } = fields;
+          const { userPollInterval: upi, applicantsIntervalSec: ais, postLoginPollDelay: plpd, staggerIntervalSec: sis, ...instanceFields } = fields;
 
           {
             const global0 = getApplicantDetailsOverrides(0) ?? {};
             let changed = false;
             if (typeof upi === "number") { global0.userPollInterval = upi; changed = true; }
+            if (typeof ais === "number") { global0.applicantsIntervalSec = ais; changed = true; }
             if (typeof plpd === "number") { global0.postLoginPollDelay = plpd; changed = true; }
             if (typeof sis === "number") { global0.staggerIntervalSec = sis; changed = true; }
             if (typeof instanceFields.countryCode === "string") { global0.countryCode = instanceFields.countryCode; changed = true; }
@@ -1083,6 +1097,32 @@ export function runApplicantFormWithSubmitHandler(
                   const v = parseInt(String(j.staggerIntervalSec ?? ""), 10);
                   return Number.isFinite(v) && v >= 0 ? v : undefined;
                 })();
+
+          const submittedApplicantsIntervalSec =
+            typeof j.applicantsIntervalSec === "number" && j.applicantsIntervalSec >= 1
+              ? Math.floor(j.applicantsIntervalSec)
+              : (() => {
+                  const v = parseInt(String(j.applicantsIntervalSec ?? ""), 10);
+                  return Number.isFinite(v) && v >= 1 ? v : undefined;
+                })();
+
+          if (submittedApplicantsIntervalSec != null || submittedStaggerSec != null || typeof j.userPollInterval === "number") {
+            const global0 = getApplicantDetailsOverrides(0) ?? {};
+            let changed = false;
+            if (submittedApplicantsIntervalSec != null) {
+              global0.applicantsIntervalSec = submittedApplicantsIntervalSec;
+              changed = true;
+            }
+            if (submittedStaggerSec != null) {
+              global0.staggerIntervalSec = submittedStaggerSec;
+              changed = true;
+            }
+            if (typeof j.userPollInterval === "number" && j.userPollInterval >= 1) {
+              global0.userPollInterval = Math.floor(j.userPollInterval);
+              changed = true;
+            }
+            if (changed) setApplicantDetailsOverrides(global0, 0);
+          }
 
           const credentials = getAllInstanceCredentials();
           const details = getAllInstanceApplicantDetails();

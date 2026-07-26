@@ -122,11 +122,11 @@ export const config = {
    * When true, OTP is read via https://api.mail.tm (see /domains for hostnames — not limited to “@mail.tm”).
    * `VFS_USERNAME` / `VFS_PASSWORD` must match that mail.tm-created mailbox.
    */
-  /** Chrome window width in pixels for grid layout. 0 = auto (screen width / columns). */
+  /** Chrome window width in pixels for tile grid. 0 = auto (screen width / columns). */
   chromeWindowWidth: Math.max(0, parseInt(process.env.CHROME_WINDOW_WIDTH ?? "0", 10) || 0),
-  /** Chrome window height in pixels for grid layout. 0 = auto (screen height / rows). */
+  /** Chrome window height in pixels for tile grid. 0 = auto (screen height / rows). */
   chromeWindowHeight: Math.max(0, parseInt(process.env.CHROME_WINDOW_HEIGHT ?? "0", 10) || 0),
-  /** Fixed number of columns for the browser grid. 0 = auto (ceil(sqrt(totalInstances)) capped at 5). */
+  /** Fixed number of columns for the browser tile grid. 0 = auto. */
   chromeGridColumns: Math.max(0, parseInt(process.env.CHROME_GRID_COLUMNS ?? "0", 10) || 0),
   /** Screen width for grid calculation. 0 = auto-detect via PowerShell (fallback 1920). */
   screenWidth: Math.max(0, parseInt(process.env.SCREEN_WIDTH ?? "0", 10) || 0),

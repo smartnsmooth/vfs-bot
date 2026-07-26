@@ -113,11 +113,17 @@ export function getReadyInstanceOffset(instanceId: number, stepMs: number): numb
  * ready (not the total expected). This replaces the old `stepMs * numInstances`
  * calculation with `stepMs * readyCount` so the interval tightens when
  * some instances failed to reach the dashboard.
+ *
+ * Returns 0 when nobody is marked ready yet — callers should fall back to
+ * `stepMs * BOT_TOTAL_INSTANCES`. (Returning `stepMs * 1` here used to make
+ * every bot sleep only the user step, defeating POLL_INTERVAL_SCALED.)
  */
 export function getReadyInstancePollInterval(stepMs: number): number {
   const state = readState();
-  const readyCount = Math.max(1, state.readyInstances.length);
-  return stepMs * readyCount;
+  const readyCount = state.readyInstances.length;
+  if (readyCount > 0) return stepMs * readyCount;
+  if (state.totalExpected > 0) return stepMs * state.totalExpected;
+  return 0;
 }
 
 /**

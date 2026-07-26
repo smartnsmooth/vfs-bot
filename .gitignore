@@ -1,6 +1,7 @@
 node_modules/
 dist/
 instances-data.json
+applicants-coord.json
 slot-state.json
 bookings/
 register-bot/

@@ -445,12 +445,17 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     updateUzbLvaApplicantFields();
     applyInstanceScheduleRangeToForm(inst.details || {});
 
-    // Global settings (instance 0): postLoginPollDelay + staggerIntervalSec.
+    // Global settings (instance 0): postLoginPollDelay + staggerIntervalSec + applicantsIntervalSec.
     const globalInst = data.instances["0"];
     const plpdEl = document.getElementById("postLoginPollDelay");
     if (plpdEl) {
       const src = (globalInst && globalInst.details) || (inst && inst.details) || {};
       plpdEl.value = src.postLoginPollDelay != null ? String(src.postLoginPollDelay) : "30";
+    }
+    const aisEl = document.getElementById("applicantsIntervalSec");
+    if (aisEl) {
+      const gsrc = (globalInst && globalInst.details) || {};
+      aisEl.value = gsrc.applicantsIntervalSec != null ? String(gsrc.applicantsIntervalSec) : "2";
     }
     const sisEl = document.getElementById("staggerIntervalSec");
     if (sisEl) {
@@ -498,6 +503,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       scheduleDateRangeEnd: String(fd.get("scheduleDateRangeEnd") ?? "").trim(),
       numInstances: getNumInstances(),
       userPollInterval: parseInt(String(fd.get("userPollInterval") || "60"), 10) || 60,
+      applicantsIntervalSec: parseInt(String(fd.get("applicantsIntervalSec") || "2"), 10) || 2,
       postLoginPollDelay: parseInt(String(fd.get("postLoginPollDelay") || "30"), 10),
       staggerIntervalSec: parseInt(String(fd.get("staggerIntervalSec") || "6"), 10),
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
@@ -505,6 +511,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       juridictionCode: String(fd.get("juridictionCode") ?? "").trim() || undefined,
     };
     if (!Number.isFinite(body.postLoginPollDelay) || body.postLoginPollDelay < 0) body.postLoginPollDelay = 30;
+    if (!Number.isFinite(body.applicantsIntervalSec) || body.applicantsIntervalSec < 1) body.applicantsIntervalSec = 2;
     if (collectLogin) {
       body.vfsUsername = fd.get("vfsUsername");
       body.vfsPassword = fd.get("vfsPassword");
@@ -698,6 +705,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       scheduleDateRangeEnd: String(fd.get("scheduleDateRangeEnd") ?? "").trim(),
       numInstances: getNumInstances(),
       userPollInterval: parseInt(String(fd.get("userPollInterval") || "60"), 10) || 60,
+      applicantsIntervalSec: parseInt(String(fd.get("applicantsIntervalSec") || "2"), 10) || 2,
       postLoginPollDelay: parseInt(String(fd.get("postLoginPollDelay") || "30"), 10),
       staggerIntervalSec: parseInt(String(fd.get("staggerIntervalSec") || "6"), 10),
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
@@ -705,6 +713,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       juridictionCode: String(fd.get("juridictionCode") ?? "").trim() || undefined,
     };
     if (!Number.isFinite(body.postLoginPollDelay) || body.postLoginPollDelay < 0) body.postLoginPollDelay = 30;
+    if (!Number.isFinite(body.applicantsIntervalSec) || body.applicantsIntervalSec < 1) body.applicantsIntervalSec = 2;
     if (collectLogin) {
       body.vfsUsername = fd.get("vfsUsername");
       body.vfsPassword = fd.get("vfsPassword");

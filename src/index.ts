@@ -42,12 +42,16 @@ import { clearChromeSessionDataBeforeLaunch, resolveChromeProfileFolderName } fr
 import { killChromeTreeByCdpPortSync } from "./utils/killChromeByCdpPort";
 import {
   markInstanceReady,
-  waitForAllReady,
-  getReadyInstanceOffset,
   getReadyInstancePollInterval,
-  clearPollReadyState,
-  stampGateOpened,
 } from "./utils/pollReadyState";
+import {
+  applicantsAttemptTargetMs,
+  createApplicantsUrnUnlockWatcher,
+  ensureApplicantsWave,
+  isApplicantsUrnUnlocked,
+  markApplicantsUrnUnlocked,
+  resetApplicantsWave,
+} from "./utils/applicantsCoord";
 import { reporter } from "./monitoring/statusReporter";
 import { registry } from "./monitoring/statusRegistry";
 import { startChromeStatusProbe } from "./monitoring/chromeProbe";
@@ -789,15 +793,33 @@ function detectScreenWorkingArea(): Promise<{ width: number; height: number }> {
 }
 
 /**
- * Compute Chrome window size and position for a tiled grid layout.
- * Instance IDs are 1-based; returns {width, height, x, y} in pixels.
+ * Compact bottom-right placement used only for Chrome's first paint
+ * (so it does not flash huge on the left). After DevTools is ready we
+ * move to the tiled grid via {@link computeChromeGridPosition}.
+ */
+async function computeChromeFirstOpenPosition(): Promise<{ width: number; height: number; x: number; y: number }> {
+  const screen = await detectScreenWorkingArea();
+  const screenW = config.screenWidth > 0 ? config.screenWidth : screen.width;
+  const screenH = config.screenHeight > 0 ? config.screenHeight : screen.height;
+  const w = 480;
+  const h = 360;
+  const margin = 12;
+  return {
+    width: w,
+    height: h,
+    x: Math.max(0, screenW - w - margin),
+    y: Math.max(0, screenH - h - margin),
+  };
+}
+
+/**
+ * Tiled grid layout for all bot Chrome windows (instance IDs are 1-based).
  */
 async function computeChromeGridPosition(instanceIdx: number, totalInstances: number): Promise<{ width: number; height: number; x: number; y: number }> {
   const total = Math.max(1, totalInstances);
   const idx = Math.max(0, instanceIdx - 1); // 0-based
 
   // Auto layout targets a ~5:2 column-to-row ratio (wider than tall).
-  // 10 instances → 5 cols × 2 rows; 40 → 10 cols × 4 rows.
   const cols = config.chromeGridColumns > 0
     ? config.chromeGridColumns
     : Math.max(1, Math.ceil(Math.sqrt(total * 2.5)));
@@ -822,16 +844,14 @@ async function ensureChromeWithDevTools(opts?: { preserveSession?: boolean }): P
   const debugPort = getRemoteDebuggingPort();
 
   // If Chrome DevTools is already reachable on the target port, skip spawning.
-  // But still reposition the window in case it's off-screen or wrong size.
+  // Reposition into the tiled grid (not bottom-right).
   for (const url of getChromeDevToolsCheckUrls()) {
     if (await checkDevToolsEndpoint(url)) {
       logger.info({ url, instanceId }, "[Chrome] DevTools already running — reusing existing Chrome");
       const numId = parseInt(process.env.BOT_INSTANCE_ID ?? "1", 10) || 1;
       const total = parseInt(process.env.BOT_TOTAL_INSTANCES ?? "1", 10) || 1;
-      if (total > 1) {
-        const grid = await computeChromeGridPosition(numId, total);
-        await moveWindowByDebugPort(debugPort, grid);
-      }
+      const grid = await computeChromeGridPosition(numId, total);
+      await moveWindowByDebugPort(debugPort, grid);
       return;
     }
   }
@@ -859,6 +879,7 @@ async function ensureChromeWithDevTools(opts?: { preserveSession?: boolean }): P
 
   const numericInstanceId = parseInt(process.env.BOT_INSTANCE_ID ?? "1", 10) || 1;
   const totalInstances = parseInt(process.env.BOT_TOTAL_INSTANCES ?? "1", 10) || 1;
+  const firstOpen = await computeChromeFirstOpenPosition();
   const grid = await computeChromeGridPosition(numericInstanceId, totalInstances);
 
   patchChromeProfilePrefsBeforeLaunch(userDataDir);
@@ -883,11 +904,14 @@ async function ensureChromeWithDevTools(opts?: { preserveSession?: boolean }): P
   if (resolvedProxy.launchProxy) {
     chromeArgs.push(`--proxy-server=${resolvedProxy.launchProxy}`);
   }
+  // First paint: compact bottom-right (avoids a huge left-side flash).
+  chromeArgs.push(`--window-size=${firstOpen.width},${firstOpen.height}`);
+  chromeArgs.push(`--window-position=${firstOpen.x},${firstOpen.y}`);
   chromeArgs.push(config.loginPageUrl);
 
   logger.info(
-    { instanceId, grid, totalInstances },
-    `[Chrome] Launching at grid position col=${grid.x / grid.width}, row=${grid.y / grid.height} (${grid.width}x${grid.height})`
+    { instanceId, firstOpen, grid, totalInstances },
+    `[Chrome] Launching bottom-right first, then tile ${grid.width}x${grid.height} at (${grid.x},${grid.y})`
   );
 
   const child = spawn(chromePath, chromeArgs, { detached: true, stdio: "ignore" });
@@ -902,7 +926,7 @@ async function ensureChromeWithDevTools(opts?: { preserveSession?: boolean }): P
   while (Date.now() - startedAt < maxWaitMs) {
     for (const url of getChromeDevToolsCheckUrls()) {
       if (await checkDevToolsEndpoint(url)) {
-        // Small delay for Chrome window to fully render before moving it
+        // Small delay for Chrome window to fully render, then move into the fleet tile grid.
         await new Promise((r) => setTimeout(r, 500));
         await moveWindowByDebugPort(debugPort, grid);
         return;
@@ -1225,6 +1249,12 @@ async function runPollLoop(
   let slotFound = false;
   const slotWatcher = createSlotFoundWatcher(instanceId);
   const myAbortSeq = pollingAbortSeq;
+
+  // Register in poll-ready-state so POLL_INTERVAL_SCALED uses readyCount
+  // (step × N), not an empty list that previously collapsed to step × 1.
+  if (typeof instanceId === "number" && Number.isFinite(instanceId) && instanceId >= 1) {
+    markInstanceReady(Math.floor(instanceId));
+  }
 
   try {
     while (limit === 0 || completed < limit) {
@@ -1783,19 +1813,72 @@ async function loginWithForbiddenRecovery(instanceId?: number): Promise<void> {
   }
 }
 
+const DEFAULT_APPLICANTS_INTERVAL_SEC = 2;
+
+function getApplicantsIntervalMs(): number {
+  const globalDet = getApplicantDetailsOverrides(0);
+  const sec =
+    globalDet && typeof globalDet.applicantsIntervalSec === "number" && globalDet.applicantsIntervalSec >= 1
+      ? globalDet.applicantsIntervalSec
+      : DEFAULT_APPLICANTS_INTERVAL_SEC;
+  return Math.max(1000, Math.floor(sec) * 1000);
+}
+
 /**
- * Try save-applicants with a unified retry strategy:
+ * Wait until this bot's round-robin applicants slot, or until a peer unlocks URN
+ * (immediate wake), or abort. Returns why we woke.
+ */
+async function waitForApplicantsStaggerGate(opts: {
+  instanceId?: number;
+  attemptIndex: number;
+  abortSeq: number;
+}): Promise<"ready" | "urn_unlocked" | "abort"> {
+  if (isApplicantsUrnUnlocked()) return "urn_unlocked";
+
+  const id =
+    typeof opts.instanceId === "number" && Number.isFinite(opts.instanceId) && opts.instanceId >= 1
+      ? Math.floor(opts.instanceId)
+      : 1;
+  const numInstancesRaw = parseInt(process.env.BOT_TOTAL_INSTANCES ?? "1", 10);
+  const numInstances = Number.isFinite(numInstancesRaw) && numInstancesRaw > 0 ? numInstancesRaw : 1;
+  const stepMs = getApplicantsIntervalMs();
+  const targetAt = applicantsAttemptTargetMs(id, opts.attemptIndex, stepMs, numInstances);
+  const remainingMs = Math.max(0, targetAt - Date.now());
+
+  if (remainingMs <= 0) return "ready";
+
+  reporter.setBookingStep(
+    isApplicantsUrnUnlocked()
+      ? "save applicants (peer URN — going now)"
+      : `save applicants — turn in ${Math.round(remainingMs / 1000)}s`
+  );
+  logger.info(
+    { instanceId: id, attemptIndex: opts.attemptIndex, stepMs, numInstances, remainingMs, targetAt },
+    "[Applicants] Waiting for round-robin turn (or peer URN unlock)"
+  );
+
+  const unlockWatcher = createApplicantsUrnUnlockWatcher();
+  try {
+    const woke = await Promise.race([
+      new Promise<"ready">((r) => setTimeout(() => r("ready"), remainingMs)),
+      unlockWatcher.wait().then(() => "urn_unlocked" as const),
+      waitForPollingAbort(opts.abortSeq).then(() => "abort" as const),
+    ]);
+    return woke;
+  } finally {
+    unlockWatcher.dispose();
+  }
+}
+
+/**
+ * Try save-applicants with fleet round-robin (applicantsIntervalSec from setup form):
+ * bot 1, then bot 2 after interval, … — same idea as CheckIsSlotAvailable stagger,
+ * but with its own interval. When any bot gets a URN, peers wake and call immediately.
  *
- * - **10673** ("no appointment slots"): retry up to `pollReloginInterval` times at poll interval,
- *   then poll-style relogin + slot poll, forever until save succeeds.
- *
- * - **Any other error** (422, HTTP non-2xx, bad JSON, no URN, etc.): retry up to
- *   MAX_SAVE_APPLICANTS_RETRIES (8) times with poll interval delay between attempts.
- *   After 8 failures → full relogin (clear cache, rotate IP) + poll, then retry the whole
- *   cycle from attempt 1.  Never stops the bot.
+ * - **10673**: up to `pollReloginInterval` staggered tries, then relogin + slot poll, forever.
+ * - **Other errors**: up to MAX_SAVE_APPLICANTS_RETRIES (8), then full relogin + poll.
  */
 async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: SlotFoundState): Promise<boolean> {
-  const pollIntervalMs = getFixedTimingForInstance(instanceId).pollIntervalMs;
   const phase1Attempts = Math.max(1, config.pollReloginInterval);
   const chainAbortSeq = pollingAbortSeq;
 
@@ -1806,95 +1889,114 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
     return false;
   }
 
-  let nonRecoverableAttempts = 0; // tracks consecutive non-10673 failures across the retry loop
+  const waveSeed =
+    (slotStateCache?.timestamp && slotStateCache.timestamp > 0
+      ? slotStateCache.timestamp
+      : isSlotFoundByAnyInstance().timestamp) ?? Date.now();
+  ensureApplicantsWave(waveSeed);
+
+  let nonRecoverableAttempts = 0;
+  let attemptIndex = 0; // round-robin slot index for this bot
+  let consecutive10673 = 0;
 
   applicants10673Recovery: while (true) {
-    // Check abort before each Applicants API attempt so superseded chains don't waste a request.
     if (pollingAbortSeq !== chainAbortSeq) {
       await throwIfAbortedForPageNotFound(chainAbortSeq, "booking-save-abort");
       logger.info({ instanceId }, "[ForceBook] Booking chain superseded — exiting before save-applicants");
       return false;
     }
-    for (let phase1Idx = 0; phase1Idx < phase1Attempts; phase1Idx++) {
-      let saw10673ThisPhase = false;
-      try {
-        reporter.setBookingStep("save applicants");
-        await browser.saveApplicantsViaLiftApi();
 
-        // Verify URN was set; if not, treat as a retryable failure.
-        const urnAfterSave = getApplicationUrn();
-        if (!urnAfterSave?.trim()) {
-          throw new Error("Save applicants did not set URN");
-        }
-
-        break applicants10673Recovery;
-      } catch (err) {
-        if (err instanceof VfsRateLimitedError) {
-          if (err.isAccountBlock) {
-            await stopForAccountRateLimit(instanceId, "save-applicants", err.code);
-            return false;
-          }
-          return recoverBookingChainFromIpRateLimit(instanceId, "429-ip-save-applicants", err, slotStateCache);
-        }
-        if (err instanceof VfsGatewayTimeoutError) {
-          return recoverBookingChainFromGatewayTimeout(instanceId, "504-gateway-timeout-save-applicants", err, slotStateCache);
-        }
-        if (isSaveApplicants10673(err)) {
-          saw10673ThisPhase = true;
-          logger.warn(
-            {
-              instanceId,
-              phase1Round: phase1Idx + 1,
-              phase1Attempts,
-              err: err instanceof Error ? err.message : String(err),
-            },
-            "Save applicants returned 10673 (no appointment slots in response) — phase-1 retry or relogin"
-          );
-        } else {
-          nonRecoverableAttempts += 1;
-          const errMsg = err instanceof Error ? err.message : String(err);
-
-          if (nonRecoverableAttempts >= MAX_SAVE_APPLICANTS_RETRIES) {
-            logger.warn(
-              { instanceId, attempt: nonRecoverableAttempts, maxRetries: MAX_SAVE_APPLICANTS_RETRIES, err: errMsg },
-              "Save applicants failed after max retries — full relogin and resuming poll"
-            );
-            nonRecoverableAttempts = 0;
-            if (!(await recoverFromSaveApplicantsFailure(instanceId, "save-applicants-max-retries", err))) {
-              return false;
-            }
-            continue applicants10673Recovery;
-          }
-
-          logger.warn(
-            { instanceId, attempt: nonRecoverableAttempts, maxRetries: MAX_SAVE_APPLICANTS_RETRIES, err: errMsg },
-            "Save applicants failed — waiting poll interval before retry"
-          );
-        }
-      }
-
-      // Delay before next attempt (shared by both 10673 phase-1 retries and non-10673 retries).
-      if (saw10673ThisPhase && phase1Idx >= phase1Attempts - 1) {
-        // 10673 exhausted phase-1 — skip delay, fall through to relogin below.
-        continue;
-      }
-      await Promise.race([
-        new Promise<void>((r) => setTimeout(r, pollIntervalMs)),
-        waitForPollingAbort(chainAbortSeq),
-      ]);
-      if (pollingAbortSeq !== chainAbortSeq) {
-        await throwIfAbortedForPageNotFound(chainAbortSeq, "booking-retry-delay-abort");
-        logger.info({ instanceId }, "[ForceBook] Save-applicants retry delay interrupted — exiting booking chain");
-        return false;
-      }
+    const gate = await waitForApplicantsStaggerGate({
+      instanceId,
+      attemptIndex,
+      abortSeq: chainAbortSeq,
+    });
+    if (gate === "abort" || pollingAbortSeq !== chainAbortSeq) {
+      await throwIfAbortedForPageNotFound(chainAbortSeq, "booking-applicants-gate-abort");
+      logger.info({ instanceId }, "[Applicants] Stagger wait interrupted — exiting booking chain");
+      return false;
+    }
+    if (gate === "urn_unlocked") {
+      logger.info({ instanceId }, "[Applicants] Peer got URN — calling applicants immediately");
     }
 
-    logger.info(
-      { instanceId, phase1Attempts },
-      "Save applicants still 10673 after phase-1 retries — poll-style relogin, slot poll, then retry save applicants"
-    );
-    await performPollStyleRelogin(instanceId, "save-applicants-10673");
-    await runPollLoop(instanceId);
+    try {
+      reporter.setBookingStep("save applicants");
+      await browser.saveApplicantsViaLiftApi();
+
+      const urnAfterSave = getApplicationUrn();
+      if (!urnAfterSave?.trim()) {
+        throw new Error("Save applicants did not set URN");
+      }
+
+      markApplicantsUrnUnlocked(
+        typeof instanceId === "number" && instanceId >= 1 ? Math.floor(instanceId) : 1
+      );
+      break applicants10673Recovery;
+    } catch (err) {
+      attemptIndex += 1;
+
+      if (err instanceof VfsRateLimitedError) {
+        if (err.isAccountBlock) {
+          await stopForAccountRateLimit(instanceId, "save-applicants", err.code);
+          return false;
+        }
+        return recoverBookingChainFromIpRateLimit(instanceId, "429-ip-save-applicants", err, slotStateCache);
+      }
+      if (err instanceof VfsGatewayTimeoutError) {
+        return recoverBookingChainFromGatewayTimeout(instanceId, "504-gateway-timeout-save-applicants", err, slotStateCache);
+      }
+      if (isSaveApplicants10673(err)) {
+        consecutive10673 += 1;
+        logger.warn(
+          {
+            instanceId,
+            consecutive10673,
+            phase1Attempts,
+            attemptIndex,
+            err: err instanceof Error ? err.message : String(err),
+          },
+          "Save applicants returned 10673 — staggered retry or relogin"
+        );
+        if (consecutive10673 >= phase1Attempts) {
+          consecutive10673 = 0;
+          logger.info(
+            { instanceId, phase1Attempts },
+            "Save applicants still 10673 after phase-1 retries — poll-style relogin, slot poll, then retry save applicants"
+          );
+          await performPollStyleRelogin(instanceId, "save-applicants-10673");
+          await runPollLoop(instanceId);
+          // New wave after re-hit so fleet re-syncs applicants stagger.
+          const again = isSlotFoundByAnyInstance();
+          resetApplicantsWave(again.timestamp ?? Date.now());
+          attemptIndex = 0;
+          continue applicants10673Recovery;
+        }
+      } else {
+        consecutive10673 = 0;
+        nonRecoverableAttempts += 1;
+        const errMsg = err instanceof Error ? err.message : String(err);
+
+        if (nonRecoverableAttempts >= MAX_SAVE_APPLICANTS_RETRIES) {
+          logger.warn(
+            { instanceId, attempt: nonRecoverableAttempts, maxRetries: MAX_SAVE_APPLICANTS_RETRIES, err: errMsg },
+            "Save applicants failed after max retries — full relogin and resuming poll"
+          );
+          nonRecoverableAttempts = 0;
+          if (!(await recoverFromSaveApplicantsFailure(instanceId, "save-applicants-max-retries", err))) {
+            return false;
+          }
+          const again = isSlotFoundByAnyInstance();
+          resetApplicantsWave(again.timestamp ?? Date.now());
+          attemptIndex = 0;
+          continue applicants10673Recovery;
+        }
+        logger.warn(
+          { instanceId, attempt: nonRecoverableAttempts, maxRetries: MAX_SAVE_APPLICANTS_RETRIES, attemptIndex, err: errMsg },
+          "Save applicants failed — waiting for next applicants round-robin turn"
+        );
+      }
+    }
   }
 
   const fastSkipCalendar = (instanceId ?? 1) <= FAST_SKIP_CALENDAR_UP_TO_INSTANCE;

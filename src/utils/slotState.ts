@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, writeFileSync, unlinkSync, watch } from "node:fs";
 import { join } from "node:path";
 import { logger } from "./logger";
+import { clearApplicantsCoord, resetApplicantsWave } from "./applicantsCoord";
 
 export interface SlotFoundState {
   found: boolean;
@@ -53,6 +54,7 @@ export function markSlotFound(
   } catch (err) {
     logger.error({ err, instanceId }, "Failed to write slot state");
   }
+  resetApplicantsWave(state.timestamp ?? Date.now());
 }
 
 export function clearSlotState(): void {
@@ -64,6 +66,7 @@ export function clearSlotState(): void {
   } catch (err) {
     logger.warn({ err }, "Failed to clear slot state");
   }
+  clearApplicantsCoord();
 }
 
 /**
