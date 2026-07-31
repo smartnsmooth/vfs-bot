@@ -1,5 +1,4 @@
 import type { Frame, Page } from "playwright";
-import { logger } from "../utils/logger";
 import { reporter } from "../monitoring/statusReporter";
 
 /**
@@ -24,8 +23,7 @@ export async function waitForManualTurnstile(
   const totalMs = opts?.waitMs ?? Math.max(10_000, parseInt(process.env.CAPTCHA_MANUAL_WAIT_MS ?? "120000", 10) || 120_000);
   const deadline = Date.now() + totalMs;
 
-  logger.warn({ waitMs: totalMs }, "[Turnstile] Auto-solve failed — alerting operator and waiting for manual solve");
-  reporter.setAttention("captcha", "captcha failed — solve it in the focused Chrome window");
+    reporter.setAttention("captcha", "captcha failed — solve it in the focused Chrome window");
   reporter.requestFocus("captcha");
   reporter.captchaWaiting(deadline);
 
@@ -42,8 +40,7 @@ export async function waitForManualTurnstile(
       .catch(() => "");
 
     if (token && token.length > 20) {
-      logger.info({ tokenLength: token.length }, "[Turnstile] Manual solve detected — resuming");
-      reporter.captchaResult("passed");
+            reporter.captchaResult("passed");
       reporter.setAttention(null);
       return token;
     }
@@ -53,13 +50,11 @@ export async function waitForManualTurnstile(
       lastLog = now;
       const remaining = Math.round((deadline - now) / 1000);
       reporter.setDetail(`waiting for manual captcha (${remaining}s left)`);
-      logger.info({ remainingSec: remaining }, "[Turnstile] Waiting for manual captcha solve...");
-    }
+          }
     await page.waitForTimeout(1000);
   }
 
-  logger.warn("[Turnstile] Manual captcha window elapsed with no token — proceeding");
-  reporter.setDetail("manual captcha window elapsed");
+    reporter.setDetail("manual captcha window elapsed");
   return "";
 }
 
@@ -130,11 +125,9 @@ export async function clickTurnstile(
 
   const frame = await findTurnstileFrame(page, opts?.frameTimeoutMs ?? 20_000, opts?.check);
   if (!frame) {
-    logger.warn("[Turnstile] Challenge iframe not found via page.frames()");
-    return "";
+        return "";
   }
-  logger.info("[Turnstile] Found Turnstile iframe");
-
+  
   // Measure the widget's on-screen rect from an element inside the frame;
   // boundingBox() returns coordinates in the top-level viewport.
   let box = await frame
@@ -149,8 +142,7 @@ export async function clickTurnstile(
       .catch(() => null);
   }
   if (!box) {
-    logger.warn("[Turnstile] Could not measure the Turnstile widget position");
-    return "";
+        return "";
   }
 
   // The checkbox sits ~30px from the left, vertically centered. Move then click
@@ -160,8 +152,7 @@ export async function clickTurnstile(
   await page.mouse.move(x, y, { steps: 10 });
   await page.waitForTimeout(120);
   await page.mouse.click(x, y);
-  logger.info({ x: Math.round(x), y: Math.round(y) }, "[Turnstile] Clicked checkbox");
-
+  
   // Success = the light-DOM response token input gets populated.
   const solved = await page
     .waitForFunction(
@@ -178,11 +169,9 @@ export async function clickTurnstile(
     .catch(() => false);
 
   if (!solved) {
-    logger.warn("[Turnstile] Clicked checkbox but no token appeared — Cloudflare may have escalated to an interactive challenge");
-    return "";
+        return "";
   }
 
   const token = await readTurnstileToken(page);
-  logger.info({ ms: Date.now() - start, tokenLength: token.length }, "[Turnstile] Solved via checkbox click");
-  return token;
+    return token;
 }

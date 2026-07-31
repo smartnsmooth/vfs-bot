@@ -1,6 +1,5 @@
 import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { logger } from "./logger";
 import { getApplicantDetailsOverrides } from "./applicantDetails.store";
 import { getSessionLoginCredentials } from "./sessionLogin.store";
 import { buildScheduleRedirectUrl, type ScheduleResponseWithRedirect } from "./scheduleRedirectUrl";
@@ -75,10 +74,8 @@ export function saveBookingConfirmationFile(
     };
 
     writeFileSync(filePath, JSON.stringify(record, null, 2), "utf8");
-    logger.info({ filePath }, "Saved booking confirmation file");
-    return filePath;
+        return filePath;
   } catch (err) {
-    logger.error({ err }, "Failed to save booking confirmation file");
-    return null;
+        return null;
   }
 }

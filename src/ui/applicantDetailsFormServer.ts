@@ -2,7 +2,6 @@ import { exec } from "node:child_process";
 import { createServer, IncomingMessage, Server, ServerResponse } from "node:http";
 import { config } from "../config/config";
 import { getApplicantFormDefaults } from "../config/saveApplicants";
-import { logger } from "../utils/logger";
 import {
   getApplicantDetailsOverrides,
   setApplicantDetailsOverrides,
@@ -142,8 +141,7 @@ function openUrlInBrowser(url: string): void {
         ? `open "${url}"`
         : `xdg-open "${url}"`;
   exec(cmd, (err) => {
-    if (err) logger.warn({ err }, "Could not open browser for applicant form; open URL manually");
-  });
+      });
 }
 
 function readBody(req: IncomingMessage): Promise<string> {
@@ -221,11 +219,22 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
     const v = parseInt(j.userPollInterval, 10);
     if (Number.isFinite(v) && v >= 1) out.userPollInterval = v;
   }
-  if (typeof j.applicantsIntervalSec === "number" && Number.isFinite(j.applicantsIntervalSec) && j.applicantsIntervalSec >= 1) {
-    out.applicantsIntervalSec = Math.floor(j.applicantsIntervalSec);
+  if (typeof j.apologiesIntervalSec === "number" && Number.isFinite(j.apologiesIntervalSec) && j.apologiesIntervalSec >= 1) {
+    out.apologiesIntervalSec = Math.floor(j.apologiesIntervalSec);
+  } else if (typeof j.apologiesIntervalSec === "string" && j.apologiesIntervalSec.trim() !== "") {
+    const v = parseInt(j.apologiesIntervalSec, 10);
+    if (Number.isFinite(v) && v >= 1) out.apologiesIntervalSec = v;
+  } else if (typeof j.applicantsIntervalSec === "number" && Number.isFinite(j.applicantsIntervalSec) && j.applicantsIntervalSec >= 1) {
+    out.apologiesIntervalSec = Math.floor(j.applicantsIntervalSec);
   } else if (typeof j.applicantsIntervalSec === "string" && j.applicantsIntervalSec.trim() !== "") {
     const v = parseInt(j.applicantsIntervalSec, 10);
-    if (Number.isFinite(v) && v >= 1) out.applicantsIntervalSec = v;
+    if (Number.isFinite(v) && v >= 1) out.apologiesIntervalSec = v;
+  }
+  if (typeof j.applicantsJoinStaggerSec === "number" && Number.isFinite(j.applicantsJoinStaggerSec) && j.applicantsJoinStaggerSec >= 0.1) {
+    out.applicantsJoinStaggerSec = j.applicantsJoinStaggerSec;
+  } else if (typeof j.applicantsJoinStaggerSec === "string" && j.applicantsJoinStaggerSec.trim() !== "") {
+    const v = parseFloat(j.applicantsJoinStaggerSec);
+    if (Number.isFinite(v) && v >= 0.1) out.applicantsJoinStaggerSec = v;
   }
   if (typeof j.postLoginPollDelay === "number" && Number.isFinite(j.postLoginPollDelay) && j.postLoginPollDelay >= 0) {
     out.postLoginPollDelay = Math.floor(j.postLoginPollDelay);
@@ -238,6 +247,20 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
   } else if (typeof j.staggerIntervalSec === "string" && j.staggerIntervalSec.trim() !== "") {
     const v = parseInt(j.staggerIntervalSec, 10);
     if (Number.isFinite(v) && v >= 0) out.staggerIntervalSec = v;
+  }
+  if ("calendarPollingStartDate" in j) {
+    const v = j.calendarPollingStartDate;
+    if (typeof v === "string" && v.trim() !== "") out.calendarPollingStartDate = v.trim();
+  }
+  if (typeof j.calendarPollingInterval === "number" && Number.isFinite(j.calendarPollingInterval) && j.calendarPollingInterval >= 1) {
+    out.calendarPollingInterval = Math.floor(j.calendarPollingInterval);
+  } else if (typeof j.calendarPollingInterval === "string" && j.calendarPollingInterval.trim() !== "") {
+    const v = parseInt(j.calendarPollingInterval, 10);
+    if (Number.isFinite(v) && v >= 1) out.calendarPollingInterval = v;
+  }
+  if (typeof j.bookingSystemMode === "string") {
+    const m = j.bookingSystemMode.trim().toLowerCase();
+    if (m === "fleet" || m === "legacy") out.bookingSystemMode = m;
   }
   if (typeof out.helloVerifyNumber === "string") {
     const digits = out.helloVerifyNumber.replace(/\D/g, "").slice(0, 6);
@@ -257,58 +280,102 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
     <input type="date" id="scheduleDateRangeEnd" name="scheduleDateRangeEnd" />
   </div>`;
 
-  const defaultPollIntervalSec = 60;
+  const defaultPollIntervalSec = 5;
 
   const instanceSelectBlock = `
   <fieldset style="border:1px solid #38444d;border-radius:8px;padding:1rem 1rem 0.25rem;margin:0 0 1.25rem">
     <legend style="color:#8b98a5;font-size:0.9rem">Bot configuration</legend>
-    <label for="countryCode" style="margin-top:0.5rem">From country</label>
-    <select id="countryCode" name="countryCode">
-      <option value="ind">India</option>
-      <option value="egy">Egypt</option>
-      <option value="sau">Saudi Arabia</option>
-      <option value="uzb">Uzbekistan</option>
-    </select>
-    <label for="missionCode" style="margin-top:0.75rem">To country</label>
-    <select id="missionCode" name="missionCode">
-      <option value="bgr">Bulgaria</option>
-      <option value="lva">Latvia</option>
-      <option value="prt">Portugal</option>
-    </select>
-    <label for="userPollInterval" style="margin-top:0.75rem">Poll interval (seconds)</label>
-    <input type="number" id="userPollInterval" name="userPollInterval" min="1" value="${defaultPollIntervalSec}" />
-    <p class="hint" style="margin-top:0.25rem">Gap between bots for CheckIsSlotAvailable (fleet round-robin).</p>
-    <label for="applicantsIntervalSec" style="margin-top:0.75rem">Applicants API interval (seconds)</label>
-    <input type="number" id="applicantsIntervalSec" name="applicantsIntervalSec" min="1" value="2" />
-    <p class="hint" style="margin-top:0.25rem">After a slot hit: bots call save-applicants one-by-one at this gap (separate from poll interval). When any bot gets a URN, all others call applicants immediately.</p>
-    <label for="postLoginPollDelay" style="margin-top:0.75rem">Post-login poll delay (seconds)</label>
-    <input type="number" id="postLoginPollDelay" name="postLoginPollDelay" min="0" value="30" />
-    <label for="numInstances">Number of instances</label>
-    <input type="number" id="numInstances" name="numInstances" min="1" max="100" value="1" />
-    <label for="staggerIntervalSec" style="margin-top:0.75rem">Start interval between bots (seconds)</label>
-    <input type="number" id="staggerIntervalSec" name="staggerIntervalSec" min="0" max="120" value="6" />
-    <div id="instanceSelectWrapper" style="display:block">
-      <label for="instanceId" style="margin-top:0.75rem">Select instance to configure (each uses a different Chrome profile / IP)</label>
-      <select id="instanceId" name="instanceId">
-        <option value="1">Instance 1</option>
+    <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;margin-top:0.5rem">
+      <label for="countryCode" style="margin:0">From</label>
+      <select id="countryCode" name="countryCode" style="flex:1;min-width:8rem">
+        <option value="ind">India</option>
+        <option value="egy">Egypt</option>
+        <option value="sau">Saudi Arabia</option>
+        <option value="uzb">Uzbekistan</option>
+      </select>
+      <label for="missionCode" style="margin:0">To</label>
+      <select id="missionCode" name="missionCode" style="flex:1;min-width:8rem">
+        <option value="bgr">Bulgaria</option>
+        <option value="lva">Latvia</option>
+        <option value="prt">Portugal</option>
       </select>
     </div>
+    <label for="userPollInterval" style="margin-top:0.75rem">Poll interval (seconds)</label>
+    <input type="number" id="userPollInterval" name="userPollInterval" min="1" value="${defaultPollIntervalSec}" />
+    
+    <div class="row2">
+      <div>
+        <label for="apologiesIntervalSec" style="margin-top:0.75rem">Apologies interval (seconds)</label>
+        <input type="number" id="apologiesIntervalSec" name="apologiesIntervalSec" min="1" value="2" />
+      </div>
+      <div>
+        <label for="applicantsJoinStaggerSec" style="margin-top:0.75rem">Applicants join stagger (seconds)</label>
+        <input type="number" id="applicantsJoinStaggerSec" name="applicantsJoinStaggerSec" min="0.1" step="0.1" value="0.5" />
+      </div>
+    </div>
+    <div class="row2">
+      <div>
+        <label for="calendarPollingStartDate" style="margin-top:0.75rem">Calendar polling start date</label>
+        <input type="date" id="calendarPollingStartDate" name="calendarPollingStartDate" />
+      </div>
+      <div>
+      <label for="calendarPollingInterval" style="margin-top:0.75rem">Calendar polling interval (seconds)</label>
+      <input type="number" id="calendarPollingInterval" name="calendarPollingInterval" min="1" value="60" />
+      </div>
+    </div>
+    <label for="bookingSystemMode" style="margin-top:0.75rem">Booking system</label>
+    <select id="bookingSystemMode" name="bookingSystemMode">
+      <option value="legacy" selected>Legacy (per-bot calendar chain)</option>
+      <option value="fleet">Fleet calendar polling (new)</option>
+    </select>
+    <div class="row2">
+      <div>
+        <label for="postLoginPollDelay" style="margin-top:0.75rem">Post-login poll delay (seconds)</label>
+        <input type="number" id="postLoginPollDelay" name="postLoginPollDelay" min="0" value="30" />
+      </div>
+      <div>
+        <label for="numInstances">Number of instances</label>
+        <input type="number" id="numInstances" name="numInstances" min="1" max="100" value="1" />
+      </div>
+    </div>
+    <div class="row2">
+      <div>
+        <label for="staggerIntervalSec" style="margin-top:0.75rem">Start interval between bots</label>
+        <input type="number" id="staggerIntervalSec" name="staggerIntervalSec" min="0" max="120" value="6" />
+      </div>
+      <div id="instanceSelectWrapper" style="display:block">
+        <label for="instanceId" style="margin-top:0.75rem">Select instance to configure</label>
+        <select id="instanceId" name="instanceId">
+          <option value="1">Instance 1</option>
+        </select>
+      </div>
+    </div> 
   </fieldset>`;
 
   const loginBlock = collectLogin
     ? `
   <fieldset style="border:1px solid #38444d;border-radius:8px;padding:1rem 1rem 0.25rem;margin:0 0 1.25rem">
     <legend style="color:#8b98a5;font-size:0.9rem">VFS login</legend>
-    <p class="hint" style="margin-top:0">Used to sign in on the VFS portal in Chrome.</p>
-    <label for="vfsUsername">Email / username</label>
-    <input id="vfsUsername" name="vfsUsername" type="email" autocomplete="username" />
-    <label for="vfsPassword">Password</label>
-    <input id="vfsPassword" name="vfsPassword" type="text" autocomplete="current-password" />
-    <p class="hint" style="margin-top:0.75rem">Second VFS account (optional). If both are set, the bot alternates: after each poll relogin it logs out, closes Chrome, opens a new browser (each Chrome launch uses the next <code>PROXY_URLS</code> entry for this profile), then logs in with the other account (unless <code>VFS_CREDENTIAL_SWAP_BROWSER_RESTART=false</code>).</p>
-    <label for="vfsUsername2">Email / username (account 2)</label>
-    <input id="vfsUsername2" name="vfsUsername2" type="email" autocomplete="off" />
-    <label for="vfsPassword2">Password (account 2)</label>
-    <input id="vfsPassword2" name="vfsPassword2" type="text" autocomplete="off" />
+    <div class="row2">
+      <div>
+        <label for="vfsUsername">Email / username</label>
+        <input id="vfsUsername" name="vfsUsername" type="email" autocomplete="username" />
+      </div>
+      <div>
+        <label for="vfsPassword">Password</label>
+        <input id="vfsPassword" name="vfsPassword" type="text" autocomplete="current-password" />
+      </div>
+    </div>
+    <div class="row2">
+      <div>
+        <label for="vfsUsername2">Email / username (account 2)</label>
+        <input id="vfsUsername2" name="vfsUsername2" type="email" autocomplete="off" />
+      </div>
+      <div>
+        <label for="vfsPassword2">Password (account 2)</label>
+        <input id="vfsPassword2" name="vfsPassword2" type="text" autocomplete="off" />
+      </div>
+    </div>
   </fieldset>`
     : "";
 
@@ -326,7 +393,7 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
     :root { font-family: system-ui, sans-serif; background: #0f1419; color: #e7e9ea; }
     body { max-width: none; margin: 0; padding: 0.5rem 0.9rem 1rem; }
     /* Keep the configuration form readable; let the monitor grid use full width. */
-    #tab-configure { max-width: 1040px; margin: 0 auto; }
+    #tab-configure { max-width: 95%; margin: 0 auto; }
     #tab-monitor { max-width: none; }
     h1 { font-size: 1.25rem; margin-bottom: 0.5rem; }
     p.hint { color: #8b98a5; font-size: 0.9rem; margin-top: 0; }
@@ -392,7 +459,7 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
     .section-title { margin: 0 0 0.5rem; font-size: 0.92rem; font-weight: 600; color: #c4cdd4; }
     .ok { color: #00ba7c; margin-top: 1rem; }
     .err { color: #f4212e; margin-top: 1rem; }
-    .tabbar { display: flex; gap: 0.35rem; border-bottom: 1px solid #38444d; margin-bottom: 1.25rem; }
+    .tabbar { display: flex; gap: 0.35rem; border-bottom: 1px solid #38444d; margin-bottom: 0.5rem; }
     .tabbtn { width: auto; margin: 0; background: transparent; color: #8b98a5; border: none; border-bottom: 2px solid transparent; border-radius: 0; padding: 0.6rem 1rem; font-size: 0.95rem; font-weight: 600; }
     .tabbtn:hover { filter: none; color: #e7e9ea; }
     .tabbtn.active { color: #1d9bf0; border-bottom-color: #1d9bf0; }
@@ -822,12 +889,6 @@ async function bindApplicantFormServerToFreePort(server: Server, host: string, p
     if (tryPort > 65535) break;
     try {
       await listenOnce(server, tryPort, host);
-      if (i > 0) {
-        logger.warn(
-          { requestedPort: preferredPort, boundPort: tryPort },
-          "Setup form port was in use; using next free port"
-        );
-      }
       boundPort = tryPort;
       return tryPort;
     } catch (e) {
@@ -945,6 +1006,26 @@ export function runApplicantFormWithSubmitHandler(
                 json(res, 200, monitor.setStaggerInterval(Number.isFinite(ms) ? ms : 6000));
                 return;
               }
+              if (action === "apologies-interval") {
+                const sec = toNum(mj.intervalSec);
+                json(res, 200, monitor.setApologiesIntervalSec(Number.isFinite(sec) ? sec : 2));
+                return;
+              }
+              if (action === "poll-interval") {
+                const sec = toNum(mj.intervalSec);
+                json(res, 200, monitor.setPollIntervalSec(Number.isFinite(sec) ? sec : 60));
+                return;
+              }
+              if (action === "applicants-join-stagger") {
+                const sec = typeof mj.intervalSec === "number" ? mj.intervalSec : parseFloat(String(mj.intervalSec ?? ""));
+                json(res, 200, monitor.setApplicantsJoinStaggerSec(Number.isFinite(sec) ? sec : 0.5));
+                return;
+              }
+              if (action === "calendar-polling-interval") {
+                const sec = toNum(mj.intervalSec);
+                json(res, 200, monitor.setCalendarPollingIntervalSec(Number.isFinite(sec) ? sec : 60));
+                return;
+              }
               if (action === "start") {
                 const count = toNum(mj.count);
                 const ms = toNum(mj.intervalMs);
@@ -977,11 +1058,25 @@ export function runApplicantFormWithSubmitHandler(
             if (globalDet && typeof globalDet.userPollInterval === "number") {
               defaults.userPollInterval = globalDet.userPollInterval;
             }
-            if (globalDet && typeof globalDet.applicantsIntervalSec === "number") {
-              defaults.applicantsIntervalSec = globalDet.applicantsIntervalSec;
+            if (globalDet && typeof globalDet.apologiesIntervalSec === "number") {
+              defaults.apologiesIntervalSec = globalDet.apologiesIntervalSec;
+            } else if (globalDet && typeof globalDet.applicantsIntervalSec === "number") {
+              defaults.apologiesIntervalSec = globalDet.applicantsIntervalSec;
+            }
+            if (globalDet && typeof globalDet.applicantsJoinStaggerSec === "number") {
+              defaults.applicantsJoinStaggerSec = globalDet.applicantsJoinStaggerSec;
             }
             if (globalDet && typeof globalDet.postLoginPollDelay === "number") {
               defaults.postLoginPollDelay = globalDet.postLoginPollDelay;
+            }
+            if (globalDet && typeof globalDet.calendarPollingStartDate === "string") {
+              defaults.calendarPollingStartDate = globalDet.calendarPollingStartDate;
+            }
+            if (globalDet && typeof globalDet.calendarPollingInterval === "number") {
+              defaults.calendarPollingInterval = globalDet.calendarPollingInterval;
+            }
+            if (globalDet && typeof globalDet.bookingSystemMode === "string") {
+              defaults.bookingSystemMode = globalDet.bookingSystemMode;
             }
             const payload: Record<string, unknown> = { ok: true, defaults };
             if (collectLogin) {
@@ -1055,15 +1150,34 @@ export function runApplicantFormWithSubmitHandler(
             ...rest
           } = j;
           const fields = parseApplicantFields(rest);
-          const { userPollInterval: upi, applicantsIntervalSec: ais, postLoginPollDelay: plpd, staggerIntervalSec: sis, ...instanceFields } = fields;
+          const {
+            userPollInterval: upi,
+            apologiesIntervalSec: ais,
+            applicantsJoinStaggerSec: ajs,
+            postLoginPollDelay: plpd,
+            staggerIntervalSec: sis,
+            calendarPollingStartDate: cpsd,
+            calendarPollingInterval: cpi,
+            bookingSystemMode: bsm,
+            ...instanceFields
+          } = fields;
 
           {
             const global0 = getApplicantDetailsOverrides(0) ?? {};
             let changed = false;
             if (typeof upi === "number") { global0.userPollInterval = upi; changed = true; }
-            if (typeof ais === "number") { global0.applicantsIntervalSec = ais; changed = true; }
+            if (typeof ais === "number") {
+              global0.apologiesIntervalSec = ais;
+              delete global0.applicantsIntervalSec;
+              changed = true;
+            }
+            if (typeof ajs === "number") { global0.applicantsJoinStaggerSec = ajs; changed = true; }
             if (typeof plpd === "number") { global0.postLoginPollDelay = plpd; changed = true; }
             if (typeof sis === "number") { global0.staggerIntervalSec = sis; changed = true; }
+            if (typeof cpsd === "string") { global0.calendarPollingStartDate = cpsd; changed = true; }
+            else if ("calendarPollingStartDate" in rest) { delete global0.calendarPollingStartDate; changed = true; }
+            if (typeof cpi === "number") { global0.calendarPollingInterval = cpi; changed = true; }
+            if (typeof bsm === "string") { global0.bookingSystemMode = bsm; changed = true; }
             if (typeof instanceFields.countryCode === "string") { global0.countryCode = instanceFields.countryCode; changed = true; }
             if (typeof instanceFields.missionCode === "string") { global0.missionCode = instanceFields.missionCode; changed = true; }
             if (changed) setApplicantDetailsOverrides(global0, 0);
@@ -1098,19 +1212,55 @@ export function runApplicantFormWithSubmitHandler(
                   return Number.isFinite(v) && v >= 0 ? v : undefined;
                 })();
 
-          const submittedApplicantsIntervalSec =
-            typeof j.applicantsIntervalSec === "number" && j.applicantsIntervalSec >= 1
-              ? Math.floor(j.applicantsIntervalSec)
+          const submittedApologiesIntervalSec =
+            typeof j.apologiesIntervalSec === "number" && j.apologiesIntervalSec >= 1
+              ? Math.floor(j.apologiesIntervalSec)
+              : typeof j.applicantsIntervalSec === "number" && j.applicantsIntervalSec >= 1
+                ? Math.floor(j.applicantsIntervalSec)
+                : (() => {
+                    const v = parseInt(String(j.apologiesIntervalSec ?? j.applicantsIntervalSec ?? ""), 10);
+                    return Number.isFinite(v) && v >= 1 ? v : undefined;
+                  })();
+
+          const submittedApplicantsJoinStaggerSec =
+            typeof j.applicantsJoinStaggerSec === "number" && j.applicantsJoinStaggerSec >= 0.1
+              ? j.applicantsJoinStaggerSec
               : (() => {
-                  const v = parseInt(String(j.applicantsIntervalSec ?? ""), 10);
+                  const v = parseFloat(String(j.applicantsJoinStaggerSec ?? ""));
+                  return Number.isFinite(v) && v >= 0.1 ? v : undefined;
+                })();
+
+          const submittedCalendarPollingInterval =
+            typeof j.calendarPollingInterval === "number" && j.calendarPollingInterval >= 1
+              ? Math.floor(j.calendarPollingInterval)
+              : (() => {
+                  const v = parseInt(String(j.calendarPollingInterval ?? ""), 10);
                   return Number.isFinite(v) && v >= 1 ? v : undefined;
                 })();
 
-          if (submittedApplicantsIntervalSec != null || submittedStaggerSec != null || typeof j.userPollInterval === "number") {
+          const submittedCalendarPollingStartDate =
+            typeof j.calendarPollingStartDate === "string" && j.calendarPollingStartDate.trim() !== ""
+              ? j.calendarPollingStartDate.trim()
+              : undefined;
+
+          if (
+            submittedApologiesIntervalSec != null ||
+            submittedApplicantsJoinStaggerSec != null ||
+            submittedStaggerSec != null ||
+            typeof j.userPollInterval === "number" ||
+            submittedCalendarPollingInterval != null ||
+            "calendarPollingStartDate" in j ||
+            typeof j.bookingSystemMode === "string"
+          ) {
             const global0 = getApplicantDetailsOverrides(0) ?? {};
             let changed = false;
-            if (submittedApplicantsIntervalSec != null) {
-              global0.applicantsIntervalSec = submittedApplicantsIntervalSec;
+            if (submittedApologiesIntervalSec != null) {
+              global0.apologiesIntervalSec = submittedApologiesIntervalSec;
+              delete global0.applicantsIntervalSec;
+              changed = true;
+            }
+            if (submittedApplicantsJoinStaggerSec != null) {
+              global0.applicantsJoinStaggerSec = submittedApplicantsJoinStaggerSec;
               changed = true;
             }
             if (submittedStaggerSec != null) {
@@ -1120,6 +1270,25 @@ export function runApplicantFormWithSubmitHandler(
             if (typeof j.userPollInterval === "number" && j.userPollInterval >= 1) {
               global0.userPollInterval = Math.floor(j.userPollInterval);
               changed = true;
+            }
+            if (submittedCalendarPollingInterval != null) {
+              global0.calendarPollingInterval = submittedCalendarPollingInterval;
+              changed = true;
+            }
+            if ("calendarPollingStartDate" in j) {
+              if (submittedCalendarPollingStartDate != null) {
+                global0.calendarPollingStartDate = submittedCalendarPollingStartDate;
+              } else {
+                delete global0.calendarPollingStartDate;
+              }
+              changed = true;
+            }
+            if (typeof j.bookingSystemMode === "string") {
+              const m = j.bookingSystemMode.trim().toLowerCase();
+              if (m === "fleet" || m === "legacy") {
+                global0.bookingSystemMode = m;
+                changed = true;
+              }
             }
             if (changed) setApplicantDetailsOverrides(global0, 0);
           }
@@ -1159,7 +1328,7 @@ export function runApplicantFormWithSubmitHandler(
               ...details.get(instanceId),
             }))
               .then(() => undefined)
-              .catch((err) => logger.error({ err, instanceId }, "Form onSubmit handler failed"));
+              .catch(() => undefined);
             queued++;
           }
 
@@ -1198,8 +1367,7 @@ export function runApplicantFormWithSubmitHandler(
         res.writeHead(404);
         res.end();
       } catch (e) {
-        logger.error({ e }, "Applicant UI server error");
-        try {
+                try {
           json(res, 500, { ok: false, error: e instanceof Error ? e.message : "error" });
         } catch {
           res.destroy();
@@ -1217,8 +1385,7 @@ export function runApplicantFormWithSubmitHandler(
           server.close(() => { });
           safeReject(err);
         });
-        console.log("\n  >>> Bot setup form: " + url + "\n");
-        openUrlInBrowser(url);
+                openUrlInBrowser(url);
       } catch (err) {
         server.close(() => { });
         safeReject(err instanceof Error ? err : new Error(String(err)));

@@ -417,6 +417,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
         const k = keys[ki];
         if (skipDetailIds[k] || skipCenterCatIds[k]) continue;
         if (k === "scheduleDateRangeStart" || k === "scheduleDateRangeEnd") continue;
+        if (k === "calendarPollingStartDate" || k === "calendarPollingInterval" || k === "bookingSystemMode") continue;
         const el = document.getElementById(k);
         if (el) el.value = inst.details[k] == null ? "" : String(inst.details[k]);
       }
@@ -445,22 +446,43 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     updateUzbLvaApplicantFields();
     applyInstanceScheduleRangeToForm(inst.details || {});
 
-    // Global settings (instance 0): postLoginPollDelay + staggerIntervalSec + applicantsIntervalSec.
+    // Global settings (instance 0): postLoginPollDelay + staggerIntervalSec + apologiesIntervalSec + calendar polling.
     const globalInst = data.instances["0"];
     const plpdEl = document.getElementById("postLoginPollDelay");
     if (plpdEl) {
       const src = (globalInst && globalInst.details) || (inst && inst.details) || {};
       plpdEl.value = src.postLoginPollDelay != null ? String(src.postLoginPollDelay) : "30";
     }
-    const aisEl = document.getElementById("applicantsIntervalSec");
+    const aisEl = document.getElementById("apologiesIntervalSec");
     if (aisEl) {
       const gsrc = (globalInst && globalInst.details) || {};
-      aisEl.value = gsrc.applicantsIntervalSec != null ? String(gsrc.applicantsIntervalSec) : "2";
+      const sec = gsrc.apologiesIntervalSec != null ? gsrc.apologiesIntervalSec : gsrc.applicantsIntervalSec;
+      aisEl.value = sec != null ? String(sec) : "2";
+    }
+    const ajsEl = document.getElementById("applicantsJoinStaggerSec");
+    if (ajsEl) {
+      const gsrc = (globalInst && globalInst.details) || {};
+      ajsEl.value = gsrc.applicantsJoinStaggerSec != null ? String(gsrc.applicantsJoinStaggerSec) : "0.5";
     }
     const sisEl = document.getElementById("staggerIntervalSec");
     if (sisEl) {
       const gsrc = (globalInst && globalInst.details) || {};
       sisEl.value = gsrc.staggerIntervalSec != null ? String(gsrc.staggerIntervalSec) : "6";
+    }
+    const cpsdEl = document.getElementById("calendarPollingStartDate");
+    if (cpsdEl) {
+      const gsrc = (globalInst && globalInst.details) || {};
+      cpsdEl.value = gsrc.calendarPollingStartDate != null ? String(gsrc.calendarPollingStartDate).trim().slice(0, 10) : "";
+    }
+    const cpiEl = document.getElementById("calendarPollingInterval");
+    if (cpiEl) {
+      const gsrc = (globalInst && globalInst.details) || {};
+      cpiEl.value = gsrc.calendarPollingInterval != null ? String(gsrc.calendarPollingInterval) : "60";
+    }
+    const bsmEl = document.getElementById("bookingSystemMode");
+    if (bsmEl) {
+      const gsrc = (globalInst && globalInst.details) || {};
+      bsmEl.value = gsrc.bookingSystemMode === "fleet" ? "fleet" : "legacy";
     }
 
     if (showAlert) {
@@ -503,7 +525,11 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       scheduleDateRangeEnd: String(fd.get("scheduleDateRangeEnd") ?? "").trim(),
       numInstances: getNumInstances(),
       userPollInterval: parseInt(String(fd.get("userPollInterval") || "60"), 10) || 60,
-      applicantsIntervalSec: parseInt(String(fd.get("applicantsIntervalSec") || "2"), 10) || 2,
+      apologiesIntervalSec: parseInt(String(fd.get("apologiesIntervalSec") || "2"), 10) || 2,
+      applicantsJoinStaggerSec: parseFloat(String(fd.get("applicantsJoinStaggerSec") || "0.5")) || 0.5,
+      calendarPollingStartDate: String(fd.get("calendarPollingStartDate") ?? "").trim(),
+      calendarPollingInterval: parseInt(String(fd.get("calendarPollingInterval") || "60"), 10) || 60,
+      bookingSystemMode: String(fd.get("bookingSystemMode") || "legacy").trim() === "fleet" ? "fleet" : "legacy",
       postLoginPollDelay: parseInt(String(fd.get("postLoginPollDelay") || "30"), 10),
       staggerIntervalSec: parseInt(String(fd.get("staggerIntervalSec") || "6"), 10),
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
@@ -511,7 +537,9 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       juridictionCode: String(fd.get("juridictionCode") ?? "").trim() || undefined,
     };
     if (!Number.isFinite(body.postLoginPollDelay) || body.postLoginPollDelay < 0) body.postLoginPollDelay = 30;
-    if (!Number.isFinite(body.applicantsIntervalSec) || body.applicantsIntervalSec < 1) body.applicantsIntervalSec = 2;
+    if (!Number.isFinite(body.apologiesIntervalSec) || body.apologiesIntervalSec < 1) body.apologiesIntervalSec = 2;
+    if (!Number.isFinite(body.applicantsJoinStaggerSec) || body.applicantsJoinStaggerSec < 0.1) body.applicantsJoinStaggerSec = 0.5;
+    if (!Number.isFinite(body.calendarPollingInterval) || body.calendarPollingInterval < 1) body.calendarPollingInterval = 60;
     if (collectLogin) {
       body.vfsUsername = fd.get("vfsUsername");
       body.vfsPassword = fd.get("vfsPassword");
@@ -626,8 +654,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       await loadInstanceData(false);
 
       updateInstanceSelector();
-    } catch (err) {
-      console.error("initApplicantForm failed", err);
+    } catch {
+      // ignore
     }
   }
 
@@ -705,7 +733,11 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       scheduleDateRangeEnd: String(fd.get("scheduleDateRangeEnd") ?? "").trim(),
       numInstances: getNumInstances(),
       userPollInterval: parseInt(String(fd.get("userPollInterval") || "60"), 10) || 60,
-      applicantsIntervalSec: parseInt(String(fd.get("applicantsIntervalSec") || "2"), 10) || 2,
+      apologiesIntervalSec: parseInt(String(fd.get("apologiesIntervalSec") || "2"), 10) || 2,
+      applicantsJoinStaggerSec: parseFloat(String(fd.get("applicantsJoinStaggerSec") || "0.5")) || 0.5,
+      calendarPollingStartDate: String(fd.get("calendarPollingStartDate") ?? "").trim(),
+      calendarPollingInterval: parseInt(String(fd.get("calendarPollingInterval") || "60"), 10) || 60,
+      bookingSystemMode: String(fd.get("bookingSystemMode") || "legacy").trim() === "fleet" ? "fleet" : "legacy",
       postLoginPollDelay: parseInt(String(fd.get("postLoginPollDelay") || "30"), 10),
       staggerIntervalSec: parseInt(String(fd.get("staggerIntervalSec") || "6"), 10),
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
@@ -713,7 +745,9 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       juridictionCode: String(fd.get("juridictionCode") ?? "").trim() || undefined,
     };
     if (!Number.isFinite(body.postLoginPollDelay) || body.postLoginPollDelay < 0) body.postLoginPollDelay = 30;
-    if (!Number.isFinite(body.applicantsIntervalSec) || body.applicantsIntervalSec < 1) body.applicantsIntervalSec = 2;
+    if (!Number.isFinite(body.apologiesIntervalSec) || body.apologiesIntervalSec < 1) body.apologiesIntervalSec = 2;
+    if (!Number.isFinite(body.applicantsJoinStaggerSec) || body.applicantsJoinStaggerSec < 0.1) body.applicantsJoinStaggerSec = 0.5;
+    if (!Number.isFinite(body.calendarPollingInterval) || body.calendarPollingInterval < 1) body.calendarPollingInterval = 60;
     if (collectLogin) {
       body.vfsUsername = fd.get("vfsUsername");
       body.vfsPassword = fd.get("vfsPassword");

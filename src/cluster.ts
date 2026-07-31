@@ -1,7 +1,6 @@
 import dotenv from "dotenv";
 dotenv.config({ override: true });
 import { spawn, ChildProcess } from "node:child_process";
-import { logger } from "./utils/logger";
 import {
   runApplicantFormWithSubmitHandler,
   closeApplicantFormServer,
@@ -18,10 +17,15 @@ import {
 import { clearSlotState } from "./utils/slotState";
 import { clearSlotCenterOverride } from "./utils/slotCenterOverride.store";
 import { clearPollReadyState, initPollReadyState } from "./utils/pollReadyState";
+import { clearFleetPollCoord, ensureFleetPollEarliest } from "./utils/fleetPollCoord";
+import { computeFleetPollAnchorAt, getFleetPollStepMs, getFleetPollIntervalSec, resolveApologiesIntervalSec, resolveApplicantsJoinStaggerSec } from "./utils/fleetPollSchedule";
 import { registry } from "./monitoring/statusRegistry";
 import { startChromeStatusProbe } from "./monitoring/chromeProbe";
 import { focusChromeByPort, getDevtoolsInfo, warmupWindowHelper } from "./utils/chromeWindow";
 import { makeInitialStatus, type MonitorHooks, type InstanceStatus } from "./monitoring/status.types";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
+import { clearChromeSessionDataBeforeLaunch } from "./utils/chromeProfileSessionClean";
 
 /** How many bot instances are currently running. Set by ensureInstances(). */
 let currentNumInstances = 0;
@@ -55,19 +59,12 @@ let rolloutPaused = false;
  * begins evenly spaced only after the whole fleet has had time to log in.
  */
 let rolloutPollStartAt: number | null = null;
-/** Buffer after the staggered login ramp before the fleet starts polling. */
-const POLL_START_BUFFER_MS = 60_000;
 /** Fleet-wide pause for slot polling (Monitor tab Stop/Resume). */
 let fleetPollingPaused = false;
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 
 function getFleetPollIntervalMs(): number {
-  const globalDet = getApplicantDetailsOverrides(0);
-  const sec =
-    globalDet && typeof globalDet.userPollInterval === "number" && globalDet.userPollInterval >= 1
-      ? globalDet.userPollInterval
-      : 60;
-  return Math.max(1000, Math.floor(sec) * 1000);
+  return getFleetPollStepMs();
 }
 
 function broadcastToActiveChildren(msg: Record<string, unknown>): number {
@@ -83,6 +80,29 @@ function broadcastToActiveChildren(msg: Record<string, unknown>): number {
     }
   }
   return n;
+}
+
+function profileDirForInstance(id: number): string {
+  return `${BASE_PROFILE_DIR}-${id}`;
+}
+
+/** Advance sticky/proxy rotation so a Monitor Restart gets a new egress IP. */
+function bumpProxyRotationOnDisk(profileDir: string): void {
+  const file = path.join(profileDir, ".proxy-rotation-offset");
+  let cur = 0;
+  try {
+    if (existsSync(file)) {
+      const n = parseInt(readFileSync(file, "utf8").trim(), 10);
+      if (Number.isFinite(n) && n >= 0) cur = n;
+    }
+  } catch {
+    /* ignore */
+  }
+  try {
+    writeFileSync(file, String(cur + 1), "utf8");
+  } catch {
+    /* ignore */
+  }
 }
 
 function debugPortForInstance(id: number): number {
@@ -103,8 +123,7 @@ function seedRegistry(id: number): void {
 function sendStartNow(id: number): void {
   const inst = instances.find((i) => i.id === id);
   if (!inst || !inst.process || inst.process.killed) {
-    logger.warn({ instanceId: id }, "[Stagger] Instance process not available to start");
-    return;
+        return;
   }
   seedRegistry(id);
   const cur = registry.get(id);
@@ -190,13 +209,11 @@ function buildMonitorHooks(): MonitorHooks {
       if (typeof instanceId === "number" && Number.isFinite(instanceId) && instanceId >= 1) {
         const id = Math.floor(instanceId);
         const ok = sendToChild(id, { type: "pause-polling" });
-        logger.info({ instanceId: id, ok }, "[Monitor] Instance polling PAUSED");
-        return ok ? { ok: true } : { ok: false, error: `Bot #${id} is not running.` };
+                return ok ? { ok: true } : { ok: false, error: `Bot #${id} is not running.` };
       }
       fleetPollingPaused = true;
       const n = broadcastToActiveChildren({ type: "pause-polling" });
-      logger.info({ notified: n, pollIntervalMs }, "[Monitor] Fleet polling PAUSED");
-      return n > 0 ? { ok: true } : { ok: false, error: "No active bot processes to pause." };
+            return n > 0 ? { ok: true } : { ok: false, error: "No active bot processes to pause." };
     },
     resumePolling: (instanceId) => {
       const pollIntervalMs = getFleetPollIntervalMs();
@@ -204,16 +221,11 @@ function buildMonitorHooks(): MonitorHooks {
       if (typeof instanceId === "number" && Number.isFinite(instanceId) && instanceId >= 1) {
         const id = Math.floor(instanceId);
         const ok = sendToChild(id, { type: "resume-polling", resumeAt, pollIntervalMs });
-        logger.info({ instanceId: id, ok, resumeAt, pollIntervalMs }, "[Monitor] Instance polling RESUMED");
-        return ok ? { ok: true } : { ok: false, error: `Bot #${id} is not running.` };
+                return ok ? { ok: true } : { ok: false, error: `Bot #${id} is not running.` };
       }
       fleetPollingPaused = false;
       const n = broadcastToActiveChildren({ type: "resume-polling", resumeAt, pollIntervalMs });
-      logger.info(
-        { notified: n, resumeAt, pollIntervalMs },
-        "[Monitor] Fleet polling RESUMED — bots staggered by poll interval"
-      );
-      return n > 0 ? { ok: true } : { ok: false, error: "No active bot processes to resume." };
+            return n > 0 ? { ok: true } : { ok: false, error: "No active bot processes to resume." };
     },
     stopInstance: (id) => {
       const inst = instances.find((i) => i.id === id);
@@ -229,20 +241,14 @@ function buildMonitorHooks(): MonitorHooks {
         const inst = instances[idx]!;
         if (inst.process && !inst.process.killed) inst.process.kill("SIGTERM");
       }
-      // Close this instance's Chrome so the respawned child gets a clean launch.
+      // Close this instance's Chrome so we can wipe cookies/session and rotate IP.
       try {
         killChromeTreeByCdpPortSync(debugPortForInstance(id));
       } catch {
         /* ignore */
       }
-      const total = Math.max(currentNumInstances, id);
-      const child = spawnBotInstance(id, total);
-      if (idx >= 0) {
-        instances[idx]!.process = child;
-      } else {
-        instances.push({ id, process: child, debugPort: debugPortForInstance(id), profileDir: `${BASE_PROFILE_DIR}-${id}`, queue: Promise.resolve() });
-      }
-      // Full clean status — do not spread previous attention/captcha/error (that kept the card blinking).
+      const profileDir = profileDirForInstance(id);
+      bumpProxyRotationOnDisk(profileDir);
       registry.applyStatus({
         ...makeInitialStatus(id, debugPortForInstance(id)),
         phase: "launching",
@@ -252,17 +258,91 @@ function buildMonitorHooks(): MonitorHooks {
         heartbeatAt: Date.now(),
         updatedAt: Date.now(),
       });
-      setTimeout(() => sendStartNow(id), 1500);
+      const total = Math.max(currentNumInstances, id);
+      void (async () => {
+        try {
+          await clearChromeSessionDataBeforeLaunch(profileDir);
+        } catch {
+          /* ignore */
+        }
+        const child = spawnBotInstance(id, total);
+        if (idx >= 0) {
+          instances[idx]!.process = child;
+          instances[idx]!.profileDir = profileDir;
+        } else {
+          instances.push({
+            id,
+            process: child,
+            debugPort: debugPortForInstance(id),
+            profileDir,
+            queue: Promise.resolve(),
+          });
+        }
+        setTimeout(() => sendStartNow(id), 1500);
+      })();
       return { ok: true };
     },
     setStaggerInterval: (ms) => { if (ms >= 0) staggerIntervalMs = Math.floor(ms); return { ok: true }; },
-    getControl: () => ({
-      intervalMs: staggerIntervalMs,
-      rolloutActive,
-      total: currentNumInstances,
-      pollingPaused: fleetPollingPaused,
-      pollIntervalMs: getFleetPollIntervalMs(),
-    }),
+    setApologiesIntervalSec: (sec) => {
+      if (!Number.isFinite(sec) || sec < 1) {
+        return { ok: false, error: "Apologies interval must be at least 1 second." };
+      }
+      const global0 = getApplicantDetailsOverrides(0) ?? {};
+      global0.apologiesIntervalSec = Math.floor(sec);
+      delete global0.applicantsIntervalSec;
+      setApplicantDetailsOverrides(global0, 0);
+      broadcastToActiveChildren({ type: "global-settings-updated" });
+      return { ok: true };
+    },
+    setPollIntervalSec: (sec) => {
+      if (!Number.isFinite(sec) || sec < 1) {
+        return { ok: false, error: "Poll interval must be at least 1 second." };
+      }
+      const global0 = getApplicantDetailsOverrides(0) ?? {};
+      global0.userPollInterval = Math.floor(sec);
+      setApplicantDetailsOverrides(global0, 0);
+      broadcastToActiveChildren({ type: "global-settings-updated" });
+      return { ok: true };
+    },
+    setApplicantsJoinStaggerSec: (sec) => {
+      if (!Number.isFinite(sec) || sec < 0.1) {
+        return { ok: false, error: "Applicants join stagger must be at least 0.1 seconds." };
+      }
+      const global0 = getApplicantDetailsOverrides(0) ?? {};
+      global0.applicantsJoinStaggerSec = sec;
+      setApplicantDetailsOverrides(global0, 0);
+      broadcastToActiveChildren({ type: "global-settings-updated" });
+      return { ok: true };
+    },
+    setCalendarPollingIntervalSec: (sec) => {
+      if (!Number.isFinite(sec) || sec < 1) {
+        return { ok: false, error: "Calendar polling interval must be at least 1 second." };
+      }
+      const global0 = getApplicantDetailsOverrides(0) ?? {};
+      global0.calendarPollingInterval = Math.floor(sec);
+      setApplicantDetailsOverrides(global0, 0);
+      broadcastToActiveChildren({ type: "global-settings-updated" });
+      return { ok: true };
+    },
+    reloadGlobalSettings: () => {
+      broadcastToActiveChildren({ type: "config-updated" });
+      return { ok: true };
+    },
+    getControl: () => {
+      const global0 = getApplicantDetailsOverrides(0);
+      return {
+        intervalMs: staggerIntervalMs,
+        rolloutActive,
+        total: currentNumInstances,
+        pollingPaused: fleetPollingPaused,
+        pollIntervalMs: getFleetPollIntervalMs(),
+        apologiesIntervalSec: resolveApologiesIntervalSec(global0),
+        pollIntervalSec: getFleetPollIntervalSec(),
+        applicantsJoinStaggerSec: resolveApplicantsJoinStaggerSec(global0),
+        calendarPollingIntervalSec: global0 && typeof global0.calendarPollingInterval === "number" && global0.calendarPollingInterval >= 1
+          ? Math.floor(global0.calendarPollingInterval) : 60,
+      };
+    },
   };
 }
 
@@ -284,8 +364,7 @@ function ensureInstances(targetCount: number): void {
       queue: Promise.resolve(),
     });
     seedRegistry(i);
-    logger.info({ instanceId: i }, "Spawned bot instance");
-  }
+      }
 
   // Kill excess instances if count decreased
   for (let i = count + 1; i <= currentNumInstances; i++) {
@@ -299,8 +378,7 @@ function ensureInstances(targetCount: number): void {
   }
 
   currentNumInstances = count;
-  logger.info({ currentNumInstances }, "Instance count updated");
-}
+  }
 
 async function startFormServer(): Promise<void> {
   await runApplicantFormWithSubmitHandler((formData) => {
@@ -316,16 +394,13 @@ async function startFormServer(): Promise<void> {
       staggerIntervalMs = Math.floor(sis) * 1000;
     }
 
-    // Compute the fleet-wide poll-start time once, on the first submit batch:
+    // Compute the fleet-wide poll-start gate once, on the first submit batch:
     //   rolloutStart + startInterval × instances + 60s buffer.
-    // Every instance polls at this time + (id-1)×pollInterval, so the whole fleet
-    // finishes its staggered login first, then polls on the tuned round-robin schedule.
+    // After that gate, bots claim CheckIsSlotAvailable slots every pollInterval
+    // (shared rate limiter — missing bots don't leave dead air).
     if (formData.firstSubmit && rolloutPollStartAt == null) {
-      rolloutPollStartAt = Date.now() + staggerIntervalMs * submittedCount + POLL_START_BUFFER_MS;
-      logger.info(
-        { submittedCount, staggerIntervalMs, bufferMs: POLL_START_BUFFER_MS, pollStartAt: rolloutPollStartAt },
-        "[PollGate] Fleet poll-start scheduled (login ramp then coordinated polling)"
-      );
+      const rolloutStartedAt = Date.now();
+      rolloutPollStartAt = computeFleetPollAnchorAt(rolloutStartedAt, staggerIntervalMs, submittedCount);
     }
 
     // Initialize the synchronized polling gate on the very first submit batch
@@ -341,6 +416,10 @@ async function startFormServer(): Promise<void> {
       pollReadyInitializedForBatch = true;
       clearPollReadyState();
       initPollReadyState(submittedCount);
+      clearFleetPollCoord();
+      if (typeof rolloutPollStartAt === "number" && rolloutPollStartAt > 0) {
+        ensureFleetPollEarliest(rolloutPollStartAt);
+      }
     }
     const now = Date.now();
     if (now - lastTelegramNotifyBatchTs > 2000) {
@@ -457,8 +536,7 @@ async function startFormServer(): Promise<void> {
         inst.process!.send({ type: "force-book", instanceId: inst.id });
         queued++;
       }
-      logger.info({ queued }, "[ForceBook] Sent force-book IPC to ALL active instances — starting polling");
-      return { ok: true, queued };
+            return { ok: true, queued };
     },
   });
 }
@@ -485,8 +563,7 @@ function spawnBotInstance(instanceId: number, totalInstances: number): ChildProc
   registry.setProcessAlive(instanceId, true);
 
   child.on("exit", (code) => {
-    logger.warn({ instanceId, code }, "Bot instance exited");
-    const inst = instances.find((i) => i.id === instanceId);
+        const inst = instances.find((i) => i.id === instanceId);
     // Only clear if this exit is still the active process (restart replaces the child).
     if (inst && inst.process === child) {
       inst.process = null;
@@ -497,7 +574,25 @@ function spawnBotInstance(instanceId: number, totalInstances: number): ChildProc
 
   child.on("message", (msg: any) => {
     if (msg?.type === "bot-cycle-complete") {
-      logger.info({ instanceId }, "Bot cycle completed for instance");
+            return;
+    }
+    if (msg?.type === "instance-retired" && typeof msg.instanceId === "number") {
+      const id = Math.floor(msg.instanceId);
+      const inst = instances.find((i) => i.id === id);
+      if (inst) {
+        inst.process = null;
+        pendingStarts = pendingStarts.filter((x) => x !== id);
+        registry.setProcessAlive(id, false);
+        registry.markStopped(
+          id,
+          msg.reason === "already-booked" ? "already booked — retired" : "retired"
+        );
+      }
+      try {
+        killChromeTreeByCdpPortSync(debugPortForInstance(id));
+      } catch {
+        /* ignore */
+      }
       return;
     }
     if (msg?.type === "test-applicants-result" && typeof msg.requestId === "string") {
@@ -523,11 +618,7 @@ function spawnBotInstance(instanceId: number, totalInstances: number): ChildProc
         const before = registry.get(id);
         // Skip if attention already cleared (captcha solved) or bot prefers minimized (post-dashboard).
         if (!before?.attention || before.preferMinimized) {
-          logger.info(
-            { instanceId: id, reason: msg.reason, attention: !!before?.attention, preferMinimized: !!before?.preferMinimized },
-            "[Monitor] Skipping auto-focus — no longer needs foreground"
-          );
-          return;
+                    return;
         }
         const ok = await focusChromeByPort(port, {
           shouldAbort: () => {
@@ -535,8 +626,7 @@ function spawnBotInstance(instanceId: number, totalInstances: number): ChildProc
             return !s?.attention || !!s.preferMinimized;
           },
         });
-        logger.warn({ instanceId: id, reason: msg.reason, focused: ok }, "[Monitor] Auto-focusing Chrome for attention");
-      })();
+              })();
       return;
     }
   });
@@ -545,11 +635,11 @@ function spawnBotInstance(instanceId: number, totalInstances: number): ChildProc
 }
 
 async function main(): Promise<void> {
-  logger.info("Starting VFS Bot Cluster — open the setup form, set the number of instances, and click Submit to start");
-
+  
   // Wipe stale shared state from previous sessions so new instances start clean.
   clearSlotState();
   clearPollReadyState();
+  clearFleetPollCoord();
 
   // Start the monitoring registry (staleness sweep + subscriber notifications).
   registry.start();
@@ -563,8 +653,7 @@ async function main(): Promise<void> {
   // Start the shared form server. Instances are spawned lazily on first Submit,
   // not at startup — so the user can choose the count from the UI.
   startFormServer().catch((err) => {
-    logger.error({ err }, "Form server failed");
-    process.exit(1);
+        process.exit(1);
   });
 }
 
@@ -580,8 +669,7 @@ function shutdown(): void {
   if (isClusterShuttingDown) return;
   isClusterShuttingDown = true;
   const portCount = getInstancePortRangeCount();
-  logger.info({ instances: portCount, basePort: BASE_DEBUGGING_PORT }, "Shutting down cluster — closing Chrome windows and child processes");
-
+  
   // Kill child processes first so they don't spawn new async PowerShell kill commands.
   for (const inst of instances) {
     if (inst.process && !inst.process.killed) {
@@ -615,6 +703,5 @@ process.on("exit", () => {
 });
 
 main().catch((err) => {
-  logger.error({ err }, "Cluster startup failed");
-  process.exit(1);
+    process.exit(1);
 });

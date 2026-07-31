@@ -2,6 +2,12 @@ node_modules/
 dist/
 instances-data.json
 applicants-coord.json
+calendar-booking-coord.json
+fleet-poll-coord.json
+fleet-poll-coord.lock
+poll-ready-state.json
 slot-state.json
 bookings/
+already-booked/
+log.txt
 register-bot/

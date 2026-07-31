@@ -9,8 +9,6 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { get as httpGet } from "node:http";
 import { writeFileSync, unlinkSync } from "node:fs";
 import path from "node:path";
-import { logger } from "./logger";
-
 // ── Resident PowerShell window helper ───────────────────────────────────────
 
 const BOOTSTRAP = `
@@ -234,8 +232,7 @@ function ensureHelper(): boolean {
   try {
     writeFileSync(scriptPath, BOOTSTRAP, "utf-8");
   } catch (err) {
-    logger.warn({ err }, "[Monitor] Could not write window-helper script");
-    return false;
+        return false;
   }
 
   try {
@@ -245,8 +242,7 @@ function ensureHelper(): boolean {
       { stdio: ["pipe", "pipe", "ignore"], windowsHide: true }
     );
   } catch (err) {
-    logger.warn({ err }, "[Monitor] Could not spawn window helper");
-    helper = null;
+        helper = null;
     return false;
   }
 
@@ -254,7 +250,7 @@ function ensureHelper(): boolean {
   resetHelperReady();
   helper.stdout?.on("data", onHelperData);
   helper.on("exit", () => { helper = null; failAllPending(); });
-  helper.on("error", (err) => { logger.warn({ err }, "[Monitor] window helper error"); helper = null; failAllPending(); });
+  helper.on("error", (err) => {  helper = null; failAllPending(); });
 
   if (!exitHookAdded) {
     exitHookAdded = true;
@@ -411,8 +407,7 @@ export async function focusChromeByPort(
   const viaHelper = await sendCmd("focus", debugPort);
   if (opts?.shouldAbort?.()) return false;
   if (viaHelper) return true;
-  logger.info({ debugPort }, "[Monitor] Resident focus helper failed — trying one-shot taskbar focus");
-  if (opts?.shouldAbort?.()) return false;
+    if (opts?.shouldAbort?.()) return false;
   return focusChromeByPortOneShot(debugPort);
 }
 

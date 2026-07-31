@@ -27,7 +27,11 @@ export type AttentionReason =
   | "rate_limit"
   | "blocked"
   | "gateway_timeout"
+  | "cf_challenge"
   | "other";
+
+/** Monitor card activity flash color/kind. */
+export type ApiFlashKind = "polling" | "applicants" | "calendar" | "timeslot" | "schedule";
 
 export type CaptchaResult = "passed" | "failed" | "waiting" | "n/a";
 
@@ -73,6 +77,13 @@ export interface InstanceStatus {
   chromeAlive: boolean | null;
   /** Parent: child Node process is running. */
   processAlive: boolean;
+  /**
+   * One-shot card blink signal for the Monitor UI.
+   * `seq` increments every flash request; the dashboard blinks `times` when seq advances.
+   */
+  apiFlash: { seq: number; times: 1 | 3; kind: ApiFlashKind } | null;
+  /** Sticky Monitor card background after the last applicants/calendar/timeslot/schedule (or polling) call. */
+  cardApiBg: ApiFlashKind | null;
   startedAt: number;
   heartbeatAt: number;
   updatedAt: number;
@@ -103,6 +114,8 @@ export function makeInitialStatus(instanceId: number, debugPort: number | null):
     preferMinimized: false,
     chromeAlive: null,
     processAlive: true,
+    apiFlash: null,
+    cardApiBg: null,
     startedAt: now,
     heartbeatAt: now,
     updatedAt: now,
@@ -135,6 +148,14 @@ export interface MonitorControlState {
   pollingPaused: boolean;
   /** Configured user poll interval (ms) used for staggered resume. */
   pollIntervalMs: number;
+  /** Seconds between save-applicants calls per bot after poll 1036 (global setting). */
+  apologiesIntervalSec: number;
+  /** Seconds between slot-check API calls per instance (fleet round-robin step). */
+  pollIntervalSec: number;
+  /** Seconds gap between bots joining save-applicants after a peer URN unlock. */
+  applicantsJoinStaggerSec: number;
+  /** Seconds between calendar API re-poll calls in fleet booking mode. */
+  calendarPollingIntervalSec: number;
 }
 
 /**
@@ -163,5 +184,15 @@ export interface MonitorHooks {
   stopInstance(instanceId: number): { ok: boolean; error?: string };
   restartInstance(instanceId: number): { ok: boolean; error?: string };
   setStaggerInterval(ms: number): { ok: boolean };
+  /** Patch apologies interval on disk (after poll 1036; no polling abort). */
+  setApologiesIntervalSec(sec: number): { ok: boolean; error?: string };
+  /** Set poll interval (seconds per instance slot-check step). */
+  setPollIntervalSec(sec: number): { ok: boolean; error?: string };
+  /** Set applicants join stagger (seconds gap between bots joining save-applicants). */
+  setApplicantsJoinStaggerSec(sec: number): { ok: boolean; error?: string };
+  /** Set calendar polling interval (seconds between calendar re-poll calls). */
+  setCalendarPollingIntervalSec(sec: number): { ok: boolean; error?: string };
+  /** Reload global settings from disk on all running bots (after /api/save). */
+  reloadGlobalSettings(): { ok: boolean };
   getControl(): MonitorControlState;
 }

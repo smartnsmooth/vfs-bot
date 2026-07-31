@@ -164,9 +164,13 @@ const APPLICANT_UI_ONLY_KEYS = [
   "vacCode2",
   "selectedSubvisaCategory2",
   "userPollInterval",
-  "applicantsIntervalSec",
+  "apologiesIntervalSec",
+  "applicantsJoinStaggerSec",
   "postLoginPollDelay",
   "staggerIntervalSec",
+  "calendarPollingStartDate",
+  "calendarPollingInterval",
+  "bookingSystemMode",
 ] as const;
 
 /**

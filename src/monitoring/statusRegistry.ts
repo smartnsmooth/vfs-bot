@@ -8,7 +8,6 @@
  * Chrome page/window liveness is patched by `chromeProbe` (read-only HTTP to
  * DevTools ports) so the dashboard stays accurate without affecting bots.
  */
-import { logger } from "../utils/logger";
 import type { InstanceStatus } from "./status.types";
 
 const STALE_MS = 12_000;
@@ -160,8 +159,7 @@ class StatusRegistry {
       try {
         cb(status);
       } catch (err) {
-        logger.debug({ err }, "[Monitor] subscriber threw");
-      }
+              }
     }
   }
 

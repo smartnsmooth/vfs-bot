@@ -43,8 +43,8 @@ function resolvedSlotPayloadLoginUser(): string {
   return envSlotLoginUser();
 }
 
-/** 0 = poll forever; N > 0 = run exactly N slot checks then stop the poll loop. */
-const POLL_LIMIT_RAW = parseInt(process.env.POLL_LIMIT ?? "0", 10);
+/** 0 = poll forever; N > 0 = run exactly N slot checks then stop the poll loop. Default 16. */
+const POLL_LIMIT_RAW = parseInt(process.env.POLL_LIMIT ?? "16", 10);
 const pollLimit =
   Number.isFinite(POLL_LIMIT_RAW) && POLL_LIMIT_RAW > 0 ? Math.floor(POLL_LIMIT_RAW) : 0;
 

@@ -5,7 +5,6 @@
  * concurrent GETs with short timeouts, coalesced into registry patches.
  */
 import { get as httpGet } from "node:http";
-import { logger } from "../utils/logger";
 import { registry } from "./statusRegistry";
 
 interface DevtoolsTarget {
@@ -116,8 +115,7 @@ export function startChromeStatusProbe(opts?: { intervalMs?: number }): void {
         });
       }
     } catch (err) {
-      logger.debug({ err }, "[Monitor] Chrome probe tick failed");
-    } finally {
+          } finally {
       ticking = false;
     }
   };
@@ -127,8 +125,7 @@ export function startChromeStatusProbe(opts?: { intervalMs?: number }): void {
     void tick();
   }, intervalMs);
   if (typeof timer.unref === "function") timer.unref();
-  logger.info({ intervalMs, concurrency: CONCURRENCY }, "[Monitor] Chrome status probe started");
-}
+  }
 
 export function stopChromeStatusProbe(): void {
   if (timer) {

@@ -1,7 +1,6 @@
 import { chromium, Browser, BrowserContext, Page } from "playwright";
 import { config } from "../config/config";
 import { type ScheduleDateConstraint } from "../utils/scheduleAllowedDates.js";
-import { logger } from "../utils/logger";
 import { ensureApplicantIpResolved } from "../utils/applicantIp";
 import { getAllocationId } from "../utils/allocationId.store";
 import { getApplicationUrn } from "../utils/applicationUrn.store";
@@ -24,6 +23,7 @@ export {
   VfsForbiddenError,
   VfsGatewayTimeoutError,
   VfsRateLimitedError,
+  AlreadyBookedError,
   isTargetClosedError,
   readClientSourceHeader,
   LIFT_API_HOST_MARKER,
@@ -47,9 +47,12 @@ import {
   testSaveApplicantsOnPage,
   postFeesOnPage,
   postCalendarOnPage,
+  fetchCalendarDatesForFleetOnPage,
   postTimeslotOnPage,
+  fetchTimeslotAllocationsForFleetOnPage,
   postMapVasOnPage,
   postScheduleOnPage,
+  type FleetTimeslotEntry,
 } from "./browser.booking";
 
 // ── Login module ────────────────────────────────────────────────────────
@@ -82,8 +85,36 @@ export class BrowserService implements BrowserServiceCore {
     this.browser = await chromium.connectOverCDP(cdpUrl);
     for (const ctx of this.browser.contexts()) {
       this.attachLiftApiClientSourceSniffer(ctx);
+      await this.applyDefaultZoomOnContext(ctx).catch(() => { });
     }
     return this.browser;
+  }
+
+  /** Keep Chrome page zoom at 75% for every tab in this context. */
+  private async applyDefaultZoomOnContext(context: BrowserContext): Promise<void> {
+    const ZOOM_PCT = "75%";
+    const applyPage = async (page: Page) => {
+      try {
+        await page.evaluate((z) => {
+          try {
+            (document.documentElement as HTMLElement).style.zoom = z;
+          } catch {
+            /* ignore */
+          }
+        }, ZOOM_PCT);
+      } catch {
+        /* ignore */
+      }
+    };
+    for (const page of context.pages()) {
+      await applyPage(page);
+    }
+    context.on("page", (page) => {
+      void page.waitForLoadState("domcontentloaded").then(() => applyPage(page)).catch(() => { });
+      page.on("framenavigated", (frame) => {
+        if (frame === page.mainFrame()) void applyPage(page);
+      });
+    });
   }
 
   private findPreferredVfsPage(pages: Page[], opts?: { excludeApplicantSetup?: boolean }): Page | null {
@@ -217,8 +248,7 @@ export class BrowserService implements BrowserServiceCore {
     this.attachLiftApiClientSourceSniffer(page.context());
     // Do not bringToFront — CDP works on background tabs; bringToFront restores
     // a minimized Chrome window after dashboard settle.
-    logger.info({ cdpUrl: config.browserCdpUrl, tabUrl: page.url() }, "[lift-api] Using VFS tab for POST");
-    return page;
+        return page;
   }
 
   private async getFirstPageForIpLookup(): Promise<Page | null> {
@@ -254,12 +284,10 @@ export class BrowserService implements BrowserServiceCore {
 
       const rate = classifyVfs429FromPageText(trimmed);
       if (rate?.kind === "account") {
-        logger.warn({ code: rate.code }, "[WAF] Detected account/User ID rate-limit page (4290XX)");
-        return "account_429";
+                return "account_429";
       }
       if (rate?.kind === "ip") {
-        logger.warn({ code: rate.code }, "[WAF] Detected IP rate-limit page (4292XX)");
-        return "ip_429";
+                return "ip_429";
       }
 
       if (/^\s*\{/.test(trimmed)) {
@@ -267,24 +295,20 @@ export class BrowserService implements BrowserServiceCore {
           const parsed = JSON.parse(trimmed) as { code?: string | number };
           const codeStr = parsed.code != null ? String(parsed.code) : "";
           if (codeStr.startsWith("403")) {
-            logger.warn({ code: parsed.code }, "[WAF] Detected WAF JSON block on page body");
-            return "forbidden";
+                        return "forbidden";
           }
         } catch {
           /* not JSON */
         }
       }
       if (/Access Restricted Due to Unusual Activity/i.test(trimmed) || /403201/.test(trimmed)) {
-        logger.warn("[WAF] Detected HTML 'Access Restricted' block page (403201)");
-        return "forbidden";
+                return "forbidden";
       }
       if (/Permission Issues/i.test(trimmed) || /403101/.test(trimmed)) {
-        logger.warn("[WAF] Detected HTML 'Permission Issues' block page (403101)");
-        return "forbidden";
+                return "forbidden";
       }
       if (/Session Expired or Invalid/i.test(trimmed)) {
-        logger.warn("[WAF] Detected 'Session Expired or Invalid' block page");
-        return "forbidden";
+                return "forbidden";
       }
     } catch {
       /* ignore */
@@ -337,21 +361,18 @@ export class BrowserService implements BrowserServiceCore {
 
   async waitForLiftClientSourceIfNeeded(): Promise<void> {
     if (getCapturedClientSource()?.trim()) {
-      logger.info("clientsource: already captured from browser");
-      return;
+            return;
     }
     await this.ensureBrowser();
     const telegram = new TelegramService();
     const ALERT_INTERVAL_MS = 60_000;
-    logger.info("Waiting for clientsource capture from browser (lift-api request with clientsource header)...");
-    await telegram
+        await telegram
       .alert("info", "Waiting for clientsource — open or refresh VFS dashboard in Chrome so the bot can capture it.")
       .catch(() => { });
 
     const alertTimer = setInterval(() => {
       if (getCapturedClientSource()?.trim()) return;
-      logger.info("Still waiting for clientsource capture...");
-      telegram
+            telegram
         .alert("info", "Still waiting for clientsource — navigate VFS dashboard in Chrome to trigger a lift-api request.")
         .catch(() => { });
     }, ALERT_INTERVAL_MS);
@@ -361,17 +382,11 @@ export class BrowserService implements BrowserServiceCore {
     } finally {
       clearInterval(alertTimer);
     }
-    logger.info("clientsource captured; proceeding");
   }
 
   async preparePollingAfterLogin(options?: { skipDashboardNavigate?: boolean }): Promise<void> {
-    const page = await this.getVfsPage();
     const skipNav = options?.skipDashboardNavigate === true;
-    if (!skipNav) {
-      logger.info({ url: page.url() }, "Pre-poll: staying on current VFS tab (not navigating to application-detail)");
-    }
     if (skipNav) {
-      logger.info("Poll round after form resubmit — skipping clientsource wait; CheckIsSlotAvailable uses env/capture/storage from tab");
       return;
     }
     await this.waitForLiftClientSourceIfNeeded();
@@ -392,19 +407,16 @@ export class BrowserService implements BrowserServiceCore {
     for (const loc of candidates) {
       try {
         if (!(await loc.isVisible({ timeout: 800 }).catch(() => false))) continue;
-        logger.info("Dashboard: clicking 'Start new booking'");
         await Promise.all([
           page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => { }),
           loc.click({ timeout: 5_000 }),
         ]);
         await page.waitForTimeout(1000);
-        logger.info({ url: page.url() }, "Dashboard: 'Start new booking' click completed");
         return;
-      } catch (e) {
-        logger.warn({ e }, "Dashboard: failed to click one 'Start new booking' candidate");
+      } catch {
+        /* try next candidate */
       }
     }
-    logger.info("Dashboard: no 'Start new booking' button found (skipping)");
   }
 
   private async selectFirstOptionFromMatSelect(page: Page, select: import("playwright").Locator, label: string): Promise<boolean> {
@@ -423,14 +435,12 @@ export class BrowserService implements BrowserServiceCore {
         if (/select|choose|--/i.test(txt)) continue;
         await opt.click({ timeout: 5000 });
         await page.waitForTimeout(800);
-        logger.info({ picked: txt }, `Application-detail: selected first ${label}`);
-        return true;
+                return true;
       }
       await page.keyboard.press("Escape").catch(() => { });
       return false;
     } catch (e) {
-      logger.warn({ e }, `Application-detail: failed selecting first ${label}`);
-      return false;
+            return false;
     }
   }
 
@@ -439,18 +449,15 @@ export class BrowserService implements BrowserServiceCore {
     const url = (() => { try { return page.url(); } catch { return ""; } })();
 
     if (!/application-detail/i.test(url)) {
-      logger.info({ url }, "Application-detail: not on application-detail; skipping center/category selection");
-      return;
+            return;
     }
 
-    logger.info({ url }, "Application-detail: selecting first center + first category");
-    await page.waitForTimeout(3_000);
+        await page.waitForTimeout(3_000);
 
     const allMatSelects = page.locator("mat-select, .mat-mdc-select, .mat-select").filter({ hasNot: page.locator("[disabled], [aria-disabled='true']") });
     const count = await allMatSelects.count();
     if (count === 0) {
-      logger.warn("Application-detail: no mat-select controls found; cannot auto-pick center/category");
-      return;
+            return;
     }
 
     const centerSel = allMatSelects.nth(0);
@@ -461,8 +468,7 @@ export class BrowserService implements BrowserServiceCore {
       await page.waitForTimeout(3_000);
       await this.selectFirstOptionFromMatSelect(page, catSel, "category").catch(() => { });
     } else if (!pickedCenter) {
-      logger.warn("Application-detail: only one select found and center pick failed");
-    }
+          }
   }
 
   // ── Booking chain (delegates to browser.booking module) ─────────────
@@ -470,8 +476,7 @@ export class BrowserService implements BrowserServiceCore {
   async saveApplicantsViaLiftApi(): Promise<void> {
     const existingUrn = getApplicationUrn();
     if (existingUrn?.trim()) {
-      logger.info({ urn: existingUrn }, "Skip save applicants: URN already in memory");
-      return;
+            return;
     }
     await this.waitForLiftClientSourceIfNeeded();
     const page = await this.getVfsPage();
@@ -486,8 +491,7 @@ export class BrowserService implements BrowserServiceCore {
   async postFeesLiftApi(): Promise<void> {
     const urn = getApplicationUrn();
     if (!urn?.trim()) {
-      logger.warn("Skip fees API: no urn in memory; save applicants successfully first");
-      return;
+            return;
     }
     const page = await this.getVfsPage();
     await postFeesOnPage(page, urn);
@@ -496,56 +500,111 @@ export class BrowserService implements BrowserServiceCore {
   async postCalendarLiftApi(opts?: { scheduleConstraint?: ScheduleDateConstraint }): Promise<void> {
     const urn = getApplicationUrn();
     if (!urn?.trim()) {
-      logger.warn("Skip calendar API: no urn in memory; save applicants successfully first");
-      return;
+            return;
     }
     const page = await this.getVfsPage();
     await postCalendarOnPage(page, urn, opts);
+  }
+
+  /** Fleet booking: Calendar → dates list (throws on empty/error). */
+  async fetchCalendarDatesForFleet(): Promise<string[]> {
+    const urn = getApplicationUrn();
+    if (!urn?.trim()) {
+      throw new Error("Fleet calendar: no urn; save applicants successfully first");
+    }
+    const page = await this.getVfsPage();
+    return fetchCalendarDatesForFleetOnPage(page, urn);
   }
 
   async postTimeslotLiftApi(): Promise<void> {
     const urn = getApplicationUrn();
     const slotDate = getSlotDate();
     if (!urn?.trim()) {
-      logger.warn("Skip timeslot API: no urn; save applicants successfully first");
-      return;
+            return;
     }
     if (!slotDate?.trim()) {
-      logger.warn("Skip timeslot API: no slotDate; run calendar API first");
-      return;
+            return;
     }
     const page = await this.getVfsPage();
     await postTimeslotOnPage(page, urn, slotDate);
   }
 
+  /** Fleet booking: Timeslot for an assigned date → all entries with allocationId + time. */
+  async fetchTimeslotAllocationsForFleet(
+    slotDate: string
+  ): Promise<FleetTimeslotEntry[]> {
+    const urn = getApplicationUrn();
+    if (!urn?.trim()) {
+      throw new Error("Fleet timeslot: no urn; save applicants successfully first");
+    }
+    if (!slotDate?.trim()) {
+      throw new Error("Fleet timeslot: no slotDate assigned");
+    }
+    const page = await this.getVfsPage();
+    return fetchTimeslotAllocationsForFleetOnPage(page, urn, slotDate);
+  }
+
   async postMapVasLiftApi(): Promise<void> {
     const urn = getApplicationUrn();
     if (!urn?.trim()) {
-      logger.warn("Skip mapvas API: no urn; save applicants successfully first");
-      return;
+            return;
     }
     const page = await this.getVfsPage();
     await postMapVasOnPage(page, urn);
   }
 
-  async postScheduleLiftApi(): Promise<void> {
+  async postScheduleLiftApi(): Promise<{ paymentUrl: string | null }> {
     const urn = getApplicationUrn();
     const allocationId = getAllocationId();
     if (!urn?.trim()) {
-      logger.warn("Skip schedule API: no urn; save applicants successfully first");
-      return;
+            return { paymentUrl: null };
     }
     if (!allocationId?.trim()) {
-      logger.warn("Skip schedule API: no allocationId; run timeslot API first");
-      return;
+            return { paymentUrl: null };
     }
     const page = await this.getVfsPage();
-    await postScheduleOnPage(page, urn, allocationId);
+    return postScheduleOnPage(page, urn, allocationId);
   }
 
   async runSlotCheckInBrowser(url: string, payload: Record<string, unknown>): Promise<{ status: number; body: string }> {
-    const page = await this.getVfsPage();
-    return postLiftJsonFromPage(page, url, payload);
+    try {
+      const page = await this.getVfsPage();
+      await this.simulateUserActivity(page);
+      return await postLiftJsonFromPage(page, url, payload);
+    } catch (err) {
+      // postLiftJsonFromPage already logs (including empty/failed responses).
+      // Log here only when we never reached postLift (e.g. no VFS page).
+      const msg = err instanceof Error ? err.message : String(err);
+      const likelyBeforePost =
+        /no vfs|getvfspage|no page|browser.*(closed|disconnected)|target closed/i.test(msg);
+      if (likelyBeforePost) {
+        const { logApiCall, liftUrlToLogKind } = await import("../utils/apiCallLog.js");
+        const kind = liftUrlToLogKind(url) ?? "polling";
+        logApiCall(kind, "", undefined, JSON.stringify(payload), { error: msg });
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Dispatch synthetic DOM events on the VFS page so the Angular app's
+   * idle-timeout detector sees "user activity" and doesn't kill the session.
+   */
+  private async simulateUserActivity(page: import("playwright").Page): Promise<void> {
+    try {
+      await page.evaluate(() => {
+        const x = Math.floor(Math.random() * (window.innerWidth || 800));
+        const y = Math.floor(Math.random() * (window.innerHeight || 600));
+        const opts: MouseEventInit = { bubbles: true, clientX: x, clientY: y };
+        document.dispatchEvent(new MouseEvent("mousemove", opts));
+        document.dispatchEvent(new MouseEvent("mousedown", opts));
+        document.dispatchEvent(new MouseEvent("mouseup", opts));
+        document.dispatchEvent(new KeyboardEvent("keydown", { bubbles: true, key: "Shift" }));
+        document.dispatchEvent(new KeyboardEvent("keyup", { bubbles: true, key: "Shift" }));
+      });
+    } catch {
+      /* page may be navigating — safe to ignore */
+    }
   }
 
   // ── Session snapshot / restore (IP rotation) ────────────────────────
@@ -643,8 +702,7 @@ export class BrowserService implements BrowserServiceCore {
         `IP rotate without relogin lost VFS session (tab is ${kind || "unknown"}). Escalate to full relogin.`
       );
     }
-    logger.info({ url, hasAuthorize: Boolean(snap.authorize?.trim()) }, "[429 IP] Restored VFS session after proxy rotate");
-  }
+      }
 
   // ── CDP lifecycle ───────────────────────────────────────────────────
 

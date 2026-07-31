@@ -53,13 +53,113 @@ export function buildMonitorTabHtml(): string {
     0%, 100% { background: #15202b; box-shadow: 0 0 0 1px #f4212e55; }
     50% { background: #5a1520; box-shadow: 0 0 10px 1px #f4212eaa; }
   }
+  /* Sticky card background after API activity (survives after blink ends). */
+  .mon-tile.bg-polling:not(.attn):not(.dead) {
+    background: #1c2838;
+    border-color: #3d5368;
+  }
+  .mon-tile.bg-applicants:not(.attn):not(.dead) {
+    background: #2a2e33;
+    border-color: #4a5058;
+  }
+  .mon-tile.bg-calendar:not(.attn):not(.dead) {
+    background: #163a52;
+    border-color: #2a6a94;
+  }
+  .mon-tile.bg-timeslot:not(.attn):not(.dead) {
+    background: #143528;
+    border-color: #2d6a4f;
+  }
+  .mon-tile.bg-schedule:not(.attn):not(.dead) {
+    background: #1a4030;
+    border-color: #2f9e6f;
+  }
+  /* Short activity flash (API call) — color by endpoint kind. */
+  .mon-tile.flash-polling:not(.attn) {
+    animation: monFlashPolling 0.4s ease-in-out 1;
+  }
+  .mon-tile.flash-applicants:not(.attn) {
+    animation: monFlashApplicants 0.4s ease-in-out 3;
+  }
+  .mon-tile.flash-calendar:not(.attn) {
+    animation: monFlashCalendar 0.4s ease-in-out 3;
+  }
+  .mon-tile.flash-timeslot:not(.attn) {
+    animation: monFlashTimeslot 0.4s ease-in-out 3;
+  }
+  .mon-tile.flash-schedule:not(.attn) {
+    animation: monFlashSchedule 0.4s ease-in-out 3;
+  }
+  .mon-tile.attn.flash-polling {
+    animation: monBlinkBg 0.9s ease-in-out infinite, monApiFlashAttn 0.4s ease-in-out 1;
+  }
+  .mon-tile.attn.flash-applicants,
+  .mon-tile.attn.flash-calendar,
+  .mon-tile.attn.flash-timeslot,
+  .mon-tile.attn.flash-schedule {
+    animation: monBlinkBg 0.9s ease-in-out infinite, monApiFlashAttn 0.4s ease-in-out 3;
+  }
+  @keyframes monFlashPolling {
+    0%, 100% { background: #1c2838; box-shadow: 0 0 0 1px transparent; }
+    50% { background: #243044; box-shadow: 0 0 8px 1px #6b8fbc66; border-color: #5a7a9a; }
+  }
+  @keyframes monFlashApplicants {
+    0%, 100% { background: #2a2e33; box-shadow: 0 0 0 1px transparent; }
+    50% { background: #3a3f46; box-shadow: 0 0 8px 1px #6b728066; border-color: #5c6370; }
+  }
+  @keyframes monFlashCalendar {
+    0%, 100% { background: #163a52; box-shadow: 0 0 0 1px transparent; }
+    50% { background: #1a4a6a; box-shadow: 0 0 10px 1px #1d9bf0aa; border-color: #1d9bf0; }
+  }
+  @keyframes monFlashTimeslot {
+    0%, 100% { background: #143528; box-shadow: 0 0 0 1px transparent; }
+    50% { background: #1a4532; box-shadow: 0 0 10px 1px #2d6a4f99; border-color: #2d6a4f; }
+  }
+  @keyframes monFlashSchedule {
+    0%, 100% { background: #1a4030; box-shadow: 0 0 0 1px transparent; }
+    50% { background: #1f5040; box-shadow: 0 0 10px 1px #00ba7caa; border-color: #00ba7c; }
+  }
+  @keyframes monApiFlashAttn {
+    0%, 100% { filter: brightness(1); }
+    50% { filter: brightness(1.35); }
+  }
   @media (prefers-reduced-motion: reduce) {
     .mon-tile.attn { animation: none; background: #3d1520; box-shadow: 0 0 0 1px #f4212e88; }
+    .mon-tile.flash-polling,
+    .mon-tile.flash-applicants,
+    .mon-tile.flash-calendar,
+    .mon-tile.flash-timeslot,
+    .mon-tile.flash-schedule { animation: none; }
+    .mon-tile.bg-polling:not(.attn):not(.dead) { background: #1c2838; border-color: #3d5368; }
+    .mon-tile.bg-applicants:not(.attn):not(.dead) { background: #2a2e33; border-color: #4a5058; }
+    .mon-tile.bg-calendar:not(.attn):not(.dead) { background: #163a52; border-color: #2a6a94; }
+    .mon-tile.bg-timeslot:not(.attn):not(.dead) { background: #143528; border-color: #2d6a4f; }
+    .mon-tile.bg-schedule:not(.attn):not(.dead) { background: #1a4030; border-color: #2f9e6f; }
   }
+  .mon-toolbar label { display: inline; margin: 0; }
+  .mon-toolbar input { width: auto; margin: 0; }
+  .mon-toolbar button { width: auto; padding: 0.15rem 0.4rem; font-size: 0.65rem; min-width: 0; flex: none; }
   .mon-toast { position: fixed; right: 1rem; bottom: 1rem; background: #1c2732; border: 1px solid #38444d; color: #e7e9ea; padding: 0.6rem 0.85rem; border-radius: 8px; font-size: 0.85rem; opacity: 0; transition: opacity 0.2s; pointer-events: none; z-index: 50; max-width: 22rem; }
   .mon-toast.show { opacity: 1; }
 </style>
 <div class="mon-wrap">
+  <div class="mon-toolbar" style="margin-bottom:0.5rem;display:flex;gap:0.4rem;align-items:center;justify-content:center;font-size:0.72rem;">
+    <label for="monPollInterval">Poll (s)</label>
+    <input type="number" id="monPollInterval" min="1" max="600" value="60" step="1" style="width:3.5rem;padding:0.15rem 0.25rem;border:1px solid #38444d;border-radius:4px;background:#15202b;color:#e7e9ea;font-size:0.72rem;" />
+    <button type="button" id="monPollIntervalApply">Apply</button>
+    <span style="color:#38444d;margin:0 0.1rem;">|</span>
+    <label for="monApplicantsJoinStagger">Join stagger (s)</label>
+    <input type="number" id="monApplicantsJoinStagger" min="0.1" max="30" value="0.5" step="0.1" style="width:3.5rem;padding:0.15rem 0.25rem;border:1px solid #38444d;border-radius:4px;background:#15202b;color:#e7e9ea;font-size:0.72rem;" />
+    <button type="button" id="monApplicantsJoinStaggerApply">Apply</button>
+    <span style="color:#38444d;margin:0 0.1rem;">|</span>
+    <label for="monCalendarPollingInterval">Calendar re-poll (s)</label>
+    <input type="number" id="monCalendarPollingInterval" min="1" max="600" value="60" step="1" style="width:3.5rem;padding:0.15rem 0.25rem;border:1px solid #38444d;border-radius:4px;background:#15202b;color:#e7e9ea;font-size:0.72rem;" />
+    <button type="button" id="monCalendarPollingIntervalApply">Apply</button>
+    <span style="color:#38444d;margin:0 0.1rem;">|</span>
+    <label for="monApologiesInterval">Apologies (s)</label>
+    <input type="number" id="monApologiesInterval" min="1" max="120" value="2" style="width:3.5rem;padding:0.15rem 0.25rem;border:1px solid #38444d;border-radius:4px;background:#15202b;color:#e7e9ea;font-size:0.72rem;" />
+    <button type="button" id="monApologiesApply">Apply</button>
+  </div>
   <div class="mon-grid" id="monGrid"></div>
 </div>
 <div class="mon-toast" id="monToast"></div>
@@ -69,6 +169,8 @@ export function buildMonitorTabHtml(): string {
   var started = false;
   var instances = {};
   var prevAttn = {};
+  var lastFlashSeq = {};
+  var pendingFlash = {};
   var rafPending = false;
   var warmupUntil = 0;
 
@@ -185,10 +287,11 @@ export function buildMonitorTabHtml(): string {
     var phaseLabel = closed ? 'closed' : (paused ? 'paused' : s.phase);
     if (!closed && needsManual(s) && !paused) phaseLabel = s.phase === 'stopped' ? 'stopped' : (s.attention && s.attention.reason) || s.phase;
 
+    var apiBg = (!closed && s.cardApiBg) ? (' bg-' + s.cardApiBg) : '';
     var topColor = closed ? '#3a4349' : (needsManual(s) ? '#f4212e' : color);
     var phaseColor = closed ? '#6b7686' : (needsManual(s) ? '#f4212e' : color);
 
-    return '<div class="mon-tile' + attn + (paused && !closed ? ' paused' : '') + (closed ? ' dead' : '') + '" data-id="' + s.instanceId + '" title="' + esc(tip.join(' · ') || ('Focus bot #' + s.instanceId)) + '" style="border-top-color:' + topColor + '">' +
+    return '<div class="mon-tile' + attn + apiBg + (paused && !closed ? ' paused' : '') + (closed ? ' dead' : '') + '" data-id="' + s.instanceId + '" title="' + esc(tip.join(' · ') || ('Focus bot #' + s.instanceId)) + '" style="border-top-color:' + topColor + '">' +
       '<span class="phase" style="color:' + phaseColor + '">' + esc(phaseLabel) + '</span>' +
       '<span class="id">' + chromeDot + s.instanceId + '</span>' +
       '<div class="page" title="' + esc(s.page || '') + '">' + (pageShort ? esc(pageShort) : '<span style="color:#55606b">page —</span>') + '</div>' +
@@ -196,7 +299,7 @@ export function buildMonitorTabHtml(): string {
       '<div class="cap">' + (capBadge || '<span style="color:#6b7686">captcha —</span>') + capCounts + '</div>' +
       '<div class="actions">' +
         pollBtn +
-        '<button type="button" class="mon-btn restart" data-action="restart" title="Restart this bot">Restart</button>' +
+        '<button type="button" class="mon-btn restart" data-action="restart" title="Clear session, rotate IP, restart Chrome + bot">Restart</button>' +
       '</div>' +
     '</div>';
   }
@@ -206,7 +309,31 @@ export function buildMonitorTabHtml(): string {
     var list = Object.keys(instances).map(function(k){ return instances[k]; });
     list.sort(function(a,b){ return a.instanceId - b.instanceId; });
     var html = ''; for (var j=0;j<list.length;j++){ html += tileHtml(list[j]); }
-    el('monGrid').innerHTML = html;
+    var grid = el('monGrid');
+    grid.innerHTML = html;
+
+    var flashIds = Object.keys(pendingFlash);
+    var FLASH_KINDS = { polling:1, applicants:1, calendar:1, timeslot:1, schedule:1 };
+    for (var fi = 0; fi < flashIds.length; fi++) {
+      var fid = flashIds[fi];
+      var flashInfo = pendingFlash[fid];
+      delete pendingFlash[fid];
+      var tile = grid.querySelector('.mon-tile[data-id="' + fid + '"]');
+      if (!tile || tile.classList.contains('dead')) continue;
+      tile.classList.remove('flash-polling', 'flash-applicants', 'flash-calendar', 'flash-timeslot', 'flash-schedule');
+      void tile.offsetWidth;
+      var kind = (flashInfo && FLASH_KINDS[flashInfo.kind]) ? flashInfo.kind : 'polling';
+      var cls = 'flash-' + kind;
+      tile.classList.add(cls);
+      (function(t, c){
+        function onEnd(ev){
+          if (ev && ev.target !== t) return;
+          t.classList.remove(c);
+          t.removeEventListener('animationend', onEnd);
+        }
+        t.addEventListener('animationend', onEnd);
+      })(tile, cls);
+    }
   }
 
   function scheduleRender(){ if (rafPending) return; rafPending = true; requestAnimationFrame(render); }
@@ -220,6 +347,19 @@ export function buildMonitorTabHtml(): string {
       beep();
     }
     prevAttn[s.instanceId] = isAttn;
+
+    var flash = s.apiFlash;
+    if (flash && typeof flash.seq === 'number') {
+      var prevSeq = lastFlashSeq[s.instanceId] || 0;
+      if (flash.seq > prevSeq) {
+        lastFlashSeq[s.instanceId] = flash.seq;
+        pendingFlash[s.instanceId] = {
+          times: flash.times >= 3 ? 3 : 1,
+          kind: flash.kind || 'polling'
+        };
+      }
+    }
+
     instances[s.instanceId] = s;
     scheduleRender();
   }
@@ -279,6 +419,48 @@ export function buildMonitorTabHtml(): string {
   window.__monitorInit = function(){
     if (started) return; started = true;
     warmupUntil = Date.now() + 2500;
+    fetch('/api/monitor/control').then(function(r){ return r.json(); }).then(function(d){
+      if (d && d.ok && d.control) {
+        var c = d.control;
+        if (c.apologiesIntervalSec != null) {
+          var ai = document.getElementById('monApologiesInterval');
+          if (ai) ai.value = String(c.apologiesIntervalSec);
+        }
+        if (c.pollIntervalSec != null) {
+          var pi = document.getElementById('monPollInterval');
+          if (pi) pi.value = String(c.pollIntervalSec);
+        }
+        if (c.applicantsJoinStaggerSec != null) {
+          var js = document.getElementById('monApplicantsJoinStagger');
+          if (js) js.value = String(c.applicantsJoinStaggerSec);
+        }
+        if (c.calendarPollingIntervalSec != null) {
+          var cp = document.getElementById('monCalendarPollingInterval');
+          if (cp) cp.value = String(c.calendarPollingIntervalSec);
+        }
+      }
+    }).catch(function(){});
+
+    function bindApply(btnId, inputId, action, label, minVal, isFloat) {
+      var btn = document.getElementById(btnId);
+      if (!btn) return;
+      btn.addEventListener('click', function(){
+        var inp = document.getElementById(inputId);
+        var val = isFloat ? parseFloat(String(inp && inp.value)) : parseInt(String(inp && inp.value), 10);
+        if (!Number.isFinite(val) || val < minVal) {
+          toast(label + ' must be at least ' + minVal + (minVal < 1 ? 's' : ' second(s)'));
+          return;
+        }
+        toast('Applying ' + label + ' ' + val + 's…');
+        post(action, { intervalSec: val }).then(function(r){
+          toast(r.ok ? label + ' set to ' + val + 's' : (r.error || 'apply failed'));
+        });
+      });
+    }
+    bindApply('monApologiesApply', 'monApologiesInterval', 'apologies-interval', 'Apologies interval', 1, false);
+    bindApply('monPollIntervalApply', 'monPollInterval', 'poll-interval', 'Poll interval', 1, false);
+    bindApply('monApplicantsJoinStaggerApply', 'monApplicantsJoinStagger', 'applicants-join-stagger', 'Join stagger', 0.1, true);
+    bindApply('monCalendarPollingIntervalApply', 'monCalendarPollingInterval', 'calendar-polling-interval', 'Calendar re-poll', 1, false);
     fetch('/api/monitor/snapshot').then(function(r){ return r.json(); }).then(function(d){
       if (d && d.ok && Array.isArray(d.instances)){
         for (var i = 0; i < d.instances.length; i++){

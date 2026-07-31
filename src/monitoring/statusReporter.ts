@@ -12,6 +12,7 @@
  */
 import {
   makeInitialStatus,
+  type ApiFlashKind,
   type AttentionReason,
   type BotPhase,
   type CaptchaResult,
@@ -168,6 +169,15 @@ class StatusReporter {
   setPollingPaused(paused: boolean): void {
     if (this.status.pollingPaused === paused) return;
     this.status.pollingPaused = paused;
+    this.flushNow();
+  }
+
+  /** Blink this bot's Monitor card once (polling) or three times (booking APIs), then keep that API's bg color. */
+  flashCard(times: 1 | 3, kind: ApiFlashKind): void {
+    const n: 1 | 3 = times >= 3 ? 3 : 1;
+    const seq = (this.status.apiFlash?.seq ?? 0) + 1;
+    this.status.apiFlash = { seq, times: n, kind };
+    this.status.cardApiBg = kind;
     this.flushNow();
   }
 
