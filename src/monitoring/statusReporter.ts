@@ -172,12 +172,15 @@ class StatusReporter {
     this.flushNow();
   }
 
-  /** Blink this bot's Monitor card once (polling) or three times (booking APIs), then keep that API's bg color. */
+  /** Blink this bot's Monitor card once (polling) or three times (booking APIs). Booking APIs also keep sticky bg; polling blinks only. */
   flashCard(times: 1 | 3, kind: ApiFlashKind): void {
     const n: 1 | 3 = times >= 3 ? 3 : 1;
     const seq = (this.status.apiFlash?.seq ?? 0) + 1;
     this.status.apiFlash = { seq, times: n, kind };
-    this.status.cardApiBg = kind;
+    // Polling: blink only — do not change the sticky card background.
+    if (kind !== "polling") {
+      this.status.cardApiBg = kind;
+    }
     this.flushNow();
   }
 

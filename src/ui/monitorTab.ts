@@ -19,10 +19,10 @@ export function buildMonitorTabHtml(): string {
   .mon-tile .actions { margin-top: 0.22rem; display: flex; gap: 0.2rem; }
   .mon-tile .mon-btn { flex: 1; border: 1px solid #38444d; background: #1c2732; color: #e7e9ea; border-radius: 4px; padding: 0.12rem 0.2rem; font-size: 0.55rem; cursor: pointer; line-height: 1.15; }
   .mon-tile .mon-btn:hover { background: #253341; border-color: #4a5a68; }
-  .mon-tile .mon-btn.restart { color: #ffb347; border-color: #5a4630; }
-  .mon-tile .mon-btn.restart:hover { background: #2a2218; border-color: #8a6a3a; }
-  .mon-tile .mon-btn.stop { color: #ff8a80; border-color: #5a3030; }
-  .mon-tile .mon-btn.stop:hover { background: #2a1818; }
+  .mon-tile .mon-btn.restart { color: #6b7686; background: #1a2228; border-color: #2a3238; }
+  .mon-tile .mon-btn.restart:hover { background: #222a32; border-color: #3a4349; color: #8b98a5; }
+  .mon-tile .mon-btn.stop { color: #6b7686; background: #1a2228; border-color: #2a3238; }
+  .mon-tile .mon-btn.stop:hover { background: #222a32; border-color: #3a4349; color: #8b98a5; }
   .mon-tile .mon-btn.resume { color: #69f0ae; border-color: #2a5040; }
   .mon-tile .mon-btn.resume:hover { background: #1a2e24; }
   .mon-tile.paused { opacity: 0.92; border-color: #5a4630; }
