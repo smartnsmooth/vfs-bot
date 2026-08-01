@@ -1,7 +1,6 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-set "VFS_RELEASE=1"
 echo Starting vfsbot cluster (multi-instance)...
 set "NODE_EXE=%~dp0node\node.exe"
 if not exist "%NODE_EXE%" (
