@@ -417,7 +417,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
         const k = keys[ki];
         if (skipDetailIds[k] || skipCenterCatIds[k]) continue;
         if (k === "scheduleDateRangeStart" || k === "scheduleDateRangeEnd") continue;
-        if (k === "calendarPollingStartDate" || k === "calendarPollingInterval" || k === "bookingSystemMode") continue;
+        if (k === "calendarPollingStartDate" || k === "calendarPollingInterval") continue;
         const el = document.getElementById(k);
         if (el) el.value = inst.details[k] == null ? "" : String(inst.details[k]);
       }
@@ -479,11 +479,6 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       const gsrc = (globalInst && globalInst.details) || {};
       cpiEl.value = gsrc.calendarPollingInterval != null ? String(gsrc.calendarPollingInterval) : "60";
     }
-    const bsmEl = document.getElementById("bookingSystemMode");
-    if (bsmEl) {
-      const gsrc = (globalInst && globalInst.details) || {};
-      bsmEl.value = gsrc.bookingSystemMode === "fleet" ? "fleet" : "legacy";
-    }
 
     if (showAlert) {
       alert("Loaded saved data for Instance " + instanceId);
@@ -529,7 +524,6 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       applicantsJoinStaggerSec: parseFloat(String(fd.get("applicantsJoinStaggerSec") || "0.5")) || 0.5,
       calendarPollingStartDate: String(fd.get("calendarPollingStartDate") ?? "").trim(),
       calendarPollingInterval: parseInt(String(fd.get("calendarPollingInterval") || "60"), 10) || 60,
-      bookingSystemMode: String(fd.get("bookingSystemMode") || "legacy").trim() === "fleet" ? "fleet" : "legacy",
       postLoginPollDelay: parseInt(String(fd.get("postLoginPollDelay") || "30"), 10),
       staggerIntervalSec: parseInt(String(fd.get("staggerIntervalSec") || "6"), 10),
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
@@ -737,7 +731,6 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       applicantsJoinStaggerSec: parseFloat(String(fd.get("applicantsJoinStaggerSec") || "0.5")) || 0.5,
       calendarPollingStartDate: String(fd.get("calendarPollingStartDate") ?? "").trim(),
       calendarPollingInterval: parseInt(String(fd.get("calendarPollingInterval") || "60"), 10) || 60,
-      bookingSystemMode: String(fd.get("bookingSystemMode") || "legacy").trim() === "fleet" ? "fleet" : "legacy",
       postLoginPollDelay: parseInt(String(fd.get("postLoginPollDelay") || "30"), 10),
       staggerIntervalSec: parseInt(String(fd.get("staggerIntervalSec") || "6"), 10),
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
@@ -799,68 +792,6 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       btn.textContent = "Book Slot";
     }
   });
-
-  var testApplicantsBtn = document.getElementById("testApplicantsApiBtn");
-  if (testApplicantsBtn) {
-    testApplicantsBtn.addEventListener("click", async function () {
-      const msg = document.getElementById("msg");
-      const btn = document.getElementById("testApplicantsApiBtn");
-      msg.textContent = "";
-      btn.disabled = false;
-      var prevLabel = btn.textContent;
-      btn.textContent = "Saving…";
-      try {
-        await saveFormData(false);
-        btn.textContent = "Calling API (all instances)…";
-        const r = await fetch("/api/test-applicants", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: "{}",
-        });
-        const j = await r.json();
-        if (!r.ok) {
-          msg.className = "err";
-          msg.textContent = j.error || "Test applicants API failed";
-          return;
-        }
-        const rows = Array.isArray(j.results) ? j.results : [];
-        if (rows.length === 0) {
-          msg.className = "err";
-          msg.textContent = "No running instances. Click Submit & Run first to spawn bots, then try again.";
-          return;
-        }
-        var lines = [];
-        var anyBad = false;
-        for (var i = 0; i < rows.length; i++) {
-          var row = rows[i];
-          var id = row.instanceId;
-          if (row.ok === true && typeof row.status === "number") {
-            var prev = typeof row.bodyPreview === "string" ? row.bodyPreview : "";
-            if (row.status < 200 || row.status >= 300) anyBad = true;
-            lines.push(
-              "Instance " +
-                id +
-                ": HTTP " +
-                row.status +
-                (prev ? " — " + prev.slice(0, 500) : "") +
-                " (see that instance’s Chrome / Network tab)."
-            );
-          } else {
-            anyBad = true;
-            lines.push("Instance " + id + ": " + (row.error || "failed"));
-          }
-        }
-        msg.className = anyBad ? "err" : "ok";
-        msg.textContent = lines.join("\\n");
-      } catch (err) {
-        msg.className = "err";
-        msg.textContent = String(err);
-      } finally {
-        btn.disabled = false;
-        btn.textContent = prevLabel;
-      }
-    });
-  }
 })();
 </script>`;
 }

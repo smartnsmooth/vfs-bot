@@ -4,8 +4,6 @@ import { spawn, ChildProcess } from "node:child_process";
 import {
   runApplicantFormWithSubmitHandler,
   closeApplicantFormServer,
-  type TestApplicantsApiBatchResult,
-  type TestApplicantsApiInstanceResult,
 } from "./ui/applicantDetailsFormServer";
 import { setSessionLoginCredentials, getAllInstanceCredentials } from "./utils/sessionLogin.store";
 import { setApplicantDetailsOverrides, getAllInstanceApplicantDetails, getApplicantDetailsOverrides } from "./utils/applicantDetails.store";
@@ -43,9 +41,6 @@ interface BotInstance {
 }
 
 const instances: BotInstance[] = [];
-
-/** Parent waits for `test-applicants-result` from a child (same `requestId`). */
-const pendingTestApplicants = new Map<string, (msg: Record<string, unknown>) => void>();
 
 // ── Staggered launch controller (dashboard-controlled) ──────────────────────
 let staggerIntervalMs = Math.max(0, parseInt(process.env.STAGGER_INTERVAL_MS ?? "6000", 10) || 6000);
@@ -484,46 +479,6 @@ async function startFormServer(): Promise<void> {
   }, {
     collectLogin: true,
     monitor: buildMonitorHooks(),
-    onTestApplicantsApi: async (): Promise<TestApplicantsApiBatchResult> => {
-      const running = instances.filter((i) => i.process && !i.process.killed);
-      if (running.length === 0) {
-        return { results: [] };
-      }
-      const batchId = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-      const results = await Promise.all(
-        running.map(
-          (inst) =>
-            new Promise<TestApplicantsApiInstanceResult>((resolve) => {
-              const requestId = `${batchId}-i${inst.id}`;
-              const timer = setTimeout(() => {
-                if (pendingTestApplicants.delete(requestId)) {
-                  resolve({
-                    instanceId: inst.id,
-                    ok: false,
-                    error:
-                      "Timeout (90s) waiting for applicants API test — ensure this instance is logged in (visa.vfsglobal.com tab open).",
-                  });
-                }
-              }, 90_000);
-              pendingTestApplicants.set(requestId, (msg) => {
-                clearTimeout(timer);
-                pendingTestApplicants.delete(requestId);
-                if (msg.ok === true && typeof msg.status === "number" && typeof msg.bodyPreview === "string") {
-                  resolve({ instanceId: inst.id, ok: true, status: msg.status, bodyPreview: msg.bodyPreview });
-                } else {
-                  resolve({
-                    instanceId: inst.id,
-                    ok: false,
-                    error: typeof msg.error === "string" ? msg.error : "Test applicants API failed",
-                  });
-                }
-              });
-              inst.process!.send({ type: "test-applicants", instanceId: inst.id, requestId });
-            })
-        )
-      );
-      return { results };
-    },
     onForceBook: () => {
       const eligible = instances.filter((i) => i.process && !i.process.killed);
 
@@ -592,14 +547,6 @@ function spawnBotInstance(instanceId: number, totalInstances: number): ChildProc
         killChromeTreeByCdpPortSync(debugPortForInstance(id));
       } catch {
         /* ignore */
-      }
-      return;
-    }
-    if (msg?.type === "test-applicants-result" && typeof msg.requestId === "string") {
-      const cb = pendingTestApplicants.get(msg.requestId);
-      if (cb) {
-        pendingTestApplicants.delete(msg.requestId);
-        cb(msg as Record<string, unknown>);
       }
       return;
     }

@@ -1,5 +1,5 @@
 /**
- * Fleet Calendar booking flow (setup form bookingSystemMode = "fleet").
+ * Fleet Calendar booking flow (sole booking system).
  *
  * 1. First URN = FeeCalculator → Calendar (dedup) → Fees → then joins instance loop
  * 2. Every URN holder (including FeeCalculator after fees) runs:
@@ -41,11 +41,6 @@ import {
 import { reporter } from "../monitoring/statusReporter";
 
 const DEFAULT_CALENDAR_POLLING_INTERVAL_SEC = 60;
-
-export function isFleetCalendarBookingEnabled(): boolean {
-  const globalDet = getApplicantDetailsOverrides(0);
-  return globalDet?.bookingSystemMode === "fleet";
-}
 
 export function getCalendarPollingIntervalMs(): number {
   const globalDet = getApplicantDetailsOverrides(0);

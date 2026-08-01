@@ -26,6 +26,7 @@
   "devDependencies": {
     "@types/node": "^25.5.0",
     "@types/node-telegram-bot-api": "^0.64.14",
+    "javascript-obfuscator": "^4.2.2",
     "ts-node": "^10.9.2",
     "typescript": "^5.9.3"
   }

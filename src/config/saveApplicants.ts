@@ -170,7 +170,6 @@ const APPLICANT_UI_ONLY_KEYS = [
   "staggerIntervalSec",
   "calendarPollingStartDate",
   "calendarPollingInterval",
-  "bookingSystemMode",
 ] as const;
 
 /**

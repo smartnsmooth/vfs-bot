@@ -26,16 +26,8 @@ import {
   type SlotFoundState,
 } from "./utils/slotState";
 import { setSlotCenterOverride, clearSlotCenterOverride } from "./utils/slotCenterOverride.store";
-import { setSlotDate, clearSlotDate } from "./utils/slotDate.store";
+import { clearSlotDate } from "./utils/slotDate.store";
 import { getApplicationUrn } from "./utils/applicationUrn.store";
-import { getAllocationId } from "./utils/allocationId.store";
-import {
-  isPollingSlotInConstraint,
-  NoDatesInScheduleRangeError,
-  resolveScheduleDateConstraint,
-  scheduleConstraintIsActive,
-  scheduleConstraintLogValue,
-} from "./utils/scheduleAllowedDates.js";
 import { clearApplicantIpCache, getApplicantIpForPayload } from "./utils/applicantIp";
 import { logInstanceIp, type InstanceIpLogReason } from "./utils/apiCallLog";
 import { clearChromeSessionDataBeforeLaunch, resolveChromeProfileFolderName } from "./utils/chromeProfileSessionClean";
@@ -70,7 +62,7 @@ import {
 } from "./utils/applicantsCoord";
 import { allClusterParticipantIds, waitForJoinStagger } from "./utils/joinStagger";
 import { getEffectiveJoinStaggerMs, registerFleetUrn, retireFromFleet } from "./utils/calendarBookingCoord";
-import { isFleetCalendarBookingEnabled, runFleetCalendarBooking } from "./flows/fleetCalendarBooking";
+import { runFleetCalendarBooking } from "./flows/fleetCalendarBooking";
 import { saveAlreadyBookedAccountFile } from "./utils/alreadyBookedAccountFile";
 import { reporter } from "./monitoring/statusReporter";
 import { registry } from "./monitoring/statusRegistry";
@@ -119,10 +111,6 @@ async function resolveAndReportEgressIp(opts?: {
 }
 
 const DEFAULT_POST_LOGIN_POLL_DELAY_SEC = 30;
-const FAST_SKIP_CALENDAR_UP_TO_INSTANCE = Math.max(
-  0,
-  parseInt(process.env.FAST_SKIP_CALENDAR_UP_TO_INSTANCE ?? "5", 10) || 5
-);
 const DEFAULT_POLL_INTERVAL_SEC = 60;
 
 type ProxyChainModule = {
@@ -234,6 +222,32 @@ async function relaunchChromeAfterCredentialSwapLogout(): Promise<void> {
   await browser.disconnectCdp();
   await killChromeOnPort(getRemoteDebuggingPort());
   await ensureChromeWithDevTools();
+}
+
+/**
+ * Cloudflare challenge recovery during polling:
+ * skip VFS logout (tab/cookies are poisoned), kill Chrome, wipe cookies/session storage,
+ * rotate proxy IP, respawn Chrome, login, resume polling.
+ */
+async function recoverFromCloudflareChallenge(
+  instanceId?: number,
+  context?: string
+): Promise<void> {
+  const ctx = context ?? "cloudflare-challenge";
+  clearSoftIpRotateFlag();
+  reporter.setPhase("recovering", `cloudflare — wipe session + rotate IP + restart (${ctx})`);
+  reporter.setAttention("cf_challenge", "Cloudflare challenge — recovering");
+  clearApplicantIpCache();
+  // Do not call logout — CF interstitial / poisoned session can hang logout.
+  await relaunchChromeAfterCredentialSwapLogout();
+  await performVfsLoginFromStore(instanceId);
+  await resolveAndReportEgressIp({ logAs: "recover", instanceId });
+  await settleOnDashboard({
+    instanceId,
+    waitMs: RESTART_DASHBOARD_WAIT_MS,
+    reason: ctx,
+  });
+  await browser.preparePollingAfterLogin({ skipDashboardNavigate: true });
 }
 
 /**
@@ -355,9 +369,7 @@ async function retireInstanceForAlreadyBooked(instanceId: number | undefined, re
     ? Math.floor(instanceId)
     : parseInt(process.env.BOT_INSTANCE_ID ?? "1", 10) || 1;
 
-  if (isFleetCalendarBookingEnabled()) {
-    try { retireFromFleet(id); } catch { /* ignore */ }
-  }
+  try { retireFromFleet(id); } catch { /* ignore */ }
 
   await telegram
     .alert("info", `Bot ${instanceId ?? "?"} ${label} — account archived and instance shutting down.`)
@@ -1399,6 +1411,20 @@ async function runPollLoop(
             await handleIpRateLimitRecovery(instanceId, "polling-page-block", "4292xx");
             continue;
           }
+          if (blockKind === "cloudflare") {
+            reporter.setAttention("cf_challenge", "Cloudflare challenge page — recovering");
+            await telegram
+              .alert(
+                "error",
+                `Bot ${instanceId ?? "?"} hit Cloudflare challenge page during polling (${urlAfterClaim || "unknown"}). Clearing cookies/session + rotating IP + restarting Chrome...`
+              )
+              .catch(() => { });
+            await recoverFromCloudflareChallenge(instanceId, "polling-cloudflare-page");
+            await telegram
+              .alert("info", `Bot ${instanceId ?? "?"} recovered from Cloudflare challenge page — polling resumed.`)
+              .catch(() => { });
+            continue;
+          }
           if (blockKind === "forbidden") {
                         reporter.setAttention("blocked", "block page after login — rotating IP + relogin");
             await telegram.alert("error", `Bot ${instanceId ?? "?"} hit a block page during polling (${urlAfterClaim || "unknown"}). Restarting browser + rotating IP + relogin...`).catch(() => { });
@@ -1430,10 +1456,10 @@ async function runPollLoop(
           await telegram
             .alert(
               "error",
-              `Bot ${instanceId ?? "?"} got Cloudflare challenge during polling. Clearing session + rotating IP + restarting Chrome...`
+              `Bot ${instanceId ?? "?"} got Cloudflare challenge on CheckIsSlotAvailable. Clearing cookies/session + rotating IP + restarting Chrome...`
             )
             .catch(() => { });
-          await performPollStyleRelogin(instanceId, "cloudflare-challenge-recovery");
+          await recoverFromCloudflareChallenge(instanceId, "cloudflare-challenge-polling");
           await telegram
             .alert("info", `Bot ${instanceId ?? "?"} recovered from Cloudflare challenge — polling resumed.`)
             .catch(() => { });
@@ -1553,25 +1579,6 @@ function getFixedTimingForInstance(instanceId?: number): { postLoginOffsetMs: nu
     postLoginOffsetMs: (id - 1) * stepMs,
     pollIntervalMs,
   };
-}
-
-function deriveCalendarDateFromPollingRaw(raw?: string): string | null {
-  if (!raw) return null;
-  const t = raw.trim();
-  if (!t) return null;
-  // Expected from polling: MM/DD/YYYY [time...]
-  const m = t.match(/^(\d{2})\/(\d{2})\/(\d{4})/);
-  if (m) {
-    const [, mm, dd, yyyy] = m;
-    return `${mm}/${dd}/${yyyy}`;
-  }
-  // Fallback: YYYY-MM-DD -> MM/DD/YYYY
-  const iso = t.match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (iso) {
-    const [, yyyy, mm, dd] = iso;
-    return `${mm}/${dd}/${yyyy}`;
-  }
-  return null;
 }
 
 /**
@@ -2012,11 +2019,9 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
       markApplicantsUrnUnlocked(
         typeof instanceId === "number" && instanceId >= 1 ? Math.floor(instanceId) : 1
       );
-      if (isFleetCalendarBookingEnabled()) {
-        registerFleetUrn(
-          typeof instanceId === "number" && instanceId >= 1 ? Math.floor(instanceId) : 1
-        );
-      }
+      registerFleetUrn(
+        typeof instanceId === "number" && instanceId >= 1 ? Math.floor(instanceId) : 1
+      );
       break applicants10673Recovery;
     } catch (err) {
       attemptIndex += 1;
@@ -2073,124 +2078,18 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
     }
   }
 
-  const fastSkipCalendar = (instanceId ?? 1) <= FAST_SKIP_CALENDAR_UP_TO_INSTANCE;
-  const scheduleConstraint = resolveScheduleDateConstraint(instanceId);
-  const hasScheduleFilter = scheduleConstraintIsActive(scheduleConstraint);
-  const calendarOpts = hasScheduleFilter ? { scheduleConstraint } : undefined;
-  // Use the live slot state; fall back to the snapshot taken when booking started in case
-  // a failing sibling instance deleted slot-state.json while this booking is in progress.
-  const liveState = isSlotFoundByAnyInstance();
-  const shared = liveState.found ? liveState : (slotStateCache ?? liveState);
-  const pollingHitAllowed = hasScheduleFilter ? isPollingSlotInConstraint(shared.slot, scheduleConstraint) : false;
-
-  let usedCalendarForTimeslot = false;
-
   try {
-  // Fleet calendar-polling booking system (setup form bookingSystemMode = "fleet").
-  // Legacy per-bot chain remains the default when mode is "legacy" or unset.
-  if (isFleetCalendarBookingEnabled()) {
     const fleetId =
       typeof instanceId === "number" && Number.isFinite(instanceId) && instanceId >= 1
         ? Math.floor(instanceId)
         : 1;
-        return await runFleetCalendarBooking({
+    return await runFleetCalendarBooking({
       browser,
       instanceId: fleetId,
       abortSeq: chainAbortSeq,
       isAbort: (seq) => pollingAbortSeq !== seq,
       waitForAbort: waitForPollingAbort,
     });
-  }
-
-  if (!hasScheduleFilter) {
-    if (fastSkipCalendar) {
-      const derived = deriveCalendarDateFromPollingRaw(shared.slot?.rawDate ?? shared.slot?.date);
-      if (derived) {
-        setSlotDate(derived);
-              } else {
-                await browser.postCalendarLiftApi();
-        usedCalendarForTimeslot = true;
-      }
-    } else {
-      await browser.postCalendarLiftApi();
-      usedCalendarForTimeslot = true;
-    }
-  } else if (pollingHitAllowed && fastSkipCalendar) {
-    const derived = deriveCalendarDateFromPollingRaw(shared.slot?.rawDate ?? shared.slot?.date);
-    if (derived) {
-      setSlotDate(derived);
-          } else {
-            await browser.postCalendarLiftApi(calendarOpts);
-      usedCalendarForTimeslot = true;
-    }
-  } else {
-    await browser.postCalendarLiftApi(calendarOpts);
-    usedCalendarForTimeslot = true;
-  }
-
-  try {
-    reporter.setBookingStep("timeslot");
-    await browser.postTimeslotLiftApi();
-  } catch (err) {
-    if (err instanceof VfsRateLimitedError) {
-      if (err.isAccountBlock) {
-        await stopForAccountRateLimit(instanceId, "timeslot", err.code);
-        return false;
-      }
-      return recoverBookingChainFromIpRateLimit(instanceId, "429-ip-timeslot", err, slotStateCache);
-    }
-    // Requested fallback: if fast mode skipped calendar and timeslot fails, call calendar then retry once.
-    if (fastSkipCalendar && !usedCalendarForTimeslot) {
-            await browser.postCalendarLiftApi(calendarOpts);
-      usedCalendarForTimeslot = true;
-      await browser.postTimeslotLiftApi();
-    } else {
-      throw err;
-    }
-  }
-
-  const isEgyptPortugal =
-    config.slotPayload.countryCode === "egy" && config.slotPayload.missionCode === "prt";
-  if (isEgyptPortugal) {
-    await browser.postMapVasLiftApi();
-  }
-
-  reporter.setBookingStep("fees");
-  await browser.postFeesLiftApi();
-
-  const MAX_SCHEDULE_RETRIES_FROM_CALENDAR = 3;
-  for (let schedAttempt = 1; schedAttempt <= MAX_SCHEDULE_RETRIES_FROM_CALENDAR; schedAttempt++) {
-    try {
-      reporter.setBookingStep("schedule");
-      await browser.postScheduleLiftApi();
-      break;
-    } catch (schedErr) {
-      if (schedErr instanceof AlreadyBookedError) {
-        await retireInstanceForAlreadyBooked(instanceId, schedErr.message);
-      }
-      if (schedErr instanceof VfsRateLimitedError) {
-        if (schedErr.isAccountBlock) {
-          await stopForAccountRateLimit(instanceId, "schedule", schedErr.code);
-          return false;
-        }
-        return recoverBookingChainFromIpRateLimit(instanceId, "429-ip-schedule", schedErr, slotStateCache);
-      }
-      if (schedAttempt === MAX_SCHEDULE_RETRIES_FROM_CALENDAR) throw schedErr;
-            await telegram
-        .alert("error", `Schedule failed (attempt ${schedAttempt}/${MAX_SCHEDULE_RETRIES_FROM_CALENDAR}), retrying from calendar`)
-        .catch(() => { });
-      await browser.postCalendarLiftApi(calendarOpts);
-      await browser.postTimeslotLiftApi();
-      await browser.postFeesLiftApi();
-    }
-  }
-
-  if (!getAllocationId()?.trim()) {
-    throw new Error(
-      "Booking chain incomplete: schedule did not run (missing allocationId — save applicants or earlier APIs may have failed)"
-    );
-  }
-  return true;
   } catch (err) {
     if (err instanceof AlreadyBookedError) {
       await retireInstanceForAlreadyBooked(instanceId, err.message);
@@ -2509,19 +2408,6 @@ async function runOneBotCycleCore(meta: SubmitMeta): Promise<void> {
           }
           continue;
         }
-        const noDates =
-          err instanceof NoDatesInScheduleRangeError ||
-          (err instanceof Error && (err as Error & { code?: string }).code === "NO_DATES_IN_RANGE");
-        if (noDates) {
-          const range = resolveScheduleDateConstraint(instanceId);
-          const startDate = range.kind === "range" ? (range.start ?? "…") : "…";
-          const endDate = range.kind === "range" ? (range.end ?? "…") : "…";
-          const msg = `no slot from ${startDate} to ${endDate}`;
-                    await telegram.alert("no_slot_found", msg).catch(() => { });
-          clearSlotCenterOverride();
-          clearSlotDate();
-          break;
-        }
 
         // Any other booking error: log, notify, clear local state, restart polling instead of stopping.
                 await telegram
@@ -2562,41 +2448,6 @@ async function start(): Promise<void> {
       let ipcChain: Promise<void> = Promise.resolve();
       process.on("message", (msg: any) => {
         if (msg?.instanceId !== myInstanceId) return;
-
-        if (msg?.type === "test-applicants") {
-          // Stop slot polling immediately (same knobs as force-book), then run the test on the chain.
-          instanceBookingActive = false;
-          clearSlotState();
-          clearSlotCenterOverride();
-          clearSlotDate();
-          requestPollingAbort("test-applicants", myInstanceId);
-                    ipcChain = ipcChain.then(async () => {
-            syncInstanceStoresFromDisk();
-            setCurrentInstanceId(myInstanceId);
-            try {
-              const result = await browser.testSaveApplicantsViaLiftApi();
-              const preview =
-                result.body.length > 12_000 ? result.body.slice(0, 12_000) + "…" : result.body;
-              process.send?.({
-                type: "test-applicants-result",
-                requestId: msg.requestId,
-                instanceId: myInstanceId,
-                ok: true,
-                status: result.status,
-                bodyPreview: preview,
-              });
-            } catch (err) {
-              process.send?.({
-                type: "test-applicants-result",
-                requestId: msg.requestId,
-                instanceId: myInstanceId,
-                ok: false,
-                error: err instanceof Error ? err.message : String(err),
-              });
-            }
-          });
-          return;
-        }
 
         if (msg?.type === "force-book") {
           if (instanceStopped) {
@@ -2827,25 +2678,6 @@ async function start(): Promise<void> {
         }
       });
       return { ok: true, queued: 1 };
-    },
-    onTestApplicantsApi: async () => {
-      instanceBookingActive = false;
-      clearSlotState();
-      clearSlotCenterOverride();
-      clearSlotDate();
-      requestPollingAbort("test-applicants");
-            reloadApplicantDetailsFromDisk();
-      const instanceId = parseInt(process.env.BOT_INSTANCE_ID ?? "1", 10);
-      setCurrentInstanceId(instanceId);
-      try {
-        const res = await browser.testSaveApplicantsViaLiftApi();
-        const preview = res.body.length > 12_000 ? res.body.slice(0, 12_000) + "…" : res.body;
-        return { results: [{ instanceId, ok: true, status: res.status, bodyPreview: preview }] };
-      } catch (err) {
-        return {
-          results: [{ instanceId, ok: false, error: err instanceof Error ? err.message : String(err) }],
-        };
-      }
     },
   });
 }
