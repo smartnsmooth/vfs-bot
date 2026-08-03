@@ -369,22 +369,34 @@ export class BrowserService implements BrowserServiceCore {
     }
     await this.ensureBrowser();
     const telegram = new TelegramService();
-    const ALERT_INTERVAL_MS = 60_000;
-        await telegram
-      .alert("info", "Waiting for clientsource — open or refresh VFS dashboard in Chrome so the bot can capture it.")
-      .catch(() => { });
 
-    const alertTimer = setInterval(() => {
-      if (getCapturedClientSource()?.trim()) return;
-            telegram
-        .alert("info", "Still waiting for clientsource — navigate VFS dashboard in Chrome to trigger a lift-api request.")
-        .catch(() => { });
-    }, ALERT_INTERVAL_MS);
+    // Try to trigger a lift-api request by navigating/refreshing the dashboard
+    // so the clientsource sniffer can capture the header automatically.
+    try {
+      const page = await this.getVfsPage();
+      const url = page.url();
+      if (/\/(dashboard|applications|home)\b/i.test(url)) {
+        await page.reload({ waitUntil: "domcontentloaded", timeout: 15_000 }).catch(() => { });
+        await page.waitForTimeout(3_000);
+      }
+    } catch {
+      /* best-effort */
+    }
+
+    if (getCapturedClientSource()?.trim()) return;
+
+    const MAX_WAIT_MS = 90_000;
+    const ac = new AbortController();
+    const timeout = setTimeout(() => ac.abort(), MAX_WAIT_MS);
 
     try {
-      await waitForClientSourceCapture();
+      await waitForClientSourceCapture(ac.signal);
+    } catch {
+      await telegram
+        .alert("info", "clientsource not captured within 90s — proceeding to poll without it.")
+        .catch(() => { });
     } finally {
-      clearInterval(alertTimer);
+      clearTimeout(timeout);
     }
   }
 

@@ -69,6 +69,21 @@ function bakeReleaseMarkers(distDir) {
   console.log(`Release bake: packagedFlag files=${packagedHits}`);
 }
 
+/**
+ * Files that pass functions into Playwright `page.evaluate(...)`.
+ * javascript-obfuscator (stringArray / controlFlowFlattening) rewrites those
+ * function bodies to call Node-side helpers — they throw in the browser and
+ * login never reaches Sign In. Keep these readable.
+ */
+const PLAYWRIGHT_EVAL_SAFE_FILES = new Set([
+  "browser.login.js",
+  "browser.service.js",
+  "browser.booking.js",
+  "browser.errors.js",
+  "browser.core.js",
+  "turnstile.click.js",
+]);
+
 function obfuscateDist(distDir) {
   let JavaScriptObfuscator;
   try {
@@ -80,13 +95,20 @@ function obfuscateDist(distDir) {
   }
 
   const jsFiles = walkFiles(distDir, ".js");
+  let skipped = 0;
   console.log(`Obfuscating ${jsFiles.length} JS file(s) in release/dist ...`);
   for (const file of jsFiles) {
+    const base = path.basename(file);
+    if (PLAYWRIGHT_EVAL_SAFE_FILES.has(base)) {
+      skipped += 1;
+      continue;
+    }
     const source = fs.readFileSync(file, "utf8");
     const result = JavaScriptObfuscator.obfuscate(source, {
       compact: true,
-      controlFlowFlattening: true,
-      controlFlowFlatteningThreshold: 0.75,
+      // Keep evaluate-free code safer too: stringArray + CFF break any
+      // accidental page.evaluate(fn) serialization in other modules.
+      controlFlowFlattening: false,
       deadCodeInjection: false,
       debugProtection: false,
       disableConsoleOutput: false,
@@ -95,14 +117,16 @@ function obfuscateDist(distDir) {
       selfDefending: false,
       stringArray: true,
       stringArrayEncoding: ["base64"],
-      stringArrayThreshold: 0.8,
-      splitStrings: true,
-      splitStringsChunkLength: 8,
-      transformObjectKeys: true,
+      stringArrayThreshold: 0.75,
+      splitStrings: false,
+      transformObjectKeys: false,
       unicodeEscapeSequence: false,
       target: "node",
     });
     fs.writeFileSync(file, result.getObfuscatedCode(), "utf8");
+  }
+  if (skipped > 0) {
+    console.log(`Skipped obfuscation for ${skipped} Playwright evaluate-safe file(s).`);
   }
 }
 

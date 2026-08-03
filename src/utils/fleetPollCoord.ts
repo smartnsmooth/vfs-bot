@@ -142,8 +142,11 @@ function spinWait(ms: number): void {
 }
 
 /** How long after a slot is due before another bot may gap-fill. */
-function turnGraceMs(stepMs: number): number {
-  return Math.min(1500, Math.max(400, Math.floor(stepMs * 0.25)));
+function turnGraceMs(stepMs: number, firstPoll = false): number {
+  const base = Math.min(1500, Math.max(400, Math.floor(stepMs * 0.25)));
+  // First fleet poll: give instance 1 extra time to enter the ring before gap-fill.
+  if (firstPoll) return Math.max(base, 8_000);
+  return base;
 }
 
 function pollerRing(state: FleetPollCoordState): number[] {
@@ -162,10 +165,14 @@ function advanceNextPoller(ring: number[], currentNext: number): number {
 }
 
 function resolveExpected(state: FleetPollCoordState): number {
+  const preferred = Math.max(1, state.nextPollerId || 1);
   const ring = pollerRing(state);
-  if (ring.length === 0) return Math.max(1, state.nextPollerId || 1);
-  if (ring.includes(state.nextPollerId)) return state.nextPollerId;
-  return advanceNextPoller(ring, state.nextPollerId || 0);
+  if (ring.length === 0) return preferred;
+  // First fleet poll: keep the pointer on nextPollerId (defaults to 1) even if that
+  // bot has not registered yet — others only gap-fill after the longer first-turn grace.
+  if (state.lastPollAt <= 0) return preferred;
+  if (ring.includes(preferred)) return preferred;
+  return advanceNextPoller(ring, preferred);
 }
 
 export function clearFleetPollCoord(): void {
@@ -186,7 +193,8 @@ export function ensureFleetPollEarliest(earliestPollAtMs: number): void {
   const t = Math.max(0, Math.floor(earliestPollAtMs));
   if (t <= 0) return;
 
-  for (let attempt = 0; attempt < 80; attempt++) {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    if (attempt > 0 && attempt % 10 === 0) maybeClearStaleLock(5_000);
     const result = withExclusiveLock(() => {
       const s = readState();
       if (s.earliestPollAt > 0) return false;
@@ -197,27 +205,27 @@ export function ensureFleetPollEarliest(earliestPollAtMs: number): void {
       return true;
     });
     if (result.ok) return;
-    spinWait(5 + attempt);
+    spinWait(10 + Math.floor(Math.random() * 20) + attempt);
   }
 }
 
 /** Mark this instance as an active fleet poller (call when entering the poll loop). */
 export function registerFleetPoller(instanceId: number): void {
   const id = Math.max(1, Math.floor(instanceId));
-  for (let attempt = 0; attempt < 80; attempt++) {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    // Clear stale locks aggressively on every retry (38 processes hammering the lock).
+    if (attempt > 0 && attempt % 10 === 0) maybeClearStaleLock(5_000);
     const result = withExclusiveLock(() => {
       const s = readState();
       if (s.activePollers.includes(id)) return false;
       s.activePollers = safeIdArray([...s.activePollers, id]);
-      if (!s.activePollers.includes(s.nextPollerId)) {
-        s.nextPollerId = s.activePollers[0] ?? 1;
-      }
+      if (!s.nextPollerId || s.nextPollerId < 1) s.nextPollerId = 1;
       s.revision += 1;
       writeState(s);
       return true;
     });
     if (result.ok) return;
-    spinWait(5 + attempt);
+    spinWait(10 + Math.floor(Math.random() * 20) + attempt);
   }
 }
 
@@ -259,8 +267,9 @@ export async function waitAndClaimFleetPollSlot(opts: {
 
   for (;;) {
     const stepMs = getFleetPollStepMs();
-    const grace = turnGraceMs(stepMs);
     const state = readState();
+    const firstPoll = state.lastPollAt <= 0;
+    const grace = turnGraceMs(stepMs, firstPoll);
     const now = Date.now();
     const dueAt = nextClaimAtMs(state, stepMs, now);
     const expected = resolveExpected(state);
@@ -279,7 +288,8 @@ export async function waitAndClaimFleetPollSlot(opts: {
     const result = withExclusiveLock(() => {
       const s = readState();
       const step = getFleetPollStepMs();
-      const g = turnGraceMs(step);
+      const first = s.lastPollAt <= 0;
+      const g = turnGraceMs(step, first);
       const due = nextClaimAtMs(s, step, Date.now());
       const t = Date.now();
       if (t < due) return false;
@@ -290,7 +300,10 @@ export async function waitAndClaimFleetPollSlot(opts: {
       const ring = pollerRing(s);
       s.lastPollAt = t;
       s.lastPollerId = id;
-      s.nextPollerId = advanceNextPoller(ring, exp);
+      // After a successful claim, advance within the live ring. If the expected
+      // bot (e.g. 1) was still missing and we gap-filled, still advance past exp
+      // so the next turn continues in order once the ring fills out.
+      s.nextPollerId = advanceNextPoller(ring.length > 0 ? ring : [exp], exp);
       s.revision += 1;
       writeState(s);
       return true;
@@ -302,7 +315,7 @@ export async function waitAndClaimFleetPollSlot(opts: {
     const after = readState();
     const nextDue = nextClaimAtMs(after, getFleetPollStepMs(), Date.now());
     const nextExp = resolveExpected(after);
-    const nextGrace = turnGraceMs(getFleetPollStepMs());
+    const nextGrace = turnGraceMs(getFleetPollStepMs(), after.lastPollAt <= 0);
     const nextMine = id === nextExp ? nextDue : nextDue + nextGrace;
     if (Date.now() < nextMine) {
       const woke = await opts.waitUntil(Math.min(nextMine, Date.now() + 250));

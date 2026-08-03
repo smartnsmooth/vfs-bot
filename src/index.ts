@@ -1474,8 +1474,18 @@ async function runPollLoop(
         }
 
         if (unauthorized) {
-                    await telegram.alert("error", "401 Unauthorized — session expired. Polling stopped. Please re-login.").catch(() => { });
-          return false;
+          reporter.setAttention("login_failed", "401 Unauthorized — recovering session");
+          await telegram
+            .alert(
+              "error",
+              `Bot ${instanceId ?? "?"} got 401 Unauthorized during polling (VFS JWT/session expired or invalidated). Restarting browser + rotating IP + relogin...`
+            )
+            .catch(() => { });
+          await performPollStyleRelogin(instanceId, "401-unauthorized-recovery");
+          await telegram
+            .alert("info", `Bot ${instanceId ?? "?"} recovered from 401 — polling resumed.`)
+            .catch(() => { });
+          continue;
         }
 
         if (accountBlocked) {
@@ -2319,6 +2329,7 @@ async function runOneBotCycleCore(meta: SubmitMeta): Promise<void> {
     }
   }
 
+  reporter.setPhase("polling", "capturing clientsource…");
   await browser.preparePollingAfterLogin({ skipDashboardNavigate });
   // preparePolling used to call page.bringToFront() via getVfsPage — re-minimize
   // in case anything else restored the window during settle → prepare.

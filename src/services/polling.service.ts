@@ -12,7 +12,7 @@ export interface PollResult {
   centerNumber?: 1 | 2;  // Which center found the slot
   centerCode?: string;
   visaCategoryCode?: string;
-  unauthorized?: boolean;  // true when API returns 401 — polling must stop
+  unauthorized?: boolean;  // true when API returns 401 — session expired; caller should relogin + resume
   /** @deprecated Prefer accountBlocked / rateLimitedIp */
   rateLimited?: boolean;
   /** 4290XX — account / User ID restricted; stop the bot */
