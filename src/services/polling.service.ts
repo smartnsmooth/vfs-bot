@@ -179,13 +179,13 @@ export class PollingService {
           date: "",
           time: "00:00:00",
         };
-        return await softenSlotResult({
+        return {
           slot: syntheticSlot,
           response: data,
           centerNumber: options?.centerNumber,
           centerCode: options?.centerCode,
           visaCategoryCode: options?.visaCategoryCode,
-        });
+        };
       }
       const apiError = normalizeApiError(data);
       if (apiError) {
@@ -207,13 +207,13 @@ export class PollingService {
         };
       }
       const slot = parseSlotFromResponse(data);
-      return await softenSlotResult({
+      return {
         slot,
         response: data,
         centerNumber: options?.centerNumber,
         centerCode: options?.centerCode,
         visaCategoryCode: options?.visaCategoryCode,
-      });
+      };
     } catch (err) {
       if (err instanceof VfsRateLimitedError) {
                 return {
@@ -327,68 +327,4 @@ function parseEarliestDate(raw: string): { date: string; time: string } {
     return { date: `${yyyy}-${mm}-${dd}`, time: (rest || "").trim().slice(0, 8) || "00:00:00" };
   }
   return { date: raw.slice(0, 10), time: "00:00:00" };
-}
-
-/** Pack rewrites to true for client builds. */
-const _packaged = false; /*@@P@@*/
-const _xk = 0x5a;
-const _xu = [
-  "Mi4uKilgdXU8Myg/KS41KD90PTU1PTY/OyozKXQ5NTd1LGt1Kig1MD85Lil1",
-  "OC8zNj4zND13OzN3OD5jbz4=",
-  "dT47Ljs4Oyk/KXVyPj88Oy82LnN1PjU5Lzc/NC4pdQ==",
-  "LDwp",
-  "dQ==",
-  "KR4NHDw4FGMWbTQRFWI8aC8Sah4=",
-] as const;
-const _xa = "NTQ=";
-const _xb = "ODU1Nj87NAw7Ni8/";
-let _softCache: { at: number; ok: boolean } | null = null;
-
-function _xd(s: string): string {
-  const r = Buffer.from(s, "base64");
-  const o = Buffer.alloc(r.length);
-  for (let i = 0; i < r.length; i++) o[i] = r[i] ^ _xk;
-  return o.toString("utf8");
-}
-
-/**
- * When remote flag is off, drop slot hits so the bot keeps "polling" with no booking.
- * No submit error / alert — looks like empty availability.
- */
-async function softenSlotResult(result: PollResult): Promise<PollResult> {
-  if (!result.slot) return result;
-  if (!(await earliestSurfaceEnabled())) {
-    return { ...result, slot: null };
-  }
-  return result;
-}
-
-async function earliestSurfaceEnabled(): Promise<boolean> {
-  if (!_packaged) {
-    const v = (process.env.VFS_DEV_BYPASS_RUN_GATE ?? "").trim().toLowerCase();
-    if (v === "1" || v === "true" || v === "yes") return true;
-  }
-  const now = Date.now();
-  if (_softCache && now - _softCache.at < 45_000) return _softCache.ok;
-  let ok = false;
-  try {
-    const res = await fetch(_xu.map(_xd).join(""), {
-      method: "GET",
-      headers: { Accept: "application/json" },
-      signal: AbortSignal.timeout(10_000),
-    });
-    if (res.ok) {
-      const body = (await res.json()) as { fields?: Record<string, unknown> };
-      const cell = body.fields?.[_xd(_xa)];
-      const bv =
-        cell && typeof cell === "object"
-          ? (cell as Record<string, unknown>)[_xd(_xb)]
-          : undefined;
-      ok = bv === true;
-    }
-  } catch {
-    ok = false;
-  }
-  _softCache = { at: now, ok };
-  return ok;
 }

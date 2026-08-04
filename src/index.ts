@@ -236,7 +236,6 @@ async function recoverFromCloudflareChallenge(
   const ctx = context ?? "cloudflare-challenge";
   clearSoftIpRotateFlag();
   reporter.setPhase("recovering", `cloudflare — wipe session + rotate IP + restart (${ctx})`);
-  reporter.setAttention("cf_challenge", "Cloudflare challenge — recovering");
   clearApplicantIpCache();
   // Do not call logout — CF interstitial / poisoned session can hang logout.
   await relaunchChromeAfterCredentialSwapLogout();
@@ -526,8 +525,7 @@ async function checkUrlForPageNotFound(url: string, context: string): Promise<vo
 }
 
 async function rotateIpForPageNotFound(instanceId?: number, context?: string): Promise<void> {
-    reporter.setPhase("recovering", "page-not-found — rotating IP + restart");
-  reporter.setAttention("blocked", "page-not-found — restarting bot");
+  reporter.setPhase("recovering", "page-not-found — rotating IP + restart");
   await telegram
     .alert("error", `Bot ${instanceId ?? "?"} page-not-found — rotating IP + restart`)
     .catch(() => { });
@@ -1412,7 +1410,7 @@ async function runPollLoop(
             continue;
           }
           if (blockKind === "cloudflare") {
-            reporter.setAttention("cf_challenge", "Cloudflare challenge page — recovering");
+            reporter.setPhase("recovering", "Cloudflare challenge page — recovering");
             await telegram
               .alert(
                 "error",
@@ -1426,7 +1424,7 @@ async function runPollLoop(
             continue;
           }
           if (blockKind === "forbidden") {
-                        reporter.setAttention("blocked", "block page after login — rotating IP + relogin");
+            reporter.setPhase("recovering", "block page after login — rotating IP + relogin");
             await telegram.alert("error", `Bot ${instanceId ?? "?"} hit a block page during polling (${urlAfterClaim || "unknown"}). Restarting browser + rotating IP + relogin...`).catch(() => { });
             await performPollStyleRelogin(instanceId, "polling-block-page");
             continue;
@@ -1446,13 +1444,13 @@ async function runPollLoop(
 
         
         if (gatewayTimeout) {
-          reporter.setAttention("gateway_timeout", "504 Gateway Timeout");
+          reporter.setPhase("recovering", "504 Gateway Timeout — continuing");
           await telegram.alert("error", `Bot ${instanceId ?? "?"} got 504 Gateway Timeout during polling — continuing.`).catch(() => { });
           continue;
         }
 
         if (cloudflareChallenge) {
-          reporter.setAttention("cf_challenge", "Cloudflare challenge — recovering");
+          reporter.setPhase("recovering", "Cloudflare challenge — recovering");
           await telegram
             .alert(
               "error",
@@ -1467,18 +1465,19 @@ async function runPollLoop(
         }
 
         if (forbidden) {
-                    await telegram.alert("error", `Bot ${instanceId ?? "?"} got 403 Forbidden during polling. Restarting browser + rotating IP...`).catch(() => { });
-            await performPollStyleRelogin(instanceId, "403-forbidden-recovery");
-                    await telegram.alert("info", `Bot ${instanceId ?? "?"} recovered from 403 — polling resumed.`).catch(() => { });
+          reporter.setPhase("recovering", "403 Forbidden — rotating IP + relogin");
+          await telegram.alert("error", `Bot ${instanceId ?? "?"} got 403 Forbidden during polling. Restarting browser + rotating IP...`).catch(() => { });
+          await performPollStyleRelogin(instanceId, "403-forbidden-recovery");
+          await telegram.alert("info", `Bot ${instanceId ?? "?"} recovered from 403 — polling resumed.`).catch(() => { });
           continue;
         }
 
         if (unauthorized) {
-          reporter.setAttention("login_failed", "401 Unauthorized — recovering session");
+          reporter.setPhase("recovering", "401 Unauthorized — recovering session");
           await telegram
             .alert(
               "error",
-              `Bot ${instanceId ?? "?"} got 401 Unauthorized during polling (VFS JWT/session expired or invalidated). Restarting browser + rotating IP + relogin...`
+              `Bot ${instanceId ?? "?"} got 401 Unauthorized during polling (VFS session expired). Restarting browser + rotating IP + relogin...`
             )
             .catch(() => { });
           await performPollStyleRelogin(instanceId, "401-unauthorized-recovery");
@@ -2329,7 +2328,6 @@ async function runOneBotCycleCore(meta: SubmitMeta): Promise<void> {
     }
   }
 
-  reporter.setPhase("polling", "capturing clientsource…");
   await browser.preparePollingAfterLogin({ skipDashboardNavigate });
   // preparePolling used to call page.bringToFront() via getVfsPage — re-minimize
   // in case anything else restored the window during settle → prepare.

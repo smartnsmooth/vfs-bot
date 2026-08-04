@@ -37,7 +37,7 @@ function makeBlockCheck(page: Page): () => Promise<void> {
             throwIfBlockPage(page);
         }
         catch (e) {
-            reporter.setAttention("blocked", "block page (redirect) during login — rotating IP");
+            reporter.setPhase("recovering", "block page (redirect) during login — rotating IP");
             throw e;
         }
         // Body content — throttled (innerText is heavier).
@@ -56,12 +56,12 @@ function makeBlockCheck(page: Page): () => Promise<void> {
         if (/Access Restricted Due to Unusual Activity/i.test(t) || /403201/.test(t) ||
             /Permission Issues/i.test(t) || /403101/.test(t) ||
             /Session Expired or Invalid/i.test(t)) {
-            reporter.setAttention("blocked", "block page during login — rotating IP");
+            reporter.setPhase("recovering", "block page during login — rotating IP");
             throw new VfsForbiddenError("Block page detected during login (403201/403101/session-expired)");
         }
         const rate = classifyVfs429FromPageText(t);
         if (rate) {
-            reporter.setAttention("rate_limit", `rate-limit ${rate.code} during login`);
+            reporter.setPhase("recovering", `rate-limit ${rate.code} during login`);
             throwVfsRateLimited(rate.kind, rate.code, "block page during login");
         }
     };
@@ -157,12 +157,6 @@ async function dismissCookieConsent(page: Page, quickCheck: boolean = false): Pr
     }
 }
 // ── Credential filling ──────────────────────────────────────────────────
-/**
- * Fill login email/password without thrashing.
- * Previous infinite `.fill()` retry loop never reached Turnstile; the human-type
- * rewrite was too slow / fragile and often blocked Sign In + OTP. Use a few
- * targeted fills and verify the same locators.
- */
 async function fillLoginCredentials(page: Page, username: string, password: string, opts: {
     usernameSelectors: string;
     passwordSelectors: string;
@@ -171,59 +165,44 @@ async function fillLoginCredentials(page: Page, username: string, password: stri
     const deadline = Date.now() + opts.timeoutMs;
     const emailLocator = page.locator(opts.usernameSelectors).first();
     const passwordLocator = page.locator(opts.passwordSelectors).first();
-    let lastErr: unknown;
-    for (let attempt = 0; attempt < 3 && Date.now() < deadline; attempt++) {
+    while (Date.now() < deadline) {
         try {
-            await emailLocator.waitFor({ state: "visible", timeout: 8000 });
-            await emailLocator.click({ timeout: 4000 }).catch(() => { });
+            await emailLocator.waitFor({ state: "visible", timeout: 5000 });
             await emailLocator.fill(username, { timeout: 5000 });
-            await page.waitForTimeout(200);
-            await passwordLocator.waitFor({ state: "visible", timeout: 8000 });
-            await passwordLocator.click({ timeout: 4000 }).catch(() => { });
+            await page.waitForTimeout(150);
+            await passwordLocator.waitFor({ state: "visible", timeout: 5000 });
             await passwordLocator.fill(password, { timeout: 5000 });
+            const [actualEmail, actualPw] = await page
+                .evaluate((selectors) => {
+                const emailEl = document.querySelector<HTMLInputElement>('input[formControlName="username"]') ??
+                    document.querySelector<HTMLInputElement>('input[formControlName="email"]') ??
+                    document.querySelector<HTMLInputElement>('#email') ??
+                    document.querySelector<HTMLInputElement>('input[type="email"]') ??
+                    document.querySelector<HTMLInputElement>(selectors.username);
+                const pwEl = document.querySelector<HTMLInputElement>('input[formControlName="password"]') ??
+                    document.querySelector<HTMLInputElement>('input[name="password"]') ??
+                    document.querySelector<HTMLInputElement>('input[type="password"]:not([formcontrolname="otp"])') ??
+                    document.querySelector<HTMLInputElement>(selectors.password);
+                return [emailEl?.value?.trim() ?? "", pwEl?.value?.trim() ?? ""] as [
+                    string,
+                    string
+                ];
+            }, { username: opts.usernameSelectors, password: opts.passwordSelectors })
+                .catch(() => ["", ""] as [
+                string,
+                string
+            ]);
+            if (!actualEmail || !actualPw) {
+                await page.waitForTimeout(300);
+                continue;
+            }
+            return;
+        }
+        catch {
             await page.waitForTimeout(300);
-            // Verify the same locators we filled (not a separate querySelector chain).
-            const actualEmail = ((await emailLocator.inputValue().catch(() => "")) || "").trim();
-            const actualPw = ((await passwordLocator.inputValue().catch(() => "")) || "").trim();
-            if (actualEmail && actualPw)
-                return;
-            lastErr = new Error(`credentials did not stick (email=${!!actualEmail}, pw=${!!actualPw})`);
-            await page.waitForTimeout(400);
-        }
-        catch (e) {
-            lastErr = e;
-            await page.waitForTimeout(400);
         }
     }
-    throw new Error(`Failed to fill login credentials: ${lastErr instanceof Error ? lastErr.message : String(lastErr ?? "unknown")}`);
-}
-
-/** Read visible login fields; fall back to any matching input (Angular may hide duplicates). */
-async function readLoginFieldValues(page: Page, opts?: {
-    usernameSelectors?: string;
-    passwordSelectors?: string;
-}): Promise<[string, string]> {
-    if (opts?.usernameSelectors && opts?.passwordSelectors) {
-        const email = ((await page.locator(opts.usernameSelectors).first().inputValue().catch(() => "")) || "").trim();
-        const pw = ((await page.locator(opts.passwordSelectors).first().inputValue().catch(() => "")) || "").trim();
-        if (email && pw)
-            return [email, pw];
-    }
-    return page
-        .evaluate(() => {
-        const emailEl = document.querySelector<HTMLInputElement>('input[formControlName="username"]') ??
-            document.querySelector<HTMLInputElement>('input[formcontrolname="username"]') ??
-            document.querySelector<HTMLInputElement>('input[formControlName="email"]') ??
-            document.querySelector<HTMLInputElement>('input[formcontrolname="email"]') ??
-            document.querySelector<HTMLInputElement>('#email') ??
-            document.querySelector<HTMLInputElement>('input[type="email"]');
-        const pwEl = document.querySelector<HTMLInputElement>('input[formControlName="password"]') ??
-            document.querySelector<HTMLInputElement>('input[formcontrolname="password"]') ??
-            document.querySelector<HTMLInputElement>('input[name="password"]') ??
-            document.querySelector<HTMLInputElement>('input[type="password"]:not([formcontrolname="otp"])');
-        return [emailEl?.value?.trim() ?? "", pwEl?.value?.trim() ?? ""] as [string, string];
-    })
-        .catch(() => ["", ""] as [string, string]);
+    throw new Error("Failed to fill login credentials");
 }
 // ── Submit button resolution ────────────────────────────────────────────
 function dashboardUrlRegex(): RegExp {
@@ -459,37 +438,21 @@ async function submitLoginImmediately(page: Page, submitBtn: import("playwright"
         passwordSelectors: string;
     };
 }): Promise<void> {
-    const readCfTurnstileToken = (): Promise<string> => page
+    const existingToken = await page
         .evaluate(() => {
-        const els = [
-            ...document.querySelectorAll<HTMLTextAreaElement>('textarea[name="cf-turnstile-response"]'),
-            ...document.querySelectorAll<HTMLInputElement>('input[name="cf-turnstile-response"]'),
-        ];
-        for (const el of els) {
-            const v = el.value?.trim();
-            if (v && v.length > 20)
-                return v;
-        }
-        return "";
+        const el = document.querySelector<HTMLTextAreaElement>('textarea[name="cf-turnstile-response"]') ??
+            document.querySelector<HTMLInputElement>('input[name="cf-turnstile-response"]');
+        return (el as HTMLInputElement | null)?.value?.trim() ?? "";
     })
         .catch(() => "");
-
-    // Blur active field so Angular settles before Turnstile (same as register-bot).
-    await page.evaluate(() => {
-        const a = document.activeElement as HTMLElement | null;
-        if (a && typeof a.blur === "function")
-            a.blur();
-    }).catch(() => { });
-    await page.waitForTimeout(600);
-
-    let token = await readCfTurnstileToken();
-    if (token) {
+    if (existingToken) {
         reporter.captchaResult("passed");
     }
     else {
         reporter.setPhase("turnstile", "solving captcha (auto)");
         reporter.captchaWaiting(null);
         const blockCheck = makeBlockCheck(page);
+        let token = "";
         try {
             token = await clickTurnstile(page, { check: blockCheck });
         }
@@ -502,72 +465,131 @@ async function submitLoginImmediately(page: Page, submitBtn: import("playwright"
         }
         else {
             const manual = await waitForManualTurnstile(page, { check: blockCheck });
-            if (manual) {
-                token = manual;
-                reporter.captchaResult("passed");
-            }
-            else {
+            if (!manual) {
                 reporter.captchaResult("failed");
             }
         }
     }
-
-    // Ensure credentials still present after captcha (Angular may clear them).
-    let [preSubmitEmail, preSubmitPw] = await readLoginFieldValues(page, opts.loginRefill);
-    if ((!preSubmitEmail || !preSubmitPw) && opts.loginRefill) {
-        const turnstileTokenBeforeRefill = token || (await readCfTurnstileToken());
-        await fillLoginCredentials(page, opts.loginRefill.username, opts.loginRefill.password, {
-            usernameSelectors: opts.loginRefill.usernameSelectors,
-            passwordSelectors: opts.loginRefill.passwordSelectors,
-            timeoutMs: 10000,
-        });
-        [preSubmitEmail, preSubmitPw] = await readLoginFieldValues(page, opts.loginRefill);
+    try {
+        await submitBtn.waitFor({ state: "visible", timeout: 10000 });
+        const deadline = Date.now() + 8000;
+        while (Date.now() < deadline) {
+            const enabled = await submitBtn.isEnabled().catch(() => false);
+            if (enabled) {
+                break;
+            }
+            await page.waitForTimeout(200);
+        }
+    }
+    catch {
+    }
+    const readCfTurnstileToken = (): Promise<string> => page
+        .evaluate(() => {
+        const els = [
+            ...document.querySelectorAll<HTMLTextAreaElement>('textarea[name="cf-turnstile-response"]'),
+            ...document.querySelectorAll<HTMLInputElement>('input[name="cf-turnstile-response"]'),
+        ];
+        for (const el of els) {
+            const v = el.value?.trim();
+            if (v)
+                return v;
+        }
+        return "";
+    })
+        .catch(() => "");
+    const turnstileTokenBeforeRefill = await readCfTurnstileToken();
+    if (opts.loginRefill) {
         const turnstileAfterRefill = await readCfTurnstileToken();
         if (turnstileTokenBeforeRefill.length > 80 &&
             turnstileAfterRefill.length < turnstileTokenBeforeRefill.length * 0.5) {
-            await page.evaluate(injectTurnstileTokenInPage, turnstileTokenBeforeRefill).catch(() => { });
-            token = turnstileTokenBeforeRefill;
+            await page.evaluate(injectTurnstileTokenInPage, turnstileTokenBeforeRefill);
+        }
+    }
+    const readLoginFields = (): Promise<[
+        string,
+        string
+    ]> => page
+        .evaluate(() => {
+        const emailEl = document.querySelector<HTMLInputElement>('input[formControlName="username"]') ??
+            document.querySelector<HTMLInputElement>('input[formControlName="email"]') ??
+            document.querySelector<HTMLInputElement>('#email') ??
+            document.querySelector<HTMLInputElement>('input[type="email"]');
+        const pwEl = document.querySelector<HTMLInputElement>('input[formControlName="password"]') ??
+            document.querySelector<HTMLInputElement>('input[name="password"]') ??
+            document.querySelector<HTMLInputElement>('input[type="password"]:not([formcontrolname="otp"])');
+        return [emailEl?.value?.trim() ?? "", pwEl?.value?.trim() ?? ""] as [
+            string,
+            string
+        ];
+    })
+        .catch(() => ["", ""] as [
+        string,
+        string
+    ]);
+    let [preSubmitEmail, preSubmitPw] = await readLoginFields();
+    if ((!preSubmitEmail || !preSubmitPw) && opts.loginRefill) {
+        for (let guardRetry = 0; guardRetry < 3; guardRetry++) {
+            await fillLoginCredentials(page, opts.loginRefill.username, opts.loginRefill.password, {
+                usernameSelectors: opts.loginRefill.usernameSelectors,
+                passwordSelectors: opts.loginRefill.passwordSelectors,
+                timeoutMs: 10000,
+            });
+            [preSubmitEmail, preSubmitPw] = await readLoginFields();
+            if (preSubmitEmail && preSubmitPw)
+                break;
+            await page.waitForTimeout(500);
         }
     }
     if (!preSubmitEmail || !preSubmitPw) {
         throw new Error(`Login fields empty before submit (email=${!!preSubmitEmail}, pw=${!!preSubmitPw}) — Angular cleared them; will retry login`);
     }
-
-    // Re-inject token if remount wiped it right before click.
-    const beforeClick = await readCfTurnstileToken();
-    if (beforeClick.length < 20 && token.length > 20) {
-        await page.evaluate(injectTurnstileTokenInPage, token).catch(() => { });
-    }
-
-    // CRITICAL: use a real Playwright click (trusted). DOM evaluate btn.click()
-    // does NOT fire Angular (click) handlers on VFS Sign In — button never submits.
-    let btn = submitBtn;
-    try {
-        await btn.waitFor({ state: "visible", timeout: 10000 });
-    }
-    catch {
-        btn = await resolveLoginSubmitButton(page);
-    }
-    const enableDeadline = Date.now() + 8000;
-    while (Date.now() < enableDeadline) {
-        if (await btn.isEnabled().catch(() => false))
-            break;
-        await page.waitForTimeout(200);
-    }
-    await forceClickSignInButton(page, btn);
+    const triggered = await page
+        .evaluate(() => {
+        const btn = document.querySelector<HTMLButtonElement>('button[type="submit"]') ??
+            (Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find((b) => /sign\s*in|log\s*in/i.test((b.textContent || "").trim())) ??
+                null);
+        const form = (btn?.closest("form") as HTMLFormElement | null) ??
+            (document.querySelector("form") as HTMLFormElement | null);
+        if (!btn && !form)
+            return { ok: false, reason: "no_form_or_button_found" as const };
+        if (btn) {
+            (btn as HTMLButtonElement).disabled = false;
+            btn.removeAttribute("disabled");
+            btn.setAttribute("aria-disabled", "false");
+        }
+        try {
+            btn?.click();
+        }
+        catch {
+        }
+        const anyForm = form as any;
+        if (form && typeof anyForm?.requestSubmit === "function") {
+            try {
+                anyForm.requestSubmit(btn ?? undefined);
+                return { ok: true, reason: "button.click + requestSubmit" as const };
+            }
+            catch {
+            }
+        }
+        if (form) {
+            const ev = new Event("submit", { bubbles: true, cancelable: true });
+            form.dispatchEvent(ev);
+            return { ok: true, reason: "button.click + submit_event" as const };
+        }
+        return { ok: true, reason: "button.click_only" as const };
+    })
+        .catch(() => ({ ok: false, reason: "evaluate_failed" as const }));
+    if (!triggered.ok)
+        throw new Error(`Login submit trigger failed: ${triggered.reason}`);
 }
 async function forceClickSignInButton(page: Page, submitBtn: import("playwright").Locator): Promise<void> {
     const maxAttempts = 3;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
-            // Best-effort enable — must not block the real click if evaluate fails
-            // (obfuscated builds historically broke page.evaluate serialization).
             await submitBtn.evaluate((btn: HTMLElement) => {
                 (btn as HTMLButtonElement).disabled = false;
                 btn.removeAttribute("disabled");
-                btn.setAttribute("aria-disabled", "false");
-            }).catch(() => { });
-            await submitBtn.scrollIntoViewIfNeeded().catch(() => { });
+            });
             await submitBtn.click({ timeout: 10000, force: true });
             return;
         }

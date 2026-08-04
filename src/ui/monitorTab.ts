@@ -2,7 +2,8 @@
  * "Monitor bots" tab markup + client script for the setup page.
  *
  * Per-card Stop/Resume polling + Restart. Cards needing manual action
- * (attention / needs_attention / login_failed stop) blink their background.
+ * (captcha / OTP / hard stop that still needs the operator) blink their background.
+ * Auto-recovery (401/403/CF/IP rotate) uses phase "recovering" and does not blink.
  */
 export function buildMonitorTabHtml(): string {
   return `
@@ -233,8 +234,8 @@ export function buildMonitorTabHtml(): string {
   function needsManual(s){
     if (!s) return false;
     if (isClosed(s)) return false;
+    // Auto-recovery must not blink — only true operator attention.
     if (s.phase === 'launching' || s.phase === 'recovering' || s.phase === 'idle') return false;
-    if (s.phase === 'needs_attention') return true;
     if (s.attention) return true;
     if (s.captcha && s.captcha.last === 'waiting') return true;
     return false;

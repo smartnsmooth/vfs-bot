@@ -136,6 +136,11 @@ class StatusReporter {
   setAttention(reason: AttentionReason | null, detail?: string): void {
     if (reason === null) {
       this.status.attention = null;
+      // Clearing attention must also leave needs_attention — otherwise the
+      // Monitor card keeps the infinite blink forever.
+      if (this.status.phase === "needs_attention") {
+        this.status.phase = "idle";
+      }
       this.flushNow();
       return;
     }
