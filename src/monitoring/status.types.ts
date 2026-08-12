@@ -17,6 +17,7 @@ export type BotPhase =
   | "payment"
   | "recovering"
   | "stopped"
+  | "already_booked"
   | "needs_attention"
   | "unresponsive";
 
@@ -31,7 +32,30 @@ export type AttentionReason =
   | "other";
 
 /** Monitor card activity flash color/kind. */
-export type ApiFlashKind = "polling" | "applicants" | "calendar" | "timeslot" | "schedule";
+export type ApiFlashKind = "polling" | "applicants" | "calendar" | "fees" | "timeslot" | "schedule";
+
+/** Map a booking-step label to sticky Monitor card background kind. */
+export function bookingStepToApiKind(step: string | null | undefined): ApiFlashKind | null {
+  if (!step) return null;
+  const s = step.toLowerCase();
+  if (s.includes("applicant")) return "applicants";
+  if (s.includes("calendar")) return "calendar";
+  if (s.includes("fee")) return "fees";
+  if (s.includes("timeslot") || s.includes("time slot")) return "timeslot";
+  if (s.includes("schedule")) return "schedule";
+  return null;
+}
+
+/** Short Monitor phase badge for a booking step. */
+export function bookingStepPhaseLabel(step: string | null | undefined): string | null {
+  const kind = bookingStepToApiKind(step);
+  if (kind === "applicants") return "applicants";
+  if (kind === "calendar") return "calendar";
+  if (kind === "fees") return "fees";
+  if (kind === "timeslot") return "timeslot";
+  if (kind === "schedule") return "schedule";
+  return null;
+}
 
 export type CaptchaResult = "passed" | "failed" | "waiting" | "n/a";
 
@@ -84,6 +108,11 @@ export interface InstanceStatus {
   apiFlash: { seq: number; times: 1 | 3; kind: ApiFlashKind } | null;
   /** Sticky Monitor card background after the last applicants/calendar/timeslot/schedule (or polling) call. */
   cardApiBg: ApiFlashKind | null;
+  /**
+   * True when applicants/schedule returned already-booked (1037) or payment pending (1101).
+   * Monitor shows "already booked" and hides Restart.
+   */
+  alreadyBooked: boolean;
   startedAt: number;
   heartbeatAt: number;
   updatedAt: number;
@@ -116,6 +145,7 @@ export function makeInitialStatus(instanceId: number, debugPort: number | null):
     processAlive: true,
     apiFlash: null,
     cardApiBg: null,
+    alreadyBooked: false,
     startedAt: now,
     heartbeatAt: now,
     updatedAt: now,

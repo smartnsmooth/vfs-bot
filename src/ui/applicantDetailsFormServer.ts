@@ -431,12 +431,31 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
     }
     .picker-row { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; margin-top: 0.25rem; }
     .picker-row input[type="date"] { margin-top: 0; max-width: 11rem; flex: 1 1 auto; min-width: 0; }
-    .form-actions { margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid #38444d; display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; }
+    .form-actions { margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid #38444d; display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; }
     button[type="submit"] { margin-top: 0; flex: 1; min-width: 8rem; }
     #forceBookBtn { margin-top: 0; flex: 1; min-width: 8rem; background: #f5a623; color: #15202b; font-weight: 700; }
     button { width: 100%; padding: 0.65rem; border: none; border-radius: 8px;
       background: #1d9bf0; color: #fff; font-weight: 600; cursor: pointer; font-size: 1rem; }
     button:hover { filter: brightness(1.08); }
+    button:disabled { cursor: not-allowed; opacity: 0.8; }
+    button:disabled:hover { filter: none; }
+    #submitBtn.is-loading {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+    }
+    #submitBtn.is-loading::before {
+      content: "";
+      width: 1em;
+      height: 1em;
+      border: 2px solid rgba(255, 255, 255, 0.35);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: submitSpin 0.7s linear infinite;
+      flex-shrink: 0;
+    }
+    @keyframes submitSpin { to { transform: rotate(360deg); } }
     button.btn-inline { margin-top: 0; width: auto; padding: 0.5rem 0.9rem; font-size: 0.9rem; }
     button.btn-secondary { margin-top: 0.6rem; width: auto; background: #38444d; color: #e7e9ea; font-size: 0.85rem; padding: 0.45rem 0.75rem; }
     button.btn-secondary:hover { filter: brightness(1.12); }
@@ -802,11 +821,11 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
         <select id="selectedSubvisaCategory2" name="selectedSubvisaCategory2">
           <option value="">-- Select Category --</option>
         </select>
+        <div class="form-actions">
+          <button type="submit" id="submitBtn">Submit &amp; Run</button>
+          <button type="button" id="forceBookBtn">Book Slot</button>
+        </div>
       </div>
-    </div>
-    <div class="form-actions">
-      <button type="submit" id="submitBtn">Submit &amp; Run</button>
-      <button type="button" id="forceBookBtn">Book Slot</button>
     </div>
   </form>
   <p id="msg"></p>

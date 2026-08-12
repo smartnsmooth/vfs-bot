@@ -231,6 +231,10 @@ function buildMonitorHooks(): MonitorHooks {
       return { ok: true };
     },
     restartInstance: (id) => {
+      const cur = registry.get(id);
+      if (cur?.alreadyBooked || cur?.phase === "already_booked") {
+        return { ok: false, error: `Bot #${id} is already booked — restart disabled.` };
+      }
       const idx = instances.findIndex((i) => i.id === id);
       if (idx >= 0) {
         const inst = instances[idx]!;
@@ -538,10 +542,11 @@ function spawnBotInstance(instanceId: number, totalInstances: number): ChildProc
         inst.process = null;
         pendingStarts = pendingStarts.filter((x) => x !== id);
         registry.setProcessAlive(id, false);
-        registry.markStopped(
-          id,
-          msg.reason === "already-booked" ? "already booked — retired" : "retired"
-        );
+        if (msg.reason === "already-booked") {
+          registry.markAlreadyBooked(id, "already booked");
+        } else {
+          registry.markStopped(id, "retired");
+        }
       }
       try {
         killChromeTreeByCdpPortSync(debugPortForInstance(id));

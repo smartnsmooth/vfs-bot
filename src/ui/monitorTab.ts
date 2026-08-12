@@ -58,22 +58,44 @@ export function buildMonitorTabHtml(): string {
   .mon-tile.bg-polling:not(.attn):not(.dead) {
     background: #1c2838;
     border-color: #3d5368;
+    border-top-color: #5aa9ff;
   }
   .mon-tile.bg-applicants:not(.attn):not(.dead) {
-    background: #2a2e33;
-    border-color: #4a5058;
+    background: #2a2440;
+    border-color: #6b5b95;
+    border-top-color: #a48bec;
   }
   .mon-tile.bg-calendar:not(.attn):not(.dead) {
     background: #163a52;
     border-color: #2a6a94;
+    border-top-color: #1d9bf0;
+  }
+  .mon-tile.bg-fees:not(.attn):not(.dead) {
+    background: #3a2a14;
+    border-color: #a67c2a;
+    border-top-color: #f5a623;
   }
   .mon-tile.bg-timeslot:not(.attn):not(.dead) {
     background: #143528;
     border-color: #2d6a4f;
+    border-top-color: #00ba7c;
   }
   .mon-tile.bg-schedule:not(.attn):not(.dead) {
     background: #1a4030;
     border-color: #2f9e6f;
+    border-top-color: #69f0ae;
+  }
+  .mon-tile.bg-fetch-fail:not(.attn):not(.dead),
+  .mon-tile.bg-err-401:not(.attn):not(.dead),
+  .mon-tile.bg-recovering:not(.attn):not(.dead) {
+    background: #3a2418;
+    border-color: #a35a2a;
+    border-top-color: #ff8a3d;
+  }
+  .mon-tile.bg-err-401:not(.attn):not(.dead) {
+    background: #3a1820;
+    border-color: #a33a4a;
+    border-top-color: #f4212e;
   }
   /* Short activity flash (API call) — color by endpoint kind. */
   .mon-tile.flash-polling:not(.attn) {
@@ -84,6 +106,9 @@ export function buildMonitorTabHtml(): string {
   }
   .mon-tile.flash-calendar:not(.attn) {
     animation: monFlashCalendar 0.4s ease-in-out 3;
+  }
+  .mon-tile.flash-fees:not(.attn) {
+    animation: monFlashFees 0.4s ease-in-out 3;
   }
   .mon-tile.flash-timeslot:not(.attn) {
     animation: monFlashTimeslot 0.4s ease-in-out 3;
@@ -96,6 +121,7 @@ export function buildMonitorTabHtml(): string {
   }
   .mon-tile.attn.flash-applicants,
   .mon-tile.attn.flash-calendar,
+  .mon-tile.attn.flash-fees,
   .mon-tile.attn.flash-timeslot,
   .mon-tile.attn.flash-schedule {
     animation: monBlinkBg 0.9s ease-in-out infinite, monApiFlashAttn 0.4s ease-in-out 3;
@@ -105,12 +131,16 @@ export function buildMonitorTabHtml(): string {
     50% { background: #243044; box-shadow: 0 0 8px 1px #6b8fbc66; border-color: #5a7a9a; }
   }
   @keyframes monFlashApplicants {
-    0%, 100% { background: #2a2e33; box-shadow: 0 0 0 1px transparent; }
-    50% { background: #3a3f46; box-shadow: 0 0 8px 1px #6b728066; border-color: #5c6370; }
+    0%, 100% { background: #2a2440; box-shadow: 0 0 0 1px transparent; }
+    50% { background: #3a3360; box-shadow: 0 0 8px 1px #a48bec66; border-color: #a48bec; }
   }
   @keyframes monFlashCalendar {
     0%, 100% { background: #163a52; box-shadow: 0 0 0 1px transparent; }
     50% { background: #1a4a6a; box-shadow: 0 0 10px 1px #1d9bf0aa; border-color: #1d9bf0; }
+  }
+  @keyframes monFlashFees {
+    0%, 100% { background: #3a2a14; box-shadow: 0 0 0 1px transparent; }
+    50% { background: #4a3818; box-shadow: 0 0 10px 1px #f5a62399; border-color: #f5a623; }
   }
   @keyframes monFlashTimeslot {
     0%, 100% { background: #143528; box-shadow: 0 0 0 1px transparent; }
@@ -129,11 +159,13 @@ export function buildMonitorTabHtml(): string {
     .mon-tile.flash-polling,
     .mon-tile.flash-applicants,
     .mon-tile.flash-calendar,
+    .mon-tile.flash-fees,
     .mon-tile.flash-timeslot,
     .mon-tile.flash-schedule { animation: none; }
     .mon-tile.bg-polling:not(.attn):not(.dead) { background: #1c2838; border-color: #3d5368; }
-    .mon-tile.bg-applicants:not(.attn):not(.dead) { background: #2a2e33; border-color: #4a5058; }
+    .mon-tile.bg-applicants:not(.attn):not(.dead) { background: #2a2440; border-color: #6b5b95; }
     .mon-tile.bg-calendar:not(.attn):not(.dead) { background: #163a52; border-color: #2a6a94; }
+    .mon-tile.bg-fees:not(.attn):not(.dead) { background: #3a2a14; border-color: #a67c2a; }
     .mon-tile.bg-timeslot:not(.attn):not(.dead) { background: #143528; border-color: #2d6a4f; }
     .mon-tile.bg-schedule:not(.attn):not(.dead) { background: #1a4030; border-color: #2f9e6f; }
   }
@@ -178,8 +210,39 @@ export function buildMonitorTabHtml(): string {
   var PHASE_COLORS = {
     idle: '#8b98a5', launching: '#5aa9ff', login: '#f5a623', otp: '#f5a623',
     turnstile: '#f5a623', polling: '#1d9bf0', booking: '#a48bec', payment: '#00ba7c',
-    recovering: '#ff8a3d', stopped: '#f4212e', needs_attention: '#f4212e', unresponsive: '#6b7686'
+    recovering: '#ff8a3d', stopped: '#f4212e', already_booked: '#8b98a5',
+    needs_attention: '#f4212e', unresponsive: '#6b7686',
+    applicants: '#a48bec', calendar: '#1d9bf0', fees: '#f5a623', timeslot: '#00ba7c', schedule: '#69f0ae',
+    'fetch fail': '#ff8a3d', '401': '#f4212e'
   };
+
+  function bookingKind(step){
+    var s = String(step || '').toLowerCase();
+    if (s.indexOf('applicant') >= 0) return 'applicants';
+    if (s.indexOf('calendar') >= 0) return 'calendar';
+    if (s.indexOf('fee') >= 0) return 'fees';
+    if (s.indexOf('timeslot') >= 0 || s.indexOf('time slot') >= 0) return 'timeslot';
+    if (s.indexOf('schedule') >= 0) return 'schedule';
+    return null;
+  }
+
+  function recoverLabel(detail, lastErr){
+    var d = String(detail || '') + ' ' + String((lastErr && lastErr.message) || '');
+    var low = d.toLowerCase();
+    if (low.indexOf('failed to fetch') >= 0 || low.indexOf('fetch fail') >= 0) return 'fetch fail';
+    if (/\b401\b/.test(low) || low.indexOf('unauthorized') >= 0) return '401';
+    if (/\b403\b/.test(low) || low.indexOf('forbidden') >= 0) return '403';
+    if (low.indexOf('cloudflare') >= 0) return 'cloudflare';
+    if (/\b429\b/.test(low) || low.indexOf('rate-limit') >= 0 || low.indexOf('rate limit') >= 0) return '429';
+    if (low.indexOf('504') >= 0 || low.indexOf('gateway') >= 0) return '504';
+    return 'recovering';
+  }
+
+  function recoverBgClass(label){
+    if (label === 'fetch fail') return 'fetch-fail';
+    if (label === '401') return 'err-401';
+    return 'recovering';
+  }
 
   function el(id){ return document.getElementById(id); }
 
@@ -223,8 +286,22 @@ export function buildMonitorTabHtml(): string {
     }
   }
 
+  function isAlreadyBooked(s){
+    return !!(s && (s.alreadyBooked || s.phase === 'already_booked'));
+  }
+
+  /** Chrome kill/relaunch is expected — do not grey-out / dead-blink the card. */
+  function isTransientRecoverPhase(s){
+    if (!s) return false;
+    var p = s.phase;
+    return p === 'recovering' || p === 'launching' || p === 'login' || p === 'turnstile' || p === 'otp';
+  }
+
   function isClosed(s){
     if (!s) return false;
+    if (isAlreadyBooked(s)) return true;
+    // During hard relogin Chrome is intentionally killed — keep the card stable.
+    if (isTransientRecoverPhase(s)) return false;
     if (s.chromeAlive === false) return true;
     if (s.processAlive === false && (s.phase === 'stopped' || s.phase === 'unresponsive')) return true;
     return false;
@@ -233,18 +310,24 @@ export function buildMonitorTabHtml(): string {
   /** Errors that need the operator — only while Chrome is still open so they can act. */
   function needsManual(s){
     if (!s) return false;
+    if (isAlreadyBooked(s)) return false;
+    if (isTransientRecoverPhase(s)) return false;
     if (isClosed(s)) return false;
     // Auto-recovery must not blink — only true operator attention.
-    if (s.phase === 'launching' || s.phase === 'recovering' || s.phase === 'idle') return false;
+    if (s.phase === 'idle') return false;
     if (s.attention) return true;
     if (s.captcha && s.captcha.last === 'waiting') return true;
     return false;
   }
 
   function tileHtml(s){
-    var color = PHASE_COLORS[s.phase] || '#55606b';
+    var booked = isAlreadyBooked(s);
     var paused = !!s.pollingPaused;
     var closed = isClosed(s);
+    var step = s.bookingStep || '';
+    var bKind = (!closed && !booked && s.phase === 'booking') ? (bookingKind(step) || bookingKind(s.detail) || s.cardApiBg) : null;
+    var recoverLbl = (!closed && !booked && s.phase === 'recovering') ? recoverLabel(s.detail, s.lastError) : null;
+    var color = PHASE_COLORS[booked ? 'already_booked' : (recoverLbl || bKind || s.phase)] || '#55606b';
     var attn = (!closed && needsManual(s)) ? ' attn' : '';
     var cap = s.captcha || {};
     var capBadge = '';
@@ -253,13 +336,19 @@ export function buildMonitorTabHtml(): string {
     else if (cap.last === 'waiting') capBadge = '<span style="color:#f5a623">captcha wait</span>';
     var capCounts = ' <span style="color:#6b7686">(' + (cap.solved||0) + '/' + (cap.attempts||0) + ')</span>';
     var detail = s.detail || '';
-    if (s.lastError && (s.phase === 'stopped' || s.attention || needsManual(s) || closed)) detail = s.lastError.message || detail;
+    if (booked) detail = detail || 'already booked';
+    else if (recoverLbl) detail = (s.lastError && s.lastError.message) || detail || recoverLbl;
+    else if (s.phase === 'booking' && step) detail = step;
+    else if (s.lastError && (s.phase === 'stopped' || s.attention || needsManual(s) || closed)) detail = s.lastError.message || detail;
     // Once slot polling has started, prefer the live poll count in this slot.
-    if (!closed && (s.phase === 'polling' || (paused && (s.pollCount || 0) > 0))) {
+    if (!closed && !booked && !recoverLbl && s.phase !== 'booking' && (s.phase === 'polling' || (paused && (s.pollCount || 0) > 0))) {
       detail = 'poll #' + (s.pollCount || 0);
       if (s.center) detail += ' · ' + s.center;
     }
-    var pageShort = shortPage(s.page);
+    var pageShort =
+      isTransientRecoverPhase(s) && s.chromeAlive === false
+        ? "relaunching"
+        : shortPage(s.page);
     var tip = [];
     if (s.egressIp) tip.push('ip:' + s.egressIp);
     if (s.account) tip.push(s.account);
@@ -267,30 +356,49 @@ export function buildMonitorTabHtml(): string {
     tip.push('polls:' + (s.pollCount||0));
     if (s.lastCode) tip.push('code:' + s.lastCode);
     if (paused) tip.push('polling paused');
-    if (closed) tip.push('bot closed');
+    if (booked) tip.push('already booked');
+    else if (recoverLbl) tip.push(recoverLbl);
+    else if (bKind) tip.push(bKind);
+    else if (closed) tip.push('bot closed');
     if (s.chromeAlive === false) tip.push('Chrome closed');
     else if (s.chromeAlive === true) tip.push('Chrome up');
     if (s.processAlive === false) tip.push('process dead');
     if (needsManual(s)) tip.push('needs manual action');
 
-    var chromeDot = closed
-      ? '<span style="color:#55606b" title="Bot closed">●</span> '
-      : (s.chromeAlive === true
-        ? '<span style="color:#00ba7c" title="Chrome DevTools up">●</span> '
-        : '<span style="color:#55606b" title="Chrome status unknown">●</span> ');
+    var chromeDot;
+    if (isTransientRecoverPhase(s)) {
+      // Freeze liveness dot during hard relogin — DevTools probe flaps false→true and was blinking the card.
+      chromeDot = '<span style="color:#f5a623" title="Recovering / relaunching">●</span> ';
+    } else if (closed) {
+      chromeDot = '<span style="color:#55606b" title="' + (booked ? 'Already booked' : 'Bot closed') + '">●</span> ';
+    } else if (s.chromeAlive === true) {
+      chromeDot = '<span style="color:#00ba7c" title="Chrome DevTools up">●</span> ';
+    } else {
+      chromeDot = '<span style="color:#55606b" title="Chrome status unknown">●</span> ';
+    }
 
-    var pollBtn = closed
+    var pollBtn = (closed || booked)
       ? ''
       : (paused
         ? '<button type="button" class="mon-btn resume" data-action="resume-polling" title="Resume polling (fleet poll-interval stagger)">Resume</button>'
         : '<button type="button" class="mon-btn stop" data-action="pause-polling" title="Stop polling (keep Chrome/session)">Stop</button>');
 
-    var phaseLabel = closed ? 'closed' : (paused ? 'paused' : s.phase);
-    if (!closed && needsManual(s) && !paused) phaseLabel = s.phase === 'stopped' ? 'stopped' : (s.attention && s.attention.reason) || s.phase;
+    var restartBtn = booked
+      ? ''
+      : '<button type="button" class="mon-btn restart" data-action="restart" title="Clear session, rotate IP, restart Chrome + bot">Restart</button>';
 
-    var apiBg = (!closed && s.cardApiBg) ? (' bg-' + s.cardApiBg) : '';
-    var topColor = closed ? '#3a4349' : (needsManual(s) ? '#f4212e' : color);
-    var phaseColor = closed ? '#6b7686' : (needsManual(s) ? '#f4212e' : color);
+    var phaseLabel = booked ? 'already booked' : (recoverLbl ? recoverLbl : (closed ? 'closed' : (paused ? 'paused' : (bKind || s.phase))));
+    if (!closed && !booked && !recoverLbl && !bKind && needsManual(s) && !paused) phaseLabel = s.phase === 'stopped' ? 'stopped' : (s.attention && s.attention.reason) || s.phase;
+
+    var apiBgKind = null;
+    if (!closed && !booked) {
+      if (recoverLbl) apiBgKind = recoverBgClass(recoverLbl);
+      else if (bKind) apiBgKind = bKind;
+      else if (s.cardApiBg) apiBgKind = s.cardApiBg;
+    }
+    var apiBg = apiBgKind ? (' bg-' + apiBgKind) : '';
+    var topColor = booked ? '#6b7686' : (recoverLbl ? color : (closed ? '#3a4349' : (needsManual(s) ? '#f4212e' : color)));
+    var phaseColor = booked ? '#8b98a5' : (recoverLbl ? color : (closed ? '#6b7686' : (needsManual(s) ? '#f4212e' : color)));
 
     return '<div class="mon-tile' + attn + apiBg + (paused && !closed ? ' paused' : '') + (closed ? ' dead' : '') + '" data-id="' + s.instanceId + '" title="' + esc(tip.join(' · ') || ('Focus bot #' + s.instanceId)) + '" style="border-top-color:' + topColor + '">' +
       '<span class="phase" style="color:' + phaseColor + '">' + esc(phaseLabel) + '</span>' +
@@ -300,28 +408,106 @@ export function buildMonitorTabHtml(): string {
       '<div class="cap">' + (capBadge || '<span style="color:#6b7686">captcha —</span>') + capCounts + '</div>' +
       '<div class="actions">' +
         pollBtn +
-        '<button type="button" class="mon-btn restart" data-action="restart" title="Clear session, rotate IP, restart Chrome + bot">Restart</button>' +
+        restartBtn +
       '</div>' +
     '</div>';
   }
+
+  var lastTileHtml = {};
 
   function render(){
     rafPending = false;
     var list = Object.keys(instances).map(function(k){ return instances[k]; });
     list.sort(function(a,b){ return a.instanceId - b.instanceId; });
-    var html = ''; for (var j=0;j<list.length;j++){ html += tileHtml(list[j]); }
     var grid = el('monGrid');
-    grid.innerHTML = html;
+    if (!list.length) {
+      grid.innerHTML = '<div class="mon-empty" style="grid-column:1/-1;color:#8b98a5;padding:1.5rem;text-align:center;">No bots yet — Submit &amp; Run from Configure.</div>';
+      lastTileHtml = {};
+      return;
+    }
+
+    // Incremental tile updates — rewriting the whole grid on heartbeats/Chrome probes
+    // destroys nodes mid-animation and makes text look like it is blinking.
+    var orderChanged = false;
+    var existing = grid.querySelectorAll('.mon-tile');
+    if (existing.length !== list.length) orderChanged = true;
+    else {
+      for (var oi = 0; oi < list.length; oi++) {
+        if (String(existing[oi].getAttribute('data-id')) !== String(list[oi].instanceId)) {
+          orderChanged = true;
+          break;
+        }
+      }
+    }
+
+    if (orderChanged) {
+      var frag = document.createDocumentFragment();
+      var keepFlash = {};
+      for (var fi0 = 0; fi0 < existing.length; fi0++) {
+        var oldT = existing[fi0];
+        var oid = oldT.getAttribute('data-id');
+        var flashCls = '';
+        var cn = oldT.className || '';
+        if (cn.indexOf('flash-') >= 0) {
+          var parts = cn.split(/\s+/);
+          for (var pi = 0; pi < parts.length; pi++) {
+            if (parts[pi].indexOf('flash-') === 0) flashCls = parts[pi];
+          }
+        }
+        if (flashCls) keepFlash[oid] = flashCls;
+      }
+      lastTileHtml = {};
+      for (var j = 0; j < list.length; j++) {
+        var s0 = list[j];
+        var html0 = tileHtml(s0);
+        lastTileHtml[s0.instanceId] = html0;
+        var wrap0 = document.createElement('div');
+        wrap0.innerHTML = html0;
+        var node0 = wrap0.firstElementChild;
+        if (node0 && keepFlash[s0.instanceId]) node0.classList.add(keepFlash[s0.instanceId]);
+        if (node0) frag.appendChild(node0);
+      }
+      grid.innerHTML = '';
+      grid.appendChild(frag);
+    } else {
+      for (var j2 = 0; j2 < list.length; j2++) {
+        var s1 = list[j2];
+        var id1 = s1.instanceId;
+        var html1 = tileHtml(s1);
+        if (lastTileHtml[id1] === html1) continue;
+        lastTileHtml[id1] = html1;
+        var tile1 = grid.querySelector('.mon-tile[data-id="' + id1 + '"]');
+        if (!tile1) continue;
+        // Preserve in-progress activity flash class across content patch.
+        var flashKeep = '';
+        var cls1 = tile1.className || '';
+        if (cls1.indexOf('flash-') >= 0) {
+          var parts1 = cls1.split(/\s+/);
+          for (var p1 = 0; p1 < parts1.length; p1++) {
+            if (parts1[p1].indexOf('flash-') === 0) flashKeep = parts1[p1];
+          }
+        }
+        var wrap1 = document.createElement('div');
+        wrap1.innerHTML = html1;
+        var next1 = wrap1.firstElementChild;
+        if (!next1) continue;
+        if (flashKeep) next1.classList.add(flashKeep);
+        tile1.replaceWith(next1);
+      }
+    }
 
     var flashIds = Object.keys(pendingFlash);
-    var FLASH_KINDS = { polling:1, applicants:1, calendar:1, timeslot:1, schedule:1 };
+    var FLASH_KINDS = { polling:1, applicants:1, calendar:1, fees:1, timeslot:1, schedule:1 };
     for (var fi = 0; fi < flashIds.length; fi++) {
       var fid = flashIds[fi];
       var flashInfo = pendingFlash[fid];
       delete pendingFlash[fid];
+      var stFlash = instances[fid];
+      // Skip flash during hard relogin / login — it fights recover UI and looks like blink.
+      if (stFlash && isTransientRecoverPhase(stFlash)) continue;
       var tile = grid.querySelector('.mon-tile[data-id="' + fid + '"]');
       if (!tile || tile.classList.contains('dead')) continue;
-      tile.classList.remove('flash-polling', 'flash-applicants', 'flash-calendar', 'flash-timeslot', 'flash-schedule');
+      tile.classList.remove('flash-polling', 'flash-applicants', 'flash-calendar', 'flash-fees', 'flash-timeslot', 'flash-schedule');
       void tile.offsetWidth;
       var kind = (flashInfo && FLASH_KINDS[flashInfo.kind]) ? flashInfo.kind : 'polling';
       var cls = 'flash-' + kind;

@@ -60,6 +60,20 @@ export function isTargetClosedError(e: unknown): boolean {
         e.message.includes("has been closed") ||
         e.name === "TargetClosedError");
 }
+
+/**
+ * Browser in-page `fetch()` never got an HTTP response (proxy/network drop).
+ * Logged as `page.evaluate: TypeError: Failed to fetch` with empty response body.
+ */
+export function isFailedToFetchError(e: unknown): boolean {
+    if (!(e instanceof Error)) return false;
+    const m = e.message;
+    return (
+        /Failed to fetch/i.test(m) ||
+        /TypeError:\s*Failed to fetch/i.test(m) ||
+        /net::ERR_/i.test(m)
+    );
+}
 export function throwVfsRateLimited(kind: Vfs429Kind, code: string, detail: string): never {
     throw new VfsRateLimitedError(kind, code, kind === "account"
         ? `VFS account/User ID rate-limit (${code}): ${detail}`

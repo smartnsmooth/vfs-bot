@@ -81,6 +81,7 @@ export async function postLiftJsonFromPage(
     } else if (
       logKind === "applicants" ||
       logKind === "calendar" ||
+      logKind === "fees" ||
       logKind === "timeslot" ||
       logKind === "schedule"
     ) {

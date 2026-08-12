@@ -24,6 +24,7 @@ export {
   VfsRateLimitedError,
   AlreadyBookedError,
   isTargetClosedError,
+  isFailedToFetchError,
   readClientSourceHeader,
   LIFT_API_HOST_MARKER,
   injectTurnstileTokenInPage,

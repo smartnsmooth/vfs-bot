@@ -671,6 +671,50 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
   })();
   void initApplicantForm();
 
+  function setSubmitLoading(on) {
+    const btn = document.getElementById("submitBtn");
+    if (!btn) return;
+    if (on) {
+      if (!btn.dataset.prevLabel) btn.dataset.prevLabel = btn.textContent || "Submit & Run";
+      btn.disabled = true;
+      btn.classList.add("is-loading");
+      btn.textContent = "Starting\\u2026";
+    } else {
+      btn.disabled = false;
+      btn.classList.remove("is-loading");
+      btn.textContent = btn.dataset.prevLabel || "Submit & Run";
+      delete btn.dataset.prevLabel;
+    }
+  }
+
+  /** Poll monitor until any instance reports Chrome DevTools up (first window open). */
+  async function waitForFirstChrome(timeoutMs) {
+    const deadline = Date.now() + (timeoutMs || 180000);
+    let consecutiveMisses = 0;
+    while (Date.now() < deadline) {
+      try {
+        const r = await fetch("/api/monitor/snapshot");
+        if (!r.ok) {
+          consecutiveMisses += 1;
+          if (consecutiveMisses >= 3) return false;
+        } else {
+          consecutiveMisses = 0;
+          const d = await r.json();
+          if (d && d.ok && Array.isArray(d.instances)) {
+            for (let i = 0; i < d.instances.length; i++) {
+              if (d.instances[i].chromeAlive === true) return true;
+            }
+          }
+        }
+      } catch {
+        consecutiveMisses += 1;
+        if (consecutiveMisses >= 5) return false;
+      }
+      await new Promise(function (res) { setTimeout(res, 400); });
+    }
+    return false;
+  }
+
   document.getElementById("f").addEventListener("submit", async function (e) {
     e.preventDefault();
     const msg = document.getElementById("msg");
@@ -747,6 +791,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       body.vfsUsername2 = fd.get("vfsUsername2");
       body.vfsPassword2 = fd.get("vfsPassword2");
     }
+    setSubmitLoading(true);
     try {
       const r = await fetch("/api/submit", {
         method: "POST",
@@ -757,6 +802,9 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       if (j.ok) {
         msg.className = "ok";
         msg.textContent =
+          "\\u2713 Started " + (j.queued || "all") + " bot instance(s). Waiting for Chrome\\u2026";
+        await waitForFirstChrome(180000);
+        msg.textContent =
           "\\u2713 Started " + (j.queued || "all") + " bot instance(s). Check terminal for progress.";
       } else {
         msg.className = "err";
@@ -765,6 +813,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     } catch (err) {
       msg.className = "err";
       msg.textContent = String(err);
+    } finally {
+      setSubmitLoading(false);
     }
   });
 
