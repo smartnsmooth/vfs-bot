@@ -258,10 +258,6 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
     const v = parseInt(j.calendarPollingInterval, 10);
     if (Number.isFinite(v) && v >= 1) out.calendarPollingInterval = v;
   }
-  if (typeof j.bookingSystemMode === "string") {
-    const m = j.bookingSystemMode.trim().toLowerCase();
-    if (m === "fleet" || m === "legacy") out.bookingSystemMode = m;
-  }
   if (typeof out.helloVerifyNumber === "string") {
     const digits = out.helloVerifyNumber.replace(/\D/g, "").slice(0, 6);
     if (digits.length > 0) out.helloVerifyNumber = digits;
@@ -323,11 +319,6 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
       <input type="number" id="calendarPollingInterval" name="calendarPollingInterval" min="1" value="60" />
       </div>
     </div>
-    <label for="bookingSystemMode" style="margin-top:0.75rem">Booking system</label>
-    <select id="bookingSystemMode" name="bookingSystemMode">
-      <option value="legacy" selected>Legacy (per-bot calendar chain)</option>
-      <option value="fleet">Fleet calendar polling (new)</option>
-    </select>
     <div class="row2">
       <div>
         <label for="postLoginPollDelay" style="margin-top:0.75rem">Post-login poll delay (seconds)</label>
@@ -440,13 +431,31 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
     }
     .picker-row { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; margin-top: 0.25rem; }
     .picker-row input[type="date"] { margin-top: 0; max-width: 11rem; flex: 1 1 auto; min-width: 0; }
-    .form-actions { margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid #38444d; display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; }
+    .form-actions { margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid #38444d; display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; }
     button[type="submit"] { margin-top: 0; flex: 1; min-width: 8rem; }
     #forceBookBtn { margin-top: 0; flex: 1; min-width: 8rem; background: #f5a623; color: #15202b; font-weight: 700; }
-    #testApplicantsApiBtn { display: block; }
     button { width: 100%; padding: 0.65rem; border: none; border-radius: 8px;
       background: #1d9bf0; color: #fff; font-weight: 600; cursor: pointer; font-size: 1rem; }
     button:hover { filter: brightness(1.08); }
+    button:disabled { cursor: not-allowed; opacity: 0.8; }
+    button:disabled:hover { filter: none; }
+    #submitBtn.is-loading {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+    }
+    #submitBtn.is-loading::before {
+      content: "";
+      width: 1em;
+      height: 1em;
+      border: 2px solid rgba(255, 255, 255, 0.35);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: submitSpin 0.7s linear infinite;
+      flex-shrink: 0;
+    }
+    @keyframes submitSpin { to { transform: rotate(360deg); } }
     button.btn-inline { margin-top: 0; width: auto; padding: 0.5rem 0.9rem; font-size: 0.9rem; }
     button.btn-secondary { margin-top: 0.6rem; width: auto; background: #38444d; color: #e7e9ea; font-size: 0.85rem; padding: 0.45rem 0.75rem; }
     button.btn-secondary:hover { filter: brightness(1.12); }
@@ -455,6 +464,10 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
     .date-chip-remove { margin: 0; padding: 0 0.2rem; width: auto; min-width: 0; background: transparent; color: #8b98a5; font-size: 1.15rem; line-height: 1; font-weight: 400; }
     .date-chip-remove:hover { color: #f4212e; filter: none; }
     .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
+    .row3 { display: grid; grid-template-columns: 1fr 1fr 0.5fr; gap: 0.75rem; }
+    @media (max-width: 720px) {
+      .row3 { grid-template-columns: 1fr; }
+    }
     .section-rule { margin: 1.25rem 0; border: none; border-top: 1px solid #38444d; }
     .section-title { margin: 0 0 0.5rem; font-size: 0.92rem; font-weight: 600; color: #c4cdd4; }
     .ok { color: #00ba7c; margin-top: 1rem; }
@@ -513,10 +526,14 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
           </div>
         </div>
         ${scheduleDateRangeRow}
-        <label for="passportExpirtyDate">Passport expiry (DD/MM/YYYY)</label>
-        <input id="passportExpirtyDate" name="passportExpirtyDate" placeholder="23/04/2027" />
-        <label for="nationalityCode">Nationality</label>
-        <select id="nationalityCode" name="nationalityCode">
+        <div class="row3">
+          <div>
+            <label for="passportExpirtyDate">Passport expiry (DD/MM/YYYY)</label>
+            <input id="passportExpirtyDate" name="passportExpirtyDate" placeholder="23/04/2027" />
+          </div>
+          <div>
+            <label for="nationalityCode">Nationality</label>
+            <select id="nationalityCode" name="nationalityCode">
           <option value="">-- Select Nationality --</option>
           <option value="AFG">AFGHANISTAN</option>
           <option value="ALB">ALBANIA</option>
@@ -739,11 +756,15 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
           <option value="ZMB">ZAMBIA</option>
           <option value="ZWE">ZIMBABWE</option>
         </select>
-        <label for="gender">Gender</label>
-        <select id="gender" name="gender">
-          <option value="1">MALE</option>
-          <option value="2">FEMALE</option>
-        </select>
+          </div>
+          <div>
+            <label for="gender">Gender</label>
+            <select id="gender" name="gender">
+              <option value="1">MALE</option>
+              <option value="2">FEMALE</option>
+            </select>
+          </div>
+        </div>
         <label for="vacCode">Visa Application Centre</label>
         <select id="vacCode" name="vacCode">
           <option value="">-- Select Centre --</option>
@@ -791,7 +812,6 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
 
         <hr class="section-rule" />
         <h3 class="section-title">Center 2 (optional)</h3>
-        <p class="hint" style="margin-bottom:1rem">Leave empty to poll only Center 1</p>
 
         <label for="vacCode2">Visa Application Centre 2 (Optional)</label>
         <select id="vacCode2" name="vacCode2">
@@ -801,12 +821,11 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
         <select id="selectedSubvisaCategory2" name="selectedSubvisaCategory2">
           <option value="">-- Select Category --</option>
         </select>
+        <div class="form-actions">
+          <button type="submit" id="submitBtn">Submit &amp; Run</button>
+          <button type="button" id="forceBookBtn">Book Slot</button>
+        </div>
       </div>
-    </div>
-    <div class="form-actions">
-      <button type="submit" id="submitBtn">Submit &amp; Run</button>
-      <button type="button" id="forceBookBtn">Book Slot</button>
-      <button type="button" id="testApplicantsApiBtn">Test applicants API</button>
     </div>
   </form>
   <p id="msg"></p>
@@ -833,16 +852,6 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
 </html>`;
 }
 
-/** One bot instance’s outcome for POST `appointment/applicants` (test button). */
-export type TestApplicantsApiInstanceResult =
-  | { instanceId: number; ok: true; status: number; bodyPreview: string }
-  | { instanceId: number; ok: false; error: string };
-
-/** Response: every running instance runs the lift-api applicants POST (cluster: one Chrome each). */
-export type TestApplicantsApiBatchResult = {
-  results: TestApplicantsApiInstanceResult[];
-};
-
 export type ApplicantFormOptions = {
   /**
    * When true (default), form includes VFS username/password and stores them before `loginOnFirstTab`.
@@ -851,11 +860,6 @@ export type ApplicantFormOptions = {
   collectLogin?: boolean;
   /** Called when user clicks "Book Slot" — triggers force-booking on all instances. */
   onForceBook?: () => { ok: boolean; error?: string; queued?: number };
-  /**
-   * Called when user clicks "Test applicants API" — each running instance POSTs lift-api applicants
-   * from its own logged-in Chrome tab (cluster); single-process returns one result row.
-   */
-  onTestApplicantsApi?: () => Promise<TestApplicantsApiBatchResult>;
   /** Monitoring dashboard hooks. When set, the page shows a "Monitor bots" tab. */
   monitor?: MonitorHooks;
 };
@@ -913,7 +917,6 @@ export function runApplicantFormWithSubmitHandler(
   options?: ApplicantFormOptions
 ): Promise<never> {
   const collectLogin = options?.collectLogin !== false;
-  const onTestApplicantsApi = options?.onTestApplicantsApi;
 
   const preferredPort = APPLICANT_UI_PORT;
   const host = "127.0.0.1";
@@ -1075,9 +1078,6 @@ export function runApplicantFormWithSubmitHandler(
             if (globalDet && typeof globalDet.calendarPollingInterval === "number") {
               defaults.calendarPollingInterval = globalDet.calendarPollingInterval;
             }
-            if (globalDet && typeof globalDet.bookingSystemMode === "string") {
-              defaults.bookingSystemMode = globalDet.bookingSystemMode;
-            }
             const payload: Record<string, unknown> = { ok: true, defaults };
             if (collectLogin) {
               const base = getLoginFormDefaults();
@@ -1158,7 +1158,6 @@ export function runApplicantFormWithSubmitHandler(
             staggerIntervalSec: sis,
             calendarPollingStartDate: cpsd,
             calendarPollingInterval: cpi,
-            bookingSystemMode: bsm,
             ...instanceFields
           } = fields;
 
@@ -1177,7 +1176,6 @@ export function runApplicantFormWithSubmitHandler(
             if (typeof cpsd === "string") { global0.calendarPollingStartDate = cpsd; changed = true; }
             else if ("calendarPollingStartDate" in rest) { delete global0.calendarPollingStartDate; changed = true; }
             if (typeof cpi === "number") { global0.calendarPollingInterval = cpi; changed = true; }
-            if (typeof bsm === "string") { global0.bookingSystemMode = bsm; changed = true; }
             if (typeof instanceFields.countryCode === "string") { global0.countryCode = instanceFields.countryCode; changed = true; }
             if (typeof instanceFields.missionCode === "string") { global0.missionCode = instanceFields.missionCode; changed = true; }
             if (changed) setApplicantDetailsOverrides(global0, 0);
@@ -1249,8 +1247,7 @@ export function runApplicantFormWithSubmitHandler(
             submittedStaggerSec != null ||
             typeof j.userPollInterval === "number" ||
             submittedCalendarPollingInterval != null ||
-            "calendarPollingStartDate" in j ||
-            typeof j.bookingSystemMode === "string"
+            "calendarPollingStartDate" in j
           ) {
             const global0 = getApplicantDetailsOverrides(0) ?? {};
             let changed = false;
@@ -1282,13 +1279,6 @@ export function runApplicantFormWithSubmitHandler(
                 delete global0.calendarPollingStartDate;
               }
               changed = true;
-            }
-            if (typeof j.bookingSystemMode === "string") {
-              const m = j.bookingSystemMode.trim().toLowerCase();
-              if (m === "fleet" || m === "legacy") {
-                global0.bookingSystemMode = m;
-                changed = true;
-              }
             }
             if (changed) setApplicantDetailsOverrides(global0, 0);
           }
@@ -1344,23 +1334,6 @@ export function runApplicantFormWithSubmitHandler(
           }
           const result = options.onForceBook();
           json(res, result.ok ? 200 : 409, result);
-          return;
-        }
-
-        if (req.method === "POST" && path === "/api/test-applicants") {
-          if (!onTestApplicantsApi) {
-            json(res, 400, { ok: false, error: "Test applicants API not available in this mode." });
-            return;
-          }
-          try {
-            const result = await onTestApplicantsApi();
-            json(res, 200, result);
-          } catch (e) {
-            json(res, 500, {
-              results: [],
-              error: e instanceof Error ? e.message : String(e),
-            });
-          }
           return;
         }
 

@@ -1,10 +1,8 @@
 import { chromium, Browser, BrowserContext, Page } from "playwright";
 import { config } from "../config/config";
-import { type ScheduleDateConstraint } from "../utils/scheduleAllowedDates.js";
 import { ensureApplicantIpResolved } from "../utils/applicantIp";
 import { getAllocationId } from "../utils/allocationId.store";
 import { getApplicationUrn } from "../utils/applicationUrn.store";
-import { getSlotDate } from "../utils/slotDate.store";
 import {
   getCapturedClientSource,
   setCapturedClientSource,
@@ -17,6 +15,7 @@ import {
   classifyVfs429FromPageText,
   classifyVfs429,
 } from "../utils/vfsRateLimit";
+import { isCloudflareChallengeBody } from "../utils/apiCallLog";
 
 // ── Re-exports for backward compatibility ───────────────────────────────
 export {
@@ -25,6 +24,7 @@ export {
   VfsRateLimitedError,
   AlreadyBookedError,
   isTargetClosedError,
+  isFailedToFetchError,
   readClientSourceHeader,
   LIFT_API_HOST_MARKER,
   injectTurnstileTokenInPage,
@@ -44,11 +44,8 @@ import {
 import {
   postLiftJsonFromPage,
   saveApplicantsOnPage,
-  testSaveApplicantsOnPage,
   postFeesOnPage,
-  postCalendarOnPage,
   fetchCalendarDatesForFleetOnPage,
-  postTimeslotOnPage,
   fetchTimeslotAllocationsForFleetOnPage,
   postMapVasOnPage,
   postScheduleOnPage,
@@ -273,7 +270,7 @@ export class BrowserService implements BrowserServiceCore {
     return kind !== "none";
   }
 
-  async detectPageBlockKind(): Promise<"none" | "account_429" | "ip_429" | "forbidden"> {
+  async detectPageBlockKind(): Promise<"none" | "account_429" | "ip_429" | "forbidden" | "cloudflare"> {
     try {
       const browser = await this.ensureBrowser();
       const pages = this.collectAllPagesFromBrowser(browser);
@@ -281,6 +278,11 @@ export class BrowserService implements BrowserServiceCore {
       if (!page) return "none";
       const bodyText = await page.locator("body").innerText({ timeout: 5_000 });
       const trimmed = bodyText.trim();
+
+      const html = await page.content().catch(() => "");
+      if (isCloudflareChallengeBody(html) || /Just a moment\.\.\./i.test(trimmed)) {
+        return "cloudflare";
+      }
 
       const rate = classifyVfs429FromPageText(trimmed);
       if (rate?.kind === "account") {
@@ -294,6 +296,9 @@ export class BrowserService implements BrowserServiceCore {
         try {
           const parsed = JSON.parse(trimmed) as { code?: string | number };
           const codeStr = parsed.code != null ? String(parsed.code) : "";
+          if (codeStr.startsWith("403201")) {
+                        return "cloudflare";
+          }
           if (codeStr.startsWith("403")) {
                         return "forbidden";
           }
@@ -302,7 +307,7 @@ export class BrowserService implements BrowserServiceCore {
         }
       }
       if (/Access Restricted Due to Unusual Activity/i.test(trimmed) || /403201/.test(trimmed)) {
-                return "forbidden";
+                return "cloudflare";
       }
       if (/Permission Issues/i.test(trimmed) || /403101/.test(trimmed)) {
                 return "forbidden";
@@ -483,11 +488,6 @@ export class BrowserService implements BrowserServiceCore {
     await saveApplicantsOnPage(page);
   }
 
-  async testSaveApplicantsViaLiftApi(): Promise<{ status: number; body: string }> {
-    const page = await this.getVfsPage();
-    return testSaveApplicantsOnPage(page);
-  }
-
   async postFeesLiftApi(): Promise<void> {
     const urn = getApplicationUrn();
     if (!urn?.trim()) {
@@ -497,16 +497,7 @@ export class BrowserService implements BrowserServiceCore {
     await postFeesOnPage(page, urn);
   }
 
-  async postCalendarLiftApi(opts?: { scheduleConstraint?: ScheduleDateConstraint }): Promise<void> {
-    const urn = getApplicationUrn();
-    if (!urn?.trim()) {
-            return;
-    }
-    const page = await this.getVfsPage();
-    await postCalendarOnPage(page, urn, opts);
-  }
-
-  /** Fleet booking: Calendar → dates list (throws on empty/error). */
+  /** Calendar → dates list (throws on empty/error). */
   async fetchCalendarDatesForFleet(): Promise<string[]> {
     const urn = getApplicationUrn();
     if (!urn?.trim()) {
@@ -516,20 +507,7 @@ export class BrowserService implements BrowserServiceCore {
     return fetchCalendarDatesForFleetOnPage(page, urn);
   }
 
-  async postTimeslotLiftApi(): Promise<void> {
-    const urn = getApplicationUrn();
-    const slotDate = getSlotDate();
-    if (!urn?.trim()) {
-            return;
-    }
-    if (!slotDate?.trim()) {
-            return;
-    }
-    const page = await this.getVfsPage();
-    await postTimeslotOnPage(page, urn, slotDate);
-  }
-
-  /** Fleet booking: Timeslot for an assigned date → all entries with allocationId + time. */
+  /** Timeslot for an assigned date → all entries with allocationId + time. */
   async fetchTimeslotAllocationsForFleet(
     slotDate: string
   ): Promise<FleetTimeslotEntry[]> {

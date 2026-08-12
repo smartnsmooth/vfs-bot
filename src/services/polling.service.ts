@@ -4,7 +4,12 @@ import type { CheckIsSlotAvailableResponse } from "../types/slot.type";
 import { isCloudflareChallengeBody } from "../utils/apiCallLog";
 import { classifyVfs429 } from "../utils/vfsRateLimit";
 import type { BrowserService } from "./browser.service";
-import { VfsForbiddenError, VfsGatewayTimeoutError, VfsRateLimitedError } from "./browser.service";
+import {
+  VfsForbiddenError,
+  VfsGatewayTimeoutError,
+  VfsRateLimitedError,
+  isFailedToFetchError,
+} from "./browser.service";
 
 export interface PollResult {
   slot: Slot | null;
@@ -12,7 +17,7 @@ export interface PollResult {
   centerNumber?: 1 | 2;  // Which center found the slot
   centerCode?: string;
   visaCategoryCode?: string;
-  unauthorized?: boolean;  // true when API returns 401 — polling must stop
+  unauthorized?: boolean;  // true when API returns 401 — session expired; caller should relogin + resume
   /** @deprecated Prefer accountBlocked / rateLimitedIp */
   rateLimited?: boolean;
   /** 4290XX — account / User ID restricted; stop the bot */
@@ -24,6 +29,8 @@ export interface PollResult {
   gatewayTimeout?: boolean; // true when API returns 504 — needs full browser restart + IP rotation + re-login
   /** Cloudflare "Just a moment..." / 403201 — clear session, rotate IP, restart Chrome + relogin */
   cloudflareChallenge?: boolean;
+  /** In-page fetch threw (Failed to fetch / net::ERR_*) — hard relogin + rotate IP */
+  fetchFailed?: boolean;
 }
 
 /**
@@ -179,7 +186,7 @@ export class PollingService {
           date: "",
           time: "00:00:00",
         };
-                return {
+        return {
           slot: syntheticSlot,
           response: data,
           centerNumber: options?.centerNumber,
@@ -250,6 +257,22 @@ export class PollingService {
             error: {
               code: -1,
               description: "cloudflareChallenge — clearing session, rotating IP, restarting Chrome.",
+              type: "Error",
+            },
+          },
+        };
+      }
+      if (isFailedToFetchError(err)) {
+        return {
+          slot: null,
+          fetchFailed: true,
+          response: {
+            earliestDate: null,
+            earliestSlotLists: [],
+            error: {
+              code: -1,
+              description:
+                "Failed to fetch — network/proxy drop. Clearing session, rotating IP, restarting Chrome.",
               type: "Error",
             },
           },

@@ -37,7 +37,7 @@ function makeBlockCheck(page: Page): () => Promise<void> {
             throwIfBlockPage(page);
         }
         catch (e) {
-            reporter.setAttention("blocked", "block page (redirect) during login — rotating IP");
+            reporter.setPhase("recovering", "block page (redirect) during login — rotating IP");
             throw e;
         }
         // Body content — throttled (innerText is heavier).
@@ -56,12 +56,12 @@ function makeBlockCheck(page: Page): () => Promise<void> {
         if (/Access Restricted Due to Unusual Activity/i.test(t) || /403201/.test(t) ||
             /Permission Issues/i.test(t) || /403101/.test(t) ||
             /Session Expired or Invalid/i.test(t)) {
-            reporter.setAttention("blocked", "block page during login — rotating IP");
+            reporter.setPhase("recovering", "block page during login — rotating IP");
             throw new VfsForbiddenError("Block page detected during login (403201/403101/session-expired)");
         }
         const rate = classifyVfs429FromPageText(t);
         if (rate) {
-            reporter.setAttention("rate_limit", `rate-limit ${rate.code} during login`);
+            reporter.setPhase("recovering", `rate-limit ${rate.code} during login`);
             throwVfsRateLimited(rate.kind, rate.code, "block page during login");
         }
     };

@@ -63,7 +63,7 @@ export function logApiCall(
   const time = formatCallTime();
   let entry = `- instance ${id} -> ${kind} -> ${time}\n`;
 
-  if (kind === "schedule" && requestPayload != null) {
+  if ((kind === "schedule" || kind === "timeslot") && requestPayload != null) {
     entry += `   payload:\n${formatResponseBlock(requestPayload)}\n`;
   }
 

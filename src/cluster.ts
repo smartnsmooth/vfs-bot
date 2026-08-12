@@ -4,8 +4,6 @@ import { spawn, ChildProcess } from "node:child_process";
 import {
   runApplicantFormWithSubmitHandler,
   closeApplicantFormServer,
-  type TestApplicantsApiBatchResult,
-  type TestApplicantsApiInstanceResult,
 } from "./ui/applicantDetailsFormServer";
 import { setSessionLoginCredentials, getAllInstanceCredentials } from "./utils/sessionLogin.store";
 import { setApplicantDetailsOverrides, getAllInstanceApplicantDetails, getApplicantDetailsOverrides } from "./utils/applicantDetails.store";
@@ -43,9 +41,6 @@ interface BotInstance {
 }
 
 const instances: BotInstance[] = [];
-
-/** Parent waits for `test-applicants-result` from a child (same `requestId`). */
-const pendingTestApplicants = new Map<string, (msg: Record<string, unknown>) => void>();
 
 // ── Staggered launch controller (dashboard-controlled) ──────────────────────
 let staggerIntervalMs = Math.max(0, parseInt(process.env.STAGGER_INTERVAL_MS ?? "6000", 10) || 6000);
@@ -236,6 +231,10 @@ function buildMonitorHooks(): MonitorHooks {
       return { ok: true };
     },
     restartInstance: (id) => {
+      const cur = registry.get(id);
+      if (cur?.alreadyBooked || cur?.phase === "already_booked") {
+        return { ok: false, error: `Bot #${id} is already booked — restart disabled.` };
+      }
       const idx = instances.findIndex((i) => i.id === id);
       if (idx >= 0) {
         const inst = instances[idx]!;
@@ -484,46 +483,6 @@ async function startFormServer(): Promise<void> {
   }, {
     collectLogin: true,
     monitor: buildMonitorHooks(),
-    onTestApplicantsApi: async (): Promise<TestApplicantsApiBatchResult> => {
-      const running = instances.filter((i) => i.process && !i.process.killed);
-      if (running.length === 0) {
-        return { results: [] };
-      }
-      const batchId = `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
-      const results = await Promise.all(
-        running.map(
-          (inst) =>
-            new Promise<TestApplicantsApiInstanceResult>((resolve) => {
-              const requestId = `${batchId}-i${inst.id}`;
-              const timer = setTimeout(() => {
-                if (pendingTestApplicants.delete(requestId)) {
-                  resolve({
-                    instanceId: inst.id,
-                    ok: false,
-                    error:
-                      "Timeout (90s) waiting for applicants API test — ensure this instance is logged in (visa.vfsglobal.com tab open).",
-                  });
-                }
-              }, 90_000);
-              pendingTestApplicants.set(requestId, (msg) => {
-                clearTimeout(timer);
-                pendingTestApplicants.delete(requestId);
-                if (msg.ok === true && typeof msg.status === "number" && typeof msg.bodyPreview === "string") {
-                  resolve({ instanceId: inst.id, ok: true, status: msg.status, bodyPreview: msg.bodyPreview });
-                } else {
-                  resolve({
-                    instanceId: inst.id,
-                    ok: false,
-                    error: typeof msg.error === "string" ? msg.error : "Test applicants API failed",
-                  });
-                }
-              });
-              inst.process!.send({ type: "test-applicants", instanceId: inst.id, requestId });
-            })
-        )
-      );
-      return { results };
-    },
     onForceBook: () => {
       const eligible = instances.filter((i) => i.process && !i.process.killed);
 
@@ -583,23 +542,16 @@ function spawnBotInstance(instanceId: number, totalInstances: number): ChildProc
         inst.process = null;
         pendingStarts = pendingStarts.filter((x) => x !== id);
         registry.setProcessAlive(id, false);
-        registry.markStopped(
-          id,
-          msg.reason === "already-booked" ? "already booked — retired" : "retired"
-        );
+        if (msg.reason === "already-booked") {
+          registry.markAlreadyBooked(id, "already booked");
+        } else {
+          registry.markStopped(id, "retired");
+        }
       }
       try {
         killChromeTreeByCdpPortSync(debugPortForInstance(id));
       } catch {
         /* ignore */
-      }
-      return;
-    }
-    if (msg?.type === "test-applicants-result" && typeof msg.requestId === "string") {
-      const cb = pendingTestApplicants.get(msg.requestId);
-      if (cb) {
-        pendingTestApplicants.delete(msg.requestId);
-        cb(msg as Record<string, unknown>);
       }
       return;
     }

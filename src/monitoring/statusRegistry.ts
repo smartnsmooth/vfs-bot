@@ -35,13 +35,34 @@ class StatusRegistry {
 
   applyStatus(status: InstanceStatus): void {
     const prev = this.map.get(status.instanceId);
+    // Terminal already-booked: ignore late child heartbeats / status noise.
+    if (prev?.alreadyBooked || prev?.phase === "already_booked") {
+      if (status.alreadyBooked || status.phase === "already_booked") {
+        // allow enriching detail only
+      } else {
+        return;
+      }
+    }
     // Parent owns processAlive + chromeAlive probe; don't let child overwrites wipe them.
     const merged: InstanceStatus = {
       ...status,
       chromeAlive: prev?.chromeAlive ?? status.chromeAlive ?? null,
       processAlive: prev?.processAlive ?? status.processAlive ?? true,
       preferMinimized: status.preferMinimized ?? prev?.preferMinimized ?? false,
+      alreadyBooked: Boolean(
+        status.alreadyBooked ||
+          prev?.alreadyBooked ||
+          status.phase === "already_booked" ||
+          prev?.phase === "already_booked"
+      ),
     };
+    if (merged.alreadyBooked) {
+      merged.phase = "already_booked";
+      if (!merged.detail?.trim() || /retired/i.test(merged.detail)) {
+        merged.detail = "already booked";
+      }
+      merged.attention = null;
+    }
     this.map.set(status.instanceId, merged);
     this.notify(merged);
   }
@@ -81,24 +102,45 @@ class StatusRegistry {
     }
 
     if (!patch.chromeAlive) {
-      // Chrome closed — stop attention blink; keep lastError for history on the card.
-      if (next.attention) {
-        next.attention = null;
-        changed = true;
-      }
-      if (next.captcha.last === "waiting") {
-        next.captcha.last = "failed";
-        next.captcha.waitingUntil = null;
-        changed = true;
-      }
-      if (next.phase === "needs_attention") {
-        next.phase = next.processAlive ? "recovering" : "stopped";
-        next.detail = next.processAlive ? "Chrome closed — recovering?" : "Chrome closed";
-        changed = true;
-      } else if (!next.processAlive && next.phase !== "stopped" && next.phase !== "payment") {
-        next.phase = "stopped";
-        next.detail = next.detail?.includes("closed") ? next.detail : "Chrome closed / process stopped";
-        changed = true;
+      // Keep already-booked terminal state as-is.
+      if (next.alreadyBooked || next.phase === "already_booked") {
+        if (next.chromeAlive !== false) {
+          next.chromeAlive = false;
+          changed = true;
+        }
+      } else if (
+        next.phase === "recovering" ||
+        next.phase === "launching" ||
+        next.phase === "login" ||
+        next.phase === "turnstile" ||
+        next.phase === "otp"
+      ) {
+        // Hard relogin intentionally kills Chrome — only record liveness, do not
+        // rewrite phase/detail (that was causing Monitor card flicker).
+        if (next.chromeAlive !== false) {
+          next.chromeAlive = false;
+          changed = true;
+        }
+      } else {
+        // Chrome closed — stop attention blink; keep lastError for history on the card.
+        if (next.attention) {
+          next.attention = null;
+          changed = true;
+        }
+        if (next.captcha.last === "waiting") {
+          next.captcha.last = "failed";
+          next.captcha.waitingUntil = null;
+          changed = true;
+        }
+        if (next.phase === "needs_attention") {
+          next.phase = next.processAlive ? "recovering" : "stopped";
+          next.detail = next.processAlive ? "Chrome closed — recovering?" : "Chrome closed";
+          changed = true;
+        } else if (!next.processAlive && next.phase !== "stopped" && next.phase !== "payment") {
+          next.phase = "stopped";
+          next.detail = next.detail?.includes("closed") ? next.detail : "Chrome closed / process stopped";
+          changed = true;
+        }
       }
       if (next.preferMinimized) {
         next.preferMinimized = false;
@@ -116,6 +158,8 @@ class StatusRegistry {
   markStopped(instanceId: number, detail = "stopped"): void {
     const cur = this.map.get(instanceId);
     if (!cur) return;
+    // Already-booked is terminal — do not overwrite with generic exit/stop noise.
+    if (cur.alreadyBooked || cur.phase === "already_booked") return;
     // If already relaunched (phase launching after Restart), do not overwrite with stopped+old blink state.
     if (cur.phase === "launching" && /restart/i.test(cur.detail)) return;
     const next: InstanceStatus = {
@@ -129,6 +173,31 @@ class StatusRegistry {
       detail,
       attention: null,
       processAlive: false,
+      updatedAt: Date.now(),
+    };
+    this.map.set(instanceId, next);
+    this.notify(next);
+  }
+
+  /** Applicants/schedule 1037 / 1101 — terminal; hide Restart on Monitor. */
+  markAlreadyBooked(instanceId: number, detail = "already booked"): void {
+    const cur = this.map.get(instanceId);
+    if (!cur) return;
+    const next: InstanceStatus = {
+      ...cur,
+      captcha: {
+        ...cur.captcha,
+        last: cur.captcha.last === "waiting" ? "n/a" : cur.captcha.last,
+        waitingUntil: null,
+      },
+      phase: "already_booked",
+      detail: detail.trim() || "already booked",
+      attention: null,
+      alreadyBooked: true,
+      processAlive: false,
+      chromeAlive: false,
+      pollingPaused: false,
+      preferMinimized: false,
       updatedAt: Date.now(),
     };
     this.map.set(instanceId, next);
@@ -166,7 +235,8 @@ class StatusRegistry {
   private sweep(): void {
     const now = Date.now();
     for (const status of this.map.values()) {
-      if (status.phase === "stopped" || status.phase === "payment") continue;
+      if (status.phase === "stopped" || status.phase === "payment" || status.phase === "already_booked") continue;
+      if (status.alreadyBooked) continue;
       if (status.phase === "unresponsive") continue;
       if (!status.processAlive) continue;
       if (now - status.heartbeatAt > STALE_MS) {

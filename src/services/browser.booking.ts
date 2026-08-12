@@ -1,12 +1,5 @@
 import type { Page } from "playwright";
 import { config, getCurrentInstanceId } from "../config/config";
-import {
-  calendarApiDateMatchesConstraint,
-  NoDatesInScheduleRangeError,
-  scheduleConstraintIsActive,
-  scheduleConstraintLogValue,
-  type ScheduleDateConstraint,
-} from "../utils/scheduleAllowedDates.js";
 import { buildCalendarBody, CALENDAR_URL, firstDayOfNextMonthFromDdMmYyyy } from "../config/calendar";
 import { buildScheduleBody, SCHEDULE_URL } from "../config/schedule";
 import { buildTimeslotBody, TIMESLOT_URL } from "../config/timeslot";
@@ -14,9 +7,7 @@ import { buildFeesBody, FEES_URL } from "../config/fees";
 import { buildMapVasBody, MAPVAS_URL } from "../config/mapvas";
 import { buildSaveApplicantsBody, SAVE_APPLICANTS_URL } from "../config/saveApplicants";
 import { ensureApplicantIpResolved } from "../utils/applicantIp";
-import { getAllocationId, setAllocationId } from "../utils/allocationId.store";
 import { getApplicationUrn, setApplicationUrn } from "../utils/applicationUrn.store";
-import { getSlotDate, setSlotDate, getCalendarDatesCount, setCalendarDatesCount } from "../utils/slotDate.store";
 import { setTotalAmount, setCurrency } from "../utils/totalAmount.store";
 import { getCapturedClientSource } from "../utils/capturedClientSource.store";
 import { setScheduleUrl } from "../utils/scheduleUrl.store";
@@ -90,6 +81,7 @@ export async function postLiftJsonFromPage(
     } else if (
       logKind === "applicants" ||
       logKind === "calendar" ||
+      logKind === "fees" ||
       logKind === "timeslot" ||
       logKind === "schedule"
     ) {
@@ -270,14 +262,6 @@ export async function saveApplicantsOnPage(page: Page): Promise<void> {
   setApplicationUrn(urn);
   }
 
-export async function testSaveApplicantsOnPage(page: Page): Promise<{ status: number; body: string }> {
-  await page.waitForTimeout(500);
-  await ensureApplicantIpResolved(page);
-  const body = buildSaveApplicantsBody();
-    const res = await postLiftJsonFromPage(page, SAVE_APPLICANTS_URL, body);
-    return res;
-}
-
 // ── Fees ─────────────────────────────────────────────────────────────────
 
 export async function postFeesOnPage(page: Page, urn: string): Promise<void> {
@@ -329,76 +313,9 @@ export async function postMapVasOnPage(page: Page, urn: string): Promise<void> {
 
 // ── Calendar ─────────────────────────────────────────────────────────────
 
-export async function postCalendarOnPage(
-  page: Page,
-  urn: string,
-  opts?: { scheduleConstraint?: ScheduleDateConstraint }
-): Promise<void> {
-  type CalJson = { error?: unknown; calendars?: Array<{ date?: string; isWeekend?: boolean }> | null };
-  const isCalendar1035FullSlot = (e: unknown): boolean =>
-    e != null && typeof e === "object" && (e as { code?: unknown }).code === 1035;
-
-  let payload: Record<string, unknown> = buildCalendarBody(urn);
-    let res = await postLiftJsonFromPage(page, CALENDAR_URL, payload);
-  let j: CalJson;
-  try {
-    j = JSON.parse(res.body) as CalJson;
-    if (isCalendar1035FullSlot(j.error)) {
-      const prevFrom = String(payload.fromDate ?? "");
-      const retryFrom = firstDayOfNextMonthFromDdMmYyyy(prevFrom);
-            payload = buildCalendarBody(urn, { fromDate: retryFrom });
-            res = await postLiftJsonFromPage(page, CALENDAR_URL, payload);
-      j = JSON.parse(res.body) as CalJson;
-    }
-    if (j.error != null && j.error !== "") {
-      throw new Error(`Calendar API error: ${JSON.stringify(j.error)}`);
-    }
-  } catch (e) {
-    if (e instanceof Error && e.message.startsWith("Calendar API error")) throw e;
-    throw new Error("Calendar: response is not JSON");
-  }
-  let dates = (j.calendars ?? []).map((c) => String(c?.date ?? "").trim()).filter(Boolean);
-  const constraint = opts?.scheduleConstraint;
-  if (constraint && scheduleConstraintIsActive(constraint)) {
-    const before = dates.length;
-    dates = dates.filter((d) => calendarApiDateMatchesConstraint(d, constraint));
-        if (dates.length === 0) {
-      throw new NoDatesInScheduleRangeError();
-    }
-  }
-
-  if (dates.length > 0) {
-    const totalInstances = Math.max(1, parseInt(process.env.BOT_TOTAL_INSTANCES ?? "1", 10) || 1);
-    const myId = getCurrentInstanceId() ?? 1;
-    const myIdx = Math.max(0, Math.min(totalInstances - 1, myId - 1));
-
-    const base = Math.floor(totalInstances / dates.length);
-    const rem = totalInstances % dates.length;
-
-    let chosenIdx = 0;
-    let acc = 0;
-    for (let i = 0; i < dates.length; i++) {
-      const size = base + (i < rem ? 1 : 0);
-      const start = acc;
-      const end = acc + size;
-      if (myIdx >= start && myIdx < end) {
-        chosenIdx = i;
-        break;
-      }
-      acc = end;
-    }
-
-    const chosen = dates[chosenIdx]!;
-    setSlotDate(chosen);
-    setCalendarDatesCount(dates.length);
-      } else {
-      }
-  }
-
 /**
- * Fleet mode: call Calendar and return all non-empty calendars[].date values.
+ * Call Calendar and return all non-empty calendars[].date values.
  * Empty list or API error throws (caller advances to next waiter).
- * Does not apply per-bot schedule filter or legacy date sharding.
  */
 export async function fetchCalendarDatesForFleetOnPage(page: Page, urn: string): Promise<string[]> {
   type CalJson = { error?: unknown; calendars?: Array<{ date?: string; isWeekend?: boolean }> | null };
@@ -432,8 +349,8 @@ export async function fetchCalendarDatesForFleetOnPage(page: Page, urn: string):
 }
 
 /**
- * Fleet mode: call Timeslot for a given date and return every allocationId in slots[]
- * (with that date). Does not use legacy sharding.
+ * Call Timeslot for a given date and return every allocationId in slots[]
+ * (with that date).
  */
 export interface FleetTimeslotEntry {
   allocationId: string;
@@ -472,67 +389,9 @@ export async function fetchTimeslotAllocationsForFleetOnPage(
   }
     const inst = getCurrentInstanceId() ?? 1;
   void new TelegramService()
-    .alert("hold_success", `Instance ${inst} timeslot (fleet) for ${dateLabel}: ${entries.length} allocation(s)`)
+    .alert("hold_success", `Instance ${inst} timeslot for ${dateLabel}: ${entries.length} allocation(s)`)
     .catch(() => { });
   return entries;
-}
-
-// ── Timeslot ─────────────────────────────────────────────────────────────
-
-export async function postTimeslotOnPage(page: Page, urn: string, slotDateFromCalendar: string): Promise<void> {
-  const payload = buildTimeslotBody(urn, slotDateFromCalendar);
-    const res = await postLiftJsonFromPage(page, TIMESLOT_URL, payload);
-  let j: {
-    error?: unknown;
-    slots?: Array<{ allocationId?: string | number; slot?: string; type?: string }>;
-  };
-  try {
-    j = JSON.parse(res.body) as typeof j;
-    if (j.error !== null && j.error !== undefined) {
-      throw new Error(`Timeslot API error: ${JSON.stringify(j.error)}`);
-    }
-  } catch (e) {
-    if (e instanceof Error && e.message.startsWith("Timeslot API error")) throw e;
-    throw new Error("Timeslot: response is not JSON");
-  }
-  const slots = j.slots ?? [];
-  if (slots.length === 0) {
-      } else {
-    const totalInstances = Math.max(1, parseInt(process.env.BOT_TOTAL_INSTANCES ?? "1", 10) || 1);
-    const myId = getCurrentInstanceId() ?? 1;
-    const myIdx = Math.max(0, Math.min(totalInstances - 1, myId - 1));
-
-    const dateCount = Math.max(1, getCalendarDatesCount());
-    const dateBase = Math.floor(totalInstances / dateCount);
-    const dateRem = totalInstances % dateCount;
-
-    let groupStart = 0;
-    let groupSize = totalInstances;
-    let acc = 0;
-    for (let i = 0; i < dateCount; i++) {
-      const size = dateBase + (i < dateRem ? 1 : 0);
-      if (myIdx >= acc && myIdx < acc + size) {
-        groupStart = acc;
-        groupSize = size;
-        break;
-      }
-      acc += size;
-    }
-    const subIdx = myIdx - groupStart;
-
-    const chosenSlotIdx = subIdx % slots.length;
-    const chosen = slots[chosenSlotIdx];
-    const alloc = String(chosen?.allocationId ?? "").trim();
-    if (alloc) {
-      setAllocationId(alloc);
-          } else {
-          }
-  }
-  
-  const inst = getCurrentInstanceId() ?? 1;
-  void new TelegramService()
-    .alert("hold_success", `Instance ${inst} holds slot for ${payload.slotDate}`)
-    .catch(() => { });
 }
 
 // ── Schedule ─────────────────────────────────────────────────────────────

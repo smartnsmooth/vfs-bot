@@ -1,5 +1,5 @@
 /**
- * Fleet Calendar booking flow (setup form bookingSystemMode = "fleet").
+ * Fleet Calendar booking flow (sole booking system).
  *
  * 1. First URN = FeeCalculator → Calendar (dedup) → Fees → then joins instance loop
  * 2. Every URN holder (including FeeCalculator after fees) runs:
@@ -41,11 +41,6 @@ import {
 import { reporter } from "../monitoring/statusReporter";
 
 const DEFAULT_CALENDAR_POLLING_INTERVAL_SEC = 60;
-
-export function isFleetCalendarBookingEnabled(): boolean {
-  const globalDet = getApplicantDetailsOverrides(0);
-  return globalDet?.bookingSystemMode === "fleet";
-}
 
 export function getCalendarPollingIntervalMs(): number {
   const globalDet = getApplicantDetailsOverrides(0);
@@ -110,7 +105,7 @@ async function runFeeCalculatorCalendarAndFees(
   browser: BrowserService,
   instanceId: number
 ): Promise<boolean> {
-  reporter.setBookingStep("calendar (FeeCalculator)");
+  reporter.setBookingStep("calendar");
   try {
     const dates = await browser.fetchCalendarDatesForFleet();
     const deduped = dedupeCalendarDates(dates);
@@ -121,7 +116,7 @@ async function runFeeCalculatorCalendarAndFees(
     return false;
   }
 
-  reporter.setBookingStep("fees (FeeCalculator)");
+  reporter.setBookingStep("fees");
   try {
     await browser.postFeesLiftApi();
     const totalAmount = getTotalAmount();
@@ -243,7 +238,7 @@ export async function runFleetCalendarBooking(opts: {
         state.calendarCalled &&
         !state.feesDone
       ) {
-        reporter.setBookingStep("fees (FeeCalculator retry)");
+        reporter.setBookingStep("fees · retry");
         try {
           await browser.postFeesLiftApi();
           const totalAmount = getTotalAmount();
@@ -258,7 +253,7 @@ export async function runFleetCalendarBooking(opts: {
 
       // ── Wait for fees to be published before any instance proceeds ─
       if (!state.feesDone) {
-        reporter.setBookingStep("waiting for FeeCalculator");
+        reporter.setBookingStep("fees · waiting");
         const woke = await waitForCoordOrTimeout({
           abortSeq, waitForAbort,
           timeoutMs: 500,
@@ -299,7 +294,7 @@ export async function runFleetCalendarBooking(opts: {
           const waitMs = Math.max(0, readyAt - Date.now());
 
           if (waitMs > 0) {
-            reporter.setBookingStep(`calendar re-poll in ${Math.round(waitMs / 1000)}s`);
+            reporter.setBookingStep(`calendar · re-poll in ${Math.round(waitMs / 1000)}s`);
             const woke = await waitForCoordOrTimeout({
               abortSeq, waitForAbort,
               timeoutMs: Math.min(waitMs, 2000),
@@ -309,7 +304,7 @@ export async function runFleetCalendarBooking(opts: {
             continue;
           }
 
-          reporter.setBookingStep("calendar (fleet re-poll)");
+          reporter.setBookingStep("calendar · re-poll");
           try {
             const dates = await browser.fetchCalendarDatesForFleet();
             publishCalendarRepollDates(instanceId, dates);
@@ -321,7 +316,7 @@ export async function runFleetCalendarBooking(opts: {
         }
 
         // Not our turn — wait for coord change
-        reporter.setBookingStep("waiting calendar re-poll turn");
+        reporter.setBookingStep("calendar · waiting turn");
         const woke = await waitForCoordOrTimeout({
           abortSeq, waitForAbort,
           timeoutMs: 2000,

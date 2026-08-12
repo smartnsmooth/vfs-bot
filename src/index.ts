@@ -10,7 +10,7 @@ import path from "node:path";
 import { config, setCurrentInstanceId } from "./config/config";
 import { classifyVfsFirstTabUrl } from "./flows/vfsTabUrl";
 import { PollingService } from "./services/polling.service";
-import { BrowserService, VfsForbiddenError, VfsGatewayTimeoutError, VfsRateLimitedError, AlreadyBookedError } from "./services/browser.service";
+import { BrowserService, VfsForbiddenError, VfsGatewayTimeoutError, VfsRateLimitedError, AlreadyBookedError, isFailedToFetchError } from "./services/browser.service";
 import { TelegramService } from "./services/telegram.service";
 import {
   runApplicantFormWithSubmitHandler,
@@ -26,16 +26,8 @@ import {
   type SlotFoundState,
 } from "./utils/slotState";
 import { setSlotCenterOverride, clearSlotCenterOverride } from "./utils/slotCenterOverride.store";
-import { setSlotDate, clearSlotDate } from "./utils/slotDate.store";
+import { clearSlotDate } from "./utils/slotDate.store";
 import { getApplicationUrn } from "./utils/applicationUrn.store";
-import { getAllocationId } from "./utils/allocationId.store";
-import {
-  isPollingSlotInConstraint,
-  NoDatesInScheduleRangeError,
-  resolveScheduleDateConstraint,
-  scheduleConstraintIsActive,
-  scheduleConstraintLogValue,
-} from "./utils/scheduleAllowedDates.js";
 import { clearApplicantIpCache, getApplicantIpForPayload } from "./utils/applicantIp";
 import { logInstanceIp, type InstanceIpLogReason } from "./utils/apiCallLog";
 import { clearChromeSessionDataBeforeLaunch, resolveChromeProfileFolderName } from "./utils/chromeProfileSessionClean";
@@ -70,7 +62,7 @@ import {
 } from "./utils/applicantsCoord";
 import { allClusterParticipantIds, waitForJoinStagger } from "./utils/joinStagger";
 import { getEffectiveJoinStaggerMs, registerFleetUrn, retireFromFleet } from "./utils/calendarBookingCoord";
-import { isFleetCalendarBookingEnabled, runFleetCalendarBooking } from "./flows/fleetCalendarBooking";
+import { runFleetCalendarBooking } from "./flows/fleetCalendarBooking";
 import { saveAlreadyBookedAccountFile } from "./utils/alreadyBookedAccountFile";
 import { reporter } from "./monitoring/statusReporter";
 import { registry } from "./monitoring/statusRegistry";
@@ -119,10 +111,6 @@ async function resolveAndReportEgressIp(opts?: {
 }
 
 const DEFAULT_POST_LOGIN_POLL_DELAY_SEC = 30;
-const FAST_SKIP_CALENDAR_UP_TO_INSTANCE = Math.max(
-  0,
-  parseInt(process.env.FAST_SKIP_CALENDAR_UP_TO_INSTANCE ?? "5", 10) || 5
-);
 const DEFAULT_POLL_INTERVAL_SEC = 60;
 
 type ProxyChainModule = {
@@ -237,6 +225,19 @@ async function relaunchChromeAfterCredentialSwapLogout(): Promise<void> {
 }
 
 /**
+ * Cloudflare challenge recovery during polling:
+ * skip VFS logout (CF interstitial can hang logout), hard relogin
+ * (kill Chrome, clear cache/cookies, rotate IP, new Chrome, login).
+ */
+async function recoverFromCloudflareChallenge(
+  instanceId?: number,
+  context?: string
+): Promise<void> {
+  // Do not call logout — CF interstitial / poisoned session can hang logout.
+  await performHardRelogin(instanceId, context ?? "cloudflare-challenge");
+}
+
+/**
  * After a soft (4292XX) IP rotate, the next 429 of any kind triggers full relogin + cache clear.
  * Cleared on successful recovery escalations and on account-block stop.
  */
@@ -283,44 +284,26 @@ async function rotateIpWithoutRelogin(context: string): Promise<boolean> {
 }
 
 /**
- * Handle 4292XX / soft IP rate-limit.
- * First hit → rotate IP only. Second hit (or failed soft restore) → full relogin with cache clear.
+ * Handle 4292XX / IP rate-limit after login via hard relogin
+ * (kill Chrome, clear cache/cookies, rotate IP, new Chrome, login).
  */
 async function handleIpRateLimitRecovery(
   instanceId: number | undefined,
   context: string,
   code?: string
-): Promise<"soft_rotated" | "full_relogin"> {
+): Promise<"full_relogin"> {
   const label = code ?? "4292xx";
-  reporter.setPhase("recovering", `IP rate-limit ${label} — rotating IP`);
+  reporter.setPhase("recovering", `IP rate-limit ${label} — hard relogin`);
   reporter.setPoll({ code: label });
-  if (!softIpRotateAwaitingSecond429) {
-    await telegram
-      .alert(
-        "error",
-        `Bot ${instanceId ?? "?"} got IP rate-limit ${label} (${context}). Rotating IP without relogin...`
-      )
-      .catch(() => { });
-    const ok = await rotateIpWithoutRelogin(context);
-    if (ok) {
-            await telegram
-        .alert("info", `Bot ${instanceId ?? "?"} IP rotated (no relogin) after ${label} — resuming.`)
-        .catch(() => { });
-      return "soft_rotated";
-    }
-  } else {
-        await telegram
-      .alert(
-        "error",
-        `Bot ${instanceId ?? "?"} still rate-limited (${label}) after IP rotate. Full relogin + cache clear...`
-      )
-      .catch(() => { });
-  }
-
-  clearSoftIpRotateFlag();
-  await performPollStyleRelogin(instanceId, `${context}-escalate`);
-    await telegram
-    .alert("info", `Bot ${instanceId ?? "?"} recovered from ${label} via full relogin — resuming.`)
+  await telegram
+    .alert(
+      "error",
+      `Bot ${instanceId ?? "?"} got IP rate-limit ${label} (${context}). Hard relogin (kill Chrome + clear session + rotate IP)...`
+    )
+    .catch(() => { });
+  await performHardRelogin(instanceId, `${context}-ip-rate-limit`);
+  await telegram
+    .alert("info", `Bot ${instanceId ?? "?"} recovered from ${label} via hard relogin — resuming.`)
     .catch(() => { });
   return "full_relogin";
 }
@@ -345,19 +328,17 @@ async function stopForAccountRateLimit(
 
 async function retireInstanceForAlreadyBooked(instanceId: number | undefined, reason?: string): Promise<never> {
   instanceStopped = true;
-  const label = reason ?? "already booked";
-  reporter.setAttention("blocked", `${label} — retired`);
-  reporter.setPhase("stopped", `${label} — retired`);
+  const label = "already booked";
+  reporter.setAttention(null);
+  reporter.setPhase("already_booked", label);
 
-  saveAlreadyBookedAccountFile({}, { error: label }, instanceId);
+  saveAlreadyBookedAccountFile({}, { error: reason ?? label }, instanceId);
 
   const id = typeof instanceId === "number" && Number.isFinite(instanceId) && instanceId >= 1
     ? Math.floor(instanceId)
     : parseInt(process.env.BOT_INSTANCE_ID ?? "1", 10) || 1;
 
-  if (isFleetCalendarBookingEnabled()) {
-    try { retireFromFleet(id); } catch { /* ignore */ }
-  }
+  try { retireFromFleet(id); } catch { /* ignore */ }
 
   await telegram
     .alert("info", `Bot ${instanceId ?? "?"} ${label} — account archived and instance shutting down.`)
@@ -514,15 +495,10 @@ async function checkUrlForPageNotFound(url: string, context: string): Promise<vo
 }
 
 async function rotateIpForPageNotFound(instanceId?: number, context?: string): Promise<void> {
-    reporter.setPhase("recovering", "page-not-found — rotating IP + restart");
-  reporter.setAttention("blocked", "page-not-found — restarting bot");
   await telegram
-    .alert("error", `Bot ${instanceId ?? "?"} page-not-found — rotating IP + restart`)
+    .alert("error", `Bot ${instanceId ?? "?"} page-not-found — hard relogin (kill Chrome + clear session + rotate IP)`)
     .catch(() => { });
-  clearApplicantIpCache();
-  await browser.disconnectCdp().catch(() => { });
-  await relaunchChromeAfterCredentialSwapLogout();
-  await resolveAndReportEgressIp({ logAs: "rotate-ip", instanceId });
+  await performHardRelogin(instanceId, context ?? "page-not-found");
 }
 function waitForPollingAbort(currentSeq: number): Promise<void> {
   if (pollingAbortSeq !== currentSeq) return Promise.resolve();
@@ -1399,10 +1375,24 @@ async function runPollLoop(
             await handleIpRateLimitRecovery(instanceId, "polling-page-block", "4292xx");
             continue;
           }
+          if (blockKind === "cloudflare") {
+            reporter.setPhase("recovering", "Cloudflare challenge page — recovering");
+            await telegram
+              .alert(
+                "error",
+                `Bot ${instanceId ?? "?"} hit Cloudflare challenge page during polling (${urlAfterClaim || "unknown"}). Clearing cookies/session + rotating IP + restarting Chrome...`
+              )
+              .catch(() => { });
+            await recoverFromCloudflareChallenge(instanceId, "polling-cloudflare-page");
+            await telegram
+              .alert("info", `Bot ${instanceId ?? "?"} recovered from Cloudflare challenge page — polling resumed.`)
+              .catch(() => { });
+            continue;
+          }
           if (blockKind === "forbidden") {
-                        reporter.setAttention("blocked", "block page after login — rotating IP + relogin");
+            reporter.setPhase("recovering", "block page after login — rotating IP + relogin");
             await telegram.alert("error", `Bot ${instanceId ?? "?"} hit a block page during polling (${urlAfterClaim || "unknown"}). Restarting browser + rotating IP + relogin...`).catch(() => { });
-            await performPollStyleRelogin(instanceId, "polling-block-page");
+            await performHardRelogin(instanceId, "polling-block-page");
             continue;
           }
                     await telegram.alert("error", `Not on a supported VFS page for polling (${urlAfterClaim || "unknown"}). Polling stopped.`).catch(() => { });
@@ -1412,7 +1402,7 @@ async function runPollLoop(
                 reporter.setPhase("polling", `checking center ${center.centerNumber} (${center.vacCode})`);
         reporter.setPoll({ center: `${center.centerNumber}:${center.vacCode}`, pollCount: completed + 1 });
 
-        const { slot, response, centerNumber, centerCode, visaCategoryCode, unauthorized, accountBlocked, rateLimitedIp, rateLimitCode, forbidden, gatewayTimeout, cloudflareChallenge } = await polling.checkSlotsInBrowser(browser, {
+        const { slot, response, centerNumber, centerCode, visaCategoryCode, unauthorized, accountBlocked, rateLimitedIp, rateLimitCode, forbidden, gatewayTimeout, cloudflareChallenge, fetchFailed } = await polling.checkSlotsInBrowser(browser, {
           centerCode: center.vacCode,
           visaCategoryCode: center.visaCategoryCode,
           centerNumber: center.centerNumber,
@@ -1420,20 +1410,35 @@ async function runPollLoop(
 
         
         if (gatewayTimeout) {
-          reporter.setAttention("gateway_timeout", "504 Gateway Timeout");
+          reporter.setPhase("recovering", "504 Gateway Timeout — continuing");
           await telegram.alert("error", `Bot ${instanceId ?? "?"} got 504 Gateway Timeout during polling — continuing.`).catch(() => { });
           continue;
         }
 
-        if (cloudflareChallenge) {
-          reporter.setAttention("cf_challenge", "Cloudflare challenge — recovering");
+        if (fetchFailed) {
+          reporter.setRecoveringError("fetch fail", "Failed to fetch — hard relogin (proxy/network)");
           await telegram
             .alert(
               "error",
-              `Bot ${instanceId ?? "?"} got Cloudflare challenge during polling. Clearing session + rotating IP + restarting Chrome...`
+              `Bot ${instanceId ?? "?"} got Failed to fetch during polling (proxy/network). Clearing session + rotating IP + restarting Chrome...`
             )
             .catch(() => { });
-          await performPollStyleRelogin(instanceId, "cloudflare-challenge-recovery");
+          await performHardRelogin(instanceId, "failed-to-fetch-polling");
+          await telegram
+            .alert("info", `Bot ${instanceId ?? "?"} recovered from Failed to fetch — polling resumed.`)
+            .catch(() => { });
+          continue;
+        }
+
+        if (cloudflareChallenge) {
+          reporter.setPhase("recovering", "Cloudflare challenge — recovering");
+          await telegram
+            .alert(
+              "error",
+              `Bot ${instanceId ?? "?"} got Cloudflare challenge on CheckIsSlotAvailable. Clearing cookies/session + rotating IP + restarting Chrome...`
+            )
+            .catch(() => { });
+          await recoverFromCloudflareChallenge(instanceId, "cloudflare-challenge-polling");
           await telegram
             .alert("info", `Bot ${instanceId ?? "?"} recovered from Cloudflare challenge — polling resumed.`)
             .catch(() => { });
@@ -1441,15 +1446,26 @@ async function runPollLoop(
         }
 
         if (forbidden) {
-                    await telegram.alert("error", `Bot ${instanceId ?? "?"} got 403 Forbidden during polling. Restarting browser + rotating IP...`).catch(() => { });
-            await performPollStyleRelogin(instanceId, "403-forbidden-recovery");
-                    await telegram.alert("info", `Bot ${instanceId ?? "?"} recovered from 403 — polling resumed.`).catch(() => { });
+          reporter.setPhase("recovering", "403 Forbidden — rotating IP + relogin");
+          await telegram.alert("error", `Bot ${instanceId ?? "?"} got 403 Forbidden during polling. Restarting browser + rotating IP...`).catch(() => { });
+          await performHardRelogin(instanceId, "403-forbidden-recovery");
+          await telegram.alert("info", `Bot ${instanceId ?? "?"} recovered from 403 — polling resumed.`).catch(() => { });
           continue;
         }
 
         if (unauthorized) {
-                    await telegram.alert("error", "401 Unauthorized — session expired. Polling stopped. Please re-login.").catch(() => { });
-          return false;
+          reporter.setRecoveringError("401", "401 Unauthorized — hard relogin");
+          await telegram
+            .alert(
+              "error",
+              `Bot ${instanceId ?? "?"} got 401 Unauthorized during polling (VFS session expired). Restarting browser + rotating IP + relogin...`
+            )
+            .catch(() => { });
+          await performHardRelogin(instanceId, "401-unauthorized-recovery");
+          await telegram
+            .alert("info", `Bot ${instanceId ?? "?"} recovered from 401 — polling resumed.`)
+            .catch(() => { });
+          continue;
         }
 
         if (accountBlocked) {
@@ -1484,7 +1500,27 @@ async function runPollLoop(
 
         await telegram.alert("no_slot_found", `No slot in Center ${center.centerNumber} (${center.vacCode})`).catch(() => { });
               } catch (err) {
-                await telegram.alert("error", err instanceof Error ? err.message : "Poll error").catch(() => { });
+        if (isFailedToFetchError(err)) {
+          reporter.setRecoveringError("fetch fail", "Failed to fetch — hard relogin (proxy/network)");
+          await telegram
+            .alert(
+              "error",
+              `Bot ${instanceId ?? "?"} got Failed to fetch during polling (proxy/network). Clearing session + rotating IP + restarting Chrome...`
+            )
+            .catch(() => { });
+          try {
+            await performHardRelogin(instanceId, "failed-to-fetch-polling");
+            await telegram
+              .alert("info", `Bot ${instanceId ?? "?"} recovered from Failed to fetch — polling resumed.`)
+              .catch(() => { });
+          } catch (recoverErr) {
+            await telegram
+              .alert("error", recoverErr instanceof Error ? recoverErr.message : "Failed to fetch recovery failed")
+              .catch(() => { });
+          }
+        } else {
+          await telegram.alert("error", err instanceof Error ? err.message : "Poll error").catch(() => { });
+        }
       }
       completed += 1;
       if (limit > 0 && completed >= limit) {
@@ -1530,6 +1566,15 @@ function isSaveApplicants10673(err: unknown): boolean {
   }
 }
 
+/** Save applicants returned HTTP 401 Unauthorized — session dead; hard relogin. */
+function isSaveApplicants401(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  return (
+    /Save applicants failed HTTP 401\b/i.test(err.message) ||
+    (/Save applicants failed HTTP/i.test(err.message) && /Unauthorized/i.test(err.message))
+  );
+}
+
 /** Save-applicants API / HTTP failure (excluding 10673, which has its own retry loop). */
 function isSaveApplicantsFailure(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
@@ -1555,43 +1600,24 @@ function getFixedTimingForInstance(instanceId?: number): { postLoginOffsetMs: nu
   };
 }
 
-function deriveCalendarDateFromPollingRaw(raw?: string): string | null {
-  if (!raw) return null;
-  const t = raw.trim();
-  if (!t) return null;
-  // Expected from polling: MM/DD/YYYY [time...]
-  const m = t.match(/^(\d{2})\/(\d{2})\/(\d{4})/);
-  if (m) {
-    const [, mm, dd, yyyy] = m;
-    return `${mm}/${dd}/${yyyy}`;
-  }
-  // Fallback: YYYY-MM-DD -> MM/DD/YYYY
-  const iso = t.match(/^(\d{4})-(\d{2})-(\d{2})/);
-  if (iso) {
-    const [, yyyy, mm, dd] = iso;
-    return `${mm}/${dd}/${yyyy}`;
-  }
-  return null;
-}
-
 /**
- * Same session refresh as periodic poll relogin: logout, optional Chrome restart + proxy rotation, login, prepare polling.
- * Save-applicants 10673 recovery always kills Chrome and respawns so `ensureChromeWithDevTools` runs session clean + proxy bump (same as two-account hard swap), even with a single VFS account.
+ * Hard relogin: kill Chrome, clear cache/cookies/session, rotate proxy IP,
+ * open a new Chrome, login, settle on dashboard, prepare polling.
  */
-async function performPollStyleRelogin(instanceId?: number, context?: string): Promise<void> {
-  const pollReloginInterval = config.pollReloginInterval;
-  const ctx = context ?? "poll-relogin";
+async function performHardRelogin(instanceId?: number, context?: string): Promise<void> {
+  const ctx = context ?? "hard-relogin";
   clearSoftIpRotateFlag();
-  reporter.setPhase("recovering", `relogin (${ctx})`);
-
-    await browser.logoutVfsAndOpenLoginFirstTab().catch(() => {
-    /* tab may already be gone */
-  });
+  if (/failed-to-fetch|fetch/i.test(ctx)) {
+    reporter.setRecoveringError("fetch fail", `hard relogin — ${ctx}`);
+  } else if (/401|unauthorized/i.test(ctx)) {
+    reporter.setRecoveringError("401", `hard relogin — ${ctx}`);
+  } else {
+    reporter.setPhase("recovering", `hard relogin — kill Chrome + clear session + rotate IP (${ctx})`);
+  }
   clearApplicantIpCache();
   await relaunchChromeAfterCredentialSwapLogout();
   await performVfsLoginFromStore(instanceId);
   await resolveAndReportEgressIp({ logAs: "recover", instanceId });
-  // Mid-workflow restart/relogin: settle on dashboard (minimize + 30s) before polling again.
   await settleOnDashboard({
     instanceId,
     waitMs: RESTART_DASHBOARD_WAIT_MS,
@@ -1601,8 +1627,8 @@ async function performPollStyleRelogin(instanceId?: number, context?: string): P
 }
 
 /**
- * Full session recovery after save-applicants failure:
- * logout, close Chrome, clear cache/cookies, rotate IP, login, prepare polling, poll again.
+ * Session recovery after save-applicants failure:
+ * hard relogin, then poll again.
  * Only clears this instance's in-memory overrides — does NOT delete slot-state.json
  * because other instances may still be booking based on that shared signal.
  * Returns whether a slot was found (self or peer) and polling should resume booking.
@@ -1614,15 +1640,15 @@ async function recoverFromSaveApplicantsFailure(
 ): Promise<boolean> {
   const msg = err instanceof Error ? err.message : String(err);
     await telegram
-    .alert("error", `Save applicants failed (instance ${instanceId ?? 1}), full relogin: ${msg}`)
+    .alert("error", `Save applicants failed (instance ${instanceId ?? 1}), hard relogin: ${msg}`)
     .catch(() => { });
   clearSlotCenterOverride();
   clearSlotDate();
-  await performPollStyleRelogin(instanceId, context);
+  await performHardRelogin(instanceId, context);
   return runPollLoop(instanceId);
 }
 
-/** 504 on any booking API: close browser, clear caches, rotate IP, re-login, poll, restart booking chain. */
+/** 504 / Cloudflare / forbidden on booking APIs: hard relogin, poll, restart booking chain. */
 async function recoverBookingChainFromGatewayTimeout(
   instanceId: number | undefined,
   context: string,
@@ -1635,19 +1661,14 @@ async function recoverBookingChainFromGatewayTimeout(
   return runBookingChainWithRetry(instanceId, slotStateCache);
 }
 
-/** 4292XX on booking APIs: soft IP rotate first, else full relogin; then restart booking chain. */
+/** 4292XX on booking APIs: hard relogin, poll for a fresh slot, then restart booking chain. */
 async function recoverBookingChainFromIpRateLimit(
   instanceId: number | undefined,
   context: string,
   err: VfsRateLimitedError,
   slotStateCache?: SlotFoundState
 ): Promise<boolean> {
-  const outcome = await handleIpRateLimitRecovery(instanceId, context, err.code);
-  if (outcome === "soft_rotated") {
-    // Session preserved — retry booking without re-poll if we still have slot cache.
-    return runBookingChainWithRetry(instanceId, slotStateCache);
-  }
-  // Full relogin already completed inside handleIpRateLimitRecovery — poll for a fresh slot, then book.
+  await handleIpRateLimitRecovery(instanceId, context, err.code);
   clearSlotCenterOverride();
   clearSlotDate();
   if (!(await runPollLoop(instanceId))) {
@@ -1881,8 +1902,8 @@ async function waitForApplicantsStaggerGate(opts: {
 
   reporter.setBookingStep(
     isApplicantsUrnUnlocked()
-      ? "save applicants (peer URN — going now)"
-      : `save applicants — turn in ${Math.round(remainingMs / 1000)}s`
+      ? "applicants · peer URN"
+      : `applicants · turn in ${Math.round(remainingMs / 1000)}s`
   );
 
   const unlockWatcher = createApplicantsUrnUnlockWatcher();
@@ -1904,8 +1925,8 @@ async function waitForApplicantsStaggerGate(opts: {
  * During apologies round-robin, when any bot gets a URN, peers wake and join
  * save-applicants with applicantsJoinStaggerSec gaps (default 0.5s).
  *
- * - **10673**: up to `pollReloginInterval` staggered tries, then relogin + slot poll, forever.
- * - **Other errors**: up to MAX_SAVE_APPLICANTS_RETRIES (8), then full relogin + poll.
+ * - **10673**: up to `pollReloginInterval` staggered tries, then hard relogin + slot poll, forever.
+ * - **Other errors**: up to MAX_SAVE_APPLICANTS_RETRIES (8), then hard relogin + poll.
  */
 async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: SlotFoundState): Promise<boolean> {
   const phase1Attempts = Math.max(1, config.pollReloginInterval);
@@ -2001,7 +2022,7 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
           }
 
     try {
-      reporter.setBookingStep("save applicants");
+      reporter.setBookingStep("applicants");
       await browser.saveApplicantsViaLiftApi();
 
       const urnAfterSave = getApplicationUrn();
@@ -2012,11 +2033,9 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
       markApplicantsUrnUnlocked(
         typeof instanceId === "number" && instanceId >= 1 ? Math.floor(instanceId) : 1
       );
-      if (isFleetCalendarBookingEnabled()) {
-        registerFleetUrn(
-          typeof instanceId === "number" && instanceId >= 1 ? Math.floor(instanceId) : 1
-        );
-      }
+      registerFleetUrn(
+        typeof instanceId === "number" && instanceId >= 1 ? Math.floor(instanceId) : 1
+      );
       break applicants10673Recovery;
     } catch (err) {
       attemptIndex += 1;
@@ -2034,6 +2053,22 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
       if (err instanceof VfsGatewayTimeoutError) {
         continue applicants10673Recovery;
       }
+      if (isFailedToFetchError(err)) {
+        return recoverBookingChainFromGatewayTimeout(
+          instanceId,
+          "failed-to-fetch-save-applicants",
+          err,
+          slotStateCache
+        );
+      }
+      if (isSaveApplicants401(err)) {
+        return recoverBookingChainFromGatewayTimeout(
+          instanceId,
+          "401-unauthorized-save-applicants",
+          err,
+          slotStateCache
+        );
+      }
       if (err instanceof VfsForbiddenError) {
         return recoverBookingChainFromGatewayTimeout(
           instanceId,
@@ -2046,7 +2081,7 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
         consecutive10673 += 1;
                 if (consecutive10673 >= phase1Attempts) {
           consecutive10673 = 0;
-                    await performPollStyleRelogin(instanceId, "save-applicants-10673");
+                    await performHardRelogin(instanceId, "save-applicants-10673");
           await runPollLoop(instanceId);
           // New wave after re-hit so fleet re-syncs applicants stagger.
           const again = isSlotFoundByAnyInstance();
@@ -2073,124 +2108,18 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
     }
   }
 
-  const fastSkipCalendar = (instanceId ?? 1) <= FAST_SKIP_CALENDAR_UP_TO_INSTANCE;
-  const scheduleConstraint = resolveScheduleDateConstraint(instanceId);
-  const hasScheduleFilter = scheduleConstraintIsActive(scheduleConstraint);
-  const calendarOpts = hasScheduleFilter ? { scheduleConstraint } : undefined;
-  // Use the live slot state; fall back to the snapshot taken when booking started in case
-  // a failing sibling instance deleted slot-state.json while this booking is in progress.
-  const liveState = isSlotFoundByAnyInstance();
-  const shared = liveState.found ? liveState : (slotStateCache ?? liveState);
-  const pollingHitAllowed = hasScheduleFilter ? isPollingSlotInConstraint(shared.slot, scheduleConstraint) : false;
-
-  let usedCalendarForTimeslot = false;
-
   try {
-  // Fleet calendar-polling booking system (setup form bookingSystemMode = "fleet").
-  // Legacy per-bot chain remains the default when mode is "legacy" or unset.
-  if (isFleetCalendarBookingEnabled()) {
     const fleetId =
       typeof instanceId === "number" && Number.isFinite(instanceId) && instanceId >= 1
         ? Math.floor(instanceId)
         : 1;
-        return await runFleetCalendarBooking({
+    return await runFleetCalendarBooking({
       browser,
       instanceId: fleetId,
       abortSeq: chainAbortSeq,
       isAbort: (seq) => pollingAbortSeq !== seq,
       waitForAbort: waitForPollingAbort,
     });
-  }
-
-  if (!hasScheduleFilter) {
-    if (fastSkipCalendar) {
-      const derived = deriveCalendarDateFromPollingRaw(shared.slot?.rawDate ?? shared.slot?.date);
-      if (derived) {
-        setSlotDate(derived);
-              } else {
-                await browser.postCalendarLiftApi();
-        usedCalendarForTimeslot = true;
-      }
-    } else {
-      await browser.postCalendarLiftApi();
-      usedCalendarForTimeslot = true;
-    }
-  } else if (pollingHitAllowed && fastSkipCalendar) {
-    const derived = deriveCalendarDateFromPollingRaw(shared.slot?.rawDate ?? shared.slot?.date);
-    if (derived) {
-      setSlotDate(derived);
-          } else {
-            await browser.postCalendarLiftApi(calendarOpts);
-      usedCalendarForTimeslot = true;
-    }
-  } else {
-    await browser.postCalendarLiftApi(calendarOpts);
-    usedCalendarForTimeslot = true;
-  }
-
-  try {
-    reporter.setBookingStep("timeslot");
-    await browser.postTimeslotLiftApi();
-  } catch (err) {
-    if (err instanceof VfsRateLimitedError) {
-      if (err.isAccountBlock) {
-        await stopForAccountRateLimit(instanceId, "timeslot", err.code);
-        return false;
-      }
-      return recoverBookingChainFromIpRateLimit(instanceId, "429-ip-timeslot", err, slotStateCache);
-    }
-    // Requested fallback: if fast mode skipped calendar and timeslot fails, call calendar then retry once.
-    if (fastSkipCalendar && !usedCalendarForTimeslot) {
-            await browser.postCalendarLiftApi(calendarOpts);
-      usedCalendarForTimeslot = true;
-      await browser.postTimeslotLiftApi();
-    } else {
-      throw err;
-    }
-  }
-
-  const isEgyptPortugal =
-    config.slotPayload.countryCode === "egy" && config.slotPayload.missionCode === "prt";
-  if (isEgyptPortugal) {
-    await browser.postMapVasLiftApi();
-  }
-
-  reporter.setBookingStep("fees");
-  await browser.postFeesLiftApi();
-
-  const MAX_SCHEDULE_RETRIES_FROM_CALENDAR = 3;
-  for (let schedAttempt = 1; schedAttempt <= MAX_SCHEDULE_RETRIES_FROM_CALENDAR; schedAttempt++) {
-    try {
-      reporter.setBookingStep("schedule");
-      await browser.postScheduleLiftApi();
-      break;
-    } catch (schedErr) {
-      if (schedErr instanceof AlreadyBookedError) {
-        await retireInstanceForAlreadyBooked(instanceId, schedErr.message);
-      }
-      if (schedErr instanceof VfsRateLimitedError) {
-        if (schedErr.isAccountBlock) {
-          await stopForAccountRateLimit(instanceId, "schedule", schedErr.code);
-          return false;
-        }
-        return recoverBookingChainFromIpRateLimit(instanceId, "429-ip-schedule", schedErr, slotStateCache);
-      }
-      if (schedAttempt === MAX_SCHEDULE_RETRIES_FROM_CALENDAR) throw schedErr;
-            await telegram
-        .alert("error", `Schedule failed (attempt ${schedAttempt}/${MAX_SCHEDULE_RETRIES_FROM_CALENDAR}), retrying from calendar`)
-        .catch(() => { });
-      await browser.postCalendarLiftApi(calendarOpts);
-      await browser.postTimeslotLiftApi();
-      await browser.postFeesLiftApi();
-    }
-  }
-
-  if (!getAllocationId()?.trim()) {
-    throw new Error(
-      "Booking chain incomplete: schedule did not run (missing allocationId — save applicants or earlier APIs may have failed)"
-    );
-  }
-  return true;
   } catch (err) {
     if (err instanceof AlreadyBookedError) {
       await retireInstanceForAlreadyBooked(instanceId, err.message);
@@ -2201,6 +2130,14 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
         return false;
       }
       return recoverBookingChainFromIpRateLimit(instanceId, "429-ip-booking", err, slotStateCache);
+    }
+    if (isFailedToFetchError(err)) {
+      return recoverBookingChainFromGatewayTimeout(
+        instanceId,
+        "failed-to-fetch-booking",
+        err,
+        slotStateCache
+      );
     }
     if (err instanceof VfsForbiddenError) {
       return recoverBookingChainFromGatewayTimeout(
@@ -2340,10 +2277,8 @@ async function runOneBotCycleCore(meta: SubmitMeta): Promise<void> {
       firstUrl = await browser.getFirstTabUrl();
       kind = classifyVfsFirstTabUrl(firstUrl);
     } else if (blockKind === "forbidden") {
-            await telegram.alert("error", `Bot ${instanceId ?? "?"} blocked page detected — restarting browser + rotating IP`).catch(() => { });
-      clearApplicantIpCache();
-      await relaunchChromeAfterCredentialSwapLogout();
-      await resolveAndReportEgressIp({ logAs: "rotate-ip", instanceId });
+      await telegram.alert("error", `Bot ${instanceId ?? "?"} blocked page detected — hard relogin`).catch(() => { });
+      await performHardRelogin(instanceId, "startup-page-block");
       firstUrl = await browser.getFirstTabUrl();
       kind = classifyVfsFirstTabUrl(firstUrl);
     }
@@ -2490,7 +2425,7 @@ async function runOneBotCycleCore(meta: SubmitMeta): Promise<void> {
       // slot-state.json do not break this instance's calendar / timeslot lookup.
       const slotStateSnapshot = isSlotFoundByAnyInstance();
       instanceBookingActive = true;
-      reporter.setPhase("booking", "booking chain");
+      reporter.setBookingStep("applicants");
             try {
         const bookingCompleted = await runBookingChainWithRetry(instanceId, slotStateSnapshot);
         instanceBookingActive = false;
@@ -2508,19 +2443,6 @@ async function runOneBotCycleCore(meta: SubmitMeta): Promise<void> {
                         break;
           }
           continue;
-        }
-        const noDates =
-          err instanceof NoDatesInScheduleRangeError ||
-          (err instanceof Error && (err as Error & { code?: string }).code === "NO_DATES_IN_RANGE");
-        if (noDates) {
-          const range = resolveScheduleDateConstraint(instanceId);
-          const startDate = range.kind === "range" ? (range.start ?? "…") : "…";
-          const endDate = range.kind === "range" ? (range.end ?? "…") : "…";
-          const msg = `no slot from ${startDate} to ${endDate}`;
-                    await telegram.alert("no_slot_found", msg).catch(() => { });
-          clearSlotCenterOverride();
-          clearSlotDate();
-          break;
         }
 
         // Any other booking error: log, notify, clear local state, restart polling instead of stopping.
@@ -2562,41 +2484,6 @@ async function start(): Promise<void> {
       let ipcChain: Promise<void> = Promise.resolve();
       process.on("message", (msg: any) => {
         if (msg?.instanceId !== myInstanceId) return;
-
-        if (msg?.type === "test-applicants") {
-          // Stop slot polling immediately (same knobs as force-book), then run the test on the chain.
-          instanceBookingActive = false;
-          clearSlotState();
-          clearSlotCenterOverride();
-          clearSlotDate();
-          requestPollingAbort("test-applicants", myInstanceId);
-                    ipcChain = ipcChain.then(async () => {
-            syncInstanceStoresFromDisk();
-            setCurrentInstanceId(myInstanceId);
-            try {
-              const result = await browser.testSaveApplicantsViaLiftApi();
-              const preview =
-                result.body.length > 12_000 ? result.body.slice(0, 12_000) + "…" : result.body;
-              process.send?.({
-                type: "test-applicants-result",
-                requestId: msg.requestId,
-                instanceId: myInstanceId,
-                ok: true,
-                status: result.status,
-                bodyPreview: preview,
-              });
-            } catch (err) {
-              process.send?.({
-                type: "test-applicants-result",
-                requestId: msg.requestId,
-                instanceId: myInstanceId,
-                ok: false,
-                error: err instanceof Error ? err.message : String(err),
-              });
-            }
-          });
-          return;
-        }
 
         if (msg?.type === "force-book") {
           if (instanceStopped) {
@@ -2827,25 +2714,6 @@ async function start(): Promise<void> {
         }
       });
       return { ok: true, queued: 1 };
-    },
-    onTestApplicantsApi: async () => {
-      instanceBookingActive = false;
-      clearSlotState();
-      clearSlotCenterOverride();
-      clearSlotDate();
-      requestPollingAbort("test-applicants");
-            reloadApplicantDetailsFromDisk();
-      const instanceId = parseInt(process.env.BOT_INSTANCE_ID ?? "1", 10);
-      setCurrentInstanceId(instanceId);
-      try {
-        const res = await browser.testSaveApplicantsViaLiftApi();
-        const preview = res.body.length > 12_000 ? res.body.slice(0, 12_000) + "…" : res.body;
-        return { results: [{ instanceId, ok: true, status: res.status, bodyPreview: preview }] };
-      } catch (err) {
-        return {
-          results: [{ instanceId, ok: false, error: err instanceof Error ? err.message : String(err) }],
-        };
-      }
     },
   });
 }

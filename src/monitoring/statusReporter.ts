@@ -12,6 +12,7 @@
  */
 import {
   makeInitialStatus,
+  bookingStepToApiKind,
   type ApiFlashKind,
   type AttentionReason,
   type BotPhase,
@@ -58,15 +59,26 @@ class StatusReporter {
   setPhase(phase: BotPhase, detail?: string): void {
     this.status.phase = phase;
     if (detail != null) this.status.detail = detail;
+    if (phase === "already_booked") {
+      this.status.alreadyBooked = true;
+      this.status.attention = null;
+      this.status.pollingPaused = false;
+      if (this.status.captcha.last === "waiting") {
+        this.status.captcha.last = "n/a";
+        this.status.captcha.waitingUntil = null;
+      }
+      this.flushNow();
+      return;
+    }
     // Clear sticky error blink once the bot moves into a normal workflow phase.
     // Do NOT clear on turnstile/otp — those overlap with captcha attention.
+    // recovering: keep lastError so Monitor can show fetch-fail / 401 / etc.
     if (
       phase === "launching" ||
       phase === "login" ||
       phase === "polling" ||
       phase === "booking" ||
       phase === "payment" ||
-      phase === "recovering" ||
       phase === "idle"
     ) {
       this.status.attention = null;
@@ -75,6 +87,12 @@ class StatusReporter {
         this.status.captcha.waitingUntil = null;
       }
       this.status.lastError = null;
+    } else if (phase === "recovering") {
+      this.status.attention = null;
+      if (this.status.captcha.last === "waiting") {
+        this.status.captcha.last = "n/a";
+        this.status.captcha.waitingUntil = null;
+      }
     }
     this.flushNow();
   }
@@ -115,6 +133,12 @@ class StatusReporter {
   setBookingStep(step: string | null, extra?: { urn?: string | null }): void {
     this.status.bookingStep = step;
     if (extra?.urn !== undefined) this.status.urn = extra.urn;
+    if (step) {
+      this.status.phase = "booking";
+      this.status.detail = step;
+      const kind = bookingStepToApiKind(step);
+      if (kind) this.status.cardApiBg = kind;
+    }
     this.flushNow();
   }
 
@@ -136,6 +160,11 @@ class StatusReporter {
   setAttention(reason: AttentionReason | null, detail?: string): void {
     if (reason === null) {
       this.status.attention = null;
+      // Clearing attention must also leave needs_attention — otherwise the
+      // Monitor card keeps the infinite blink forever.
+      if (this.status.phase === "needs_attention") {
+        this.status.phase = "idle";
+      }
       this.flushNow();
       return;
     }
@@ -181,6 +210,17 @@ class StatusReporter {
     if (kind !== "polling") {
       this.status.cardApiBg = kind;
     }
+    this.flushNow();
+  }
+
+  /** Sticky Monitor error status during hard recovery (fetch fail / 401 / …). */
+  setRecoveringError(label: string, detail?: string): void {
+    const msg = (detail ?? label).slice(0, 400);
+    this.status.lastError = { message: msg, at: Date.now() };
+    this.status.phase = "recovering";
+    this.status.detail = label;
+    this.status.attention = null;
+    this.status.cardApiBg = null;
     this.flushNow();
   }
 
