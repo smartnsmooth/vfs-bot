@@ -1,13 +1,80 @@
 import type { Frame, Page } from "playwright";
-import { logger } from "../utils/logger";
+import { reporter } from "../monitoring/statusReporter";
+
+/**
+ * Manual-assist fallback: after the auto-solve fails, bring the operator's
+ * attention (dashboard alert + auto-focus) and WAIT for a token to appear —
+ * i.e. give the operator time to solve the checkbox by hand in the focused
+ * Chrome window. Returns the token if it appears within `waitMs`, else "".
+ *
+ * Enabled by default; disable with CAPTCHA_MANUAL_ASSIST=false.
+ */
+export async function waitForManualTurnstile(
+  page: Page,
+  opts?: { waitMs?: number; check?: () => Promise<void> }
+): Promise<string> {
+  const enabled = (process.env.CAPTCHA_MANUAL_ASSIST ?? "true").trim().toLowerCase() !== "false";
+  if (!enabled) return "";
+
+  // If the page is actually a block/error page (403201, page-not-found, …) this
+  // throws before we claim "captcha attention", so the caller can recover instead.
+  if (opts?.check) await opts.check();
+
+  const totalMs = opts?.waitMs ?? Math.max(10_000, parseInt(process.env.CAPTCHA_MANUAL_WAIT_MS ?? "120000", 10) || 120_000);
+  const deadline = Date.now() + totalMs;
+
+    reporter.setAttention("captcha", "captcha failed — solve it in the focused Chrome window");
+  reporter.requestFocus("captcha");
+  reporter.captchaWaiting(deadline);
+
+  let lastLog = 0;
+  while (Date.now() < deadline) {
+    if (opts?.check) await opts.check();
+    const token = await page
+      .evaluate(() => {
+        const el =
+          document.querySelector<HTMLTextAreaElement>('textarea[name="cf-turnstile-response"]') ??
+          document.querySelector<HTMLInputElement>('input[name="cf-turnstile-response"]');
+        return (el as HTMLInputElement | null)?.value?.trim() ?? "";
+      })
+      .catch(() => "");
+
+    if (token && token.length > 20) {
+            reporter.captchaResult("passed");
+      reporter.setAttention(null);
+      return token;
+    }
+
+    const now = Date.now();
+    if (now - lastLog > 10_000) {
+      lastLog = now;
+      const remaining = Math.round((deadline - now) / 1000);
+      reporter.setDetail(`waiting for manual captcha (${remaining}s left)`);
+          }
+    await page.waitForTimeout(1000);
+  }
+
+    reporter.setDetail("manual captcha window elapsed");
+  return "";
+}
 
 /**
  * Locate the Cloudflare Turnstile iframe via page.frames() — this sees frames
  * inside a closed shadow DOM, which document.querySelector cannot.
  */
-async function findTurnstileFrame(page: Page, timeoutMs: number): Promise<Frame | null> {
+async function findTurnstileFrame(
+  page: Page,
+  timeoutMs: number,
+  check?: () => Promise<void>
+): Promise<Frame | null> {
   const deadline = Date.now() + timeoutMs;
+  let lastCheck = 0;
   while (Date.now() < deadline) {
+    // Abort the wait early if the page turned into a block/error page.
+    if (check && Date.now() - lastCheck > 1500) {
+      lastCheck = Date.now();
+      await check();
+    }
     const f = page
       .frames()
       .find((fr) => /challenges\.cloudflare\.com/.test(fr.url()) && /turnstile/.test(fr.url()));
@@ -37,8 +104,14 @@ async function readTurnstileToken(page: Page): Promise<string> {
  * Returns the resolved token, or "" if no token appeared (Cloudflare likely
  * escalated to an interactive challenge, which a single click cannot solve).
  */
-export async function clickTurnstile(page: Page, opts?: { frameTimeoutMs?: number; tokenTimeoutMs?: number }): Promise<string> {
+export async function clickTurnstile(
+  page: Page,
+  opts?: { frameTimeoutMs?: number; tokenTimeoutMs?: number; check?: () => Promise<void> }
+): Promise<string> {
   const start = Date.now();
+
+  // Abort immediately if the page is already a block/error page.
+  if (opts?.check) await opts.check();
 
   // Bring the widget into view. The host element is in the light DOM even when
   // the iframe itself is inside the closed shadow root.
@@ -50,13 +123,11 @@ export async function clickTurnstile(page: Page, opts?: { frameTimeoutMs?: numbe
     .scrollIntoViewIfNeeded()
     .catch(() => { });
 
-  const frame = await findTurnstileFrame(page, opts?.frameTimeoutMs ?? 20_000);
+  const frame = await findTurnstileFrame(page, opts?.frameTimeoutMs ?? 20_000, opts?.check);
   if (!frame) {
-    logger.warn("[Turnstile] Challenge iframe not found via page.frames()");
-    return "";
+        return "";
   }
-  logger.info("[Turnstile] Found Turnstile iframe");
-
+  
   // Measure the widget's on-screen rect from an element inside the frame;
   // boundingBox() returns coordinates in the top-level viewport.
   let box = await frame
@@ -71,8 +142,7 @@ export async function clickTurnstile(page: Page, opts?: { frameTimeoutMs?: numbe
       .catch(() => null);
   }
   if (!box) {
-    logger.warn("[Turnstile] Could not measure the Turnstile widget position");
-    return "";
+        return "";
   }
 
   // The checkbox sits ~30px from the left, vertically centered. Move then click
@@ -82,8 +152,7 @@ export async function clickTurnstile(page: Page, opts?: { frameTimeoutMs?: numbe
   await page.mouse.move(x, y, { steps: 10 });
   await page.waitForTimeout(120);
   await page.mouse.click(x, y);
-  logger.info({ x: Math.round(x), y: Math.round(y) }, "[Turnstile] Clicked checkbox");
-
+  
   // Success = the light-DOM response token input gets populated.
   const solved = await page
     .waitForFunction(
@@ -100,11 +169,9 @@ export async function clickTurnstile(page: Page, opts?: { frameTimeoutMs?: numbe
     .catch(() => false);
 
   if (!solved) {
-    logger.warn("[Turnstile] Clicked checkbox but no token appeared — Cloudflare may have escalated to an interactive challenge");
-    return "";
+        return "";
   }
 
   const token = await readTurnstileToken(page);
-  logger.info({ ms: Date.now() - start, tokenLength: token.length }, "[Turnstile] Solved via checkbox click");
-  return token;
+    return token;
 }

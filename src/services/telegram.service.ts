@@ -1,7 +1,5 @@
 import TelegramBot from "node-telegram-bot-api";
 import { config, getCurrentInstanceId } from "../config/config";
-import { logger } from "../utils/logger";
-
 let bot: TelegramBot | null = null;
 function getBot(): TelegramBot | null {
   if (!config.telegramEnabled) return null;
@@ -37,8 +35,7 @@ export class TelegramService {
     try {
       await client.sendMessage(config.telegramChatId, text);
     } catch (err) {
-      logger.warn({ err }, "Telegram send failed");
-    }
+          }
   }
 
   async alert(type: AlertType, detail: string, extra?: Record<string, unknown>): Promise<void> {

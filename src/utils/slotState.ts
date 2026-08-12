@@ -1,11 +1,14 @@
 import { existsSync, readFileSync, writeFileSync, unlinkSync, watch } from "node:fs";
 import { join } from "node:path";
-import { logger } from "./logger";
+import { clearApplicantsCoord, resetApplicantsWave } from "./applicantsCoord";
+import { clearCalendarBookingCoord } from "./calendarBookingCoord";
 
 export interface SlotFoundState {
   found: boolean;
   foundBy?: number; // instance ID
   timestamp?: number;
+  /** Poll returned VFS error 1036 ("Services will be back shortly") — synthetic slot hit. */
+  apologies1036?: boolean;
   slot?: {
     id?: string;
     center?: string;
@@ -38,10 +41,12 @@ export function markSlotFound(
   visaCategoryCode: string,
   slot?: { id?: string; center?: string; date?: string; time?: string; rawDate?: string }
 ): void {
+  const apologies1036 = slot?.id?.startsWith("svc-unavailable-1036_") === true;
   const state: SlotFoundState = {
     found: true,
     foundBy: instanceId,
     timestamp: Date.now(),
+    apologies1036,
     slot,
     centerCode,
     visaCategoryCode,
@@ -49,21 +54,20 @@ export function markSlotFound(
   try {
     const json = JSON.stringify(state, null, 2);
     writeFileSync(SLOT_STATE_FILE, json, "utf8");
-    logger.info({ instanceId, centerCode, visaCategoryCode, slot }, "Marked slot as found (broadcast to all instances)");
-  } catch (err) {
-    logger.error({ err, instanceId }, "Failed to write slot state");
-  }
+      } catch (err) {
+      }
+  resetApplicantsWave(state.timestamp ?? Date.now());
 }
 
 export function clearSlotState(): void {
   try {
     if (existsSync(SLOT_STATE_FILE)) {
       unlinkSync(SLOT_STATE_FILE);
-      logger.info("Cleared slot state");
-    }
+          }
   } catch (err) {
-    logger.warn({ err }, "Failed to clear slot state");
-  }
+      }
+  clearApplicantsCoord();
+  clearCalendarBookingCoord();
 }
 
 /**
@@ -121,8 +125,7 @@ export function createSlotFoundWatcher(myInstanceId?: number): {
     unwatch = () => w.close();
   } catch (err) {
     // If watch fails (rare), we still allow polling loop to detect via periodic top-of-loop checks.
-    logger.debug({ err }, "slot-state watcher unavailable; relying on loop checks");
-  }
+      }
 
   const dispose = (): void => {
     disposed = true;

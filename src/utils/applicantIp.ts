@@ -1,7 +1,5 @@
 import { networkInterfaces } from "node:os";
 import type { Page } from "playwright";
-import { logger } from "./logger";
-
 /**
  * Public IP for save-applicants (`ipAddress`):
  *
@@ -106,10 +104,7 @@ async function fetchPublicIpFromUrl(url: string, timeoutMs: number): Promise<str
 async function tryResolveApplicantIpFromBrowserPage(page: Page): Promise<string | null> {
   const urls = publicIpLookupUrlList();
   if (urls.length === 0) {
-    logger.info(
-      "Applicant IP: no in-tab lookup URLs (VFS_USE_IPIFY=false and no VFS_APPLICANT_PUBLIC_IP_URL)"
-    );
-    return null;
+        return null;
   }
   try {
     const raw = await page.evaluate(async (lookupUrls: string[]) => {
@@ -134,8 +129,7 @@ async function tryResolveApplicantIpFromBrowserPage(page: Page): Promise<string 
     if (isPlausiblePublicIp(ip)) return ip;
     return null;
   } catch (err) {
-    logger.warn({ err }, "Applicant IP: browser tab fetch failed");
-    return null;
+        return null;
   }
 }
 
@@ -166,26 +160,15 @@ async function resolveApplicantIpFromNode(): Promise<string> {
       const ip = await fetchPublicIpFromUrl(url, timeoutMs);
       if (ip) {
         cachedApplicantIp = ip;
-        logger.info(
-          { ip, via: url, source: "node" },
-          "Applicant IP resolved (Node fetch)"
-        );
-        return cachedApplicantIp;
+                return cachedApplicantIp;
       }
     }
   } else {
-    logger.warn(
-      "Applicant IP: Node fallback skipped public-IP URLs (VFS_USE_IPIFY=false and no VFS_APPLICANT_PUBLIC_IP_URL)"
-    );
-  }
+      }
 
   const local = getLocalNetworkIpv4();
   cachedApplicantIp = local || "127.0.0.1";
-  logger.warn(
-    { ip: cachedApplicantIp },
-    "Public IP lookup failed; using local network IP for applicant payload (portal may expect public IP)"
-  );
-  return cachedApplicantIp;
+    return cachedApplicantIp;
 }
 
 /**
@@ -206,16 +189,9 @@ export async function ensureApplicantIpResolved(page: Page | null): Promise<stri
     const fromBrowser = await tryResolveApplicantIpFromBrowserPage(page);
     if (fromBrowser) {
       cachedApplicantIp = fromBrowser;
-      logger.info(
-        { ip: fromBrowser, source: "browser" },
-        "Applicant IP resolved in page (matches Chrome / proxy extension egress)"
-      );
-      return cachedApplicantIp;
+            return cachedApplicantIp;
     }
-    logger.warn(
-      "Applicant IP: in-page lookup failed \u2014 falling back to Node fetch (may not match extension proxy IP)"
-    );
-  }
+      }
 
   return resolveApplicantIpFromNode();
 }
