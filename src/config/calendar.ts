@@ -5,7 +5,7 @@ import { getApplicantDetailsOverrides } from "../utils/applicantDetails.store";
 
 export const CALENDAR_URL = "https://lift-api.vfsglobal.com/appointment/calendar";
 
-/** DD/MM/YYYY — two days after today in local timezone (when setup has no "From" range). */
+/** DD/MM/YYYY — two days after today in local timezone (when setup has no Calendar polling start date). */
 function fallbackCalendarFromDate(): string {
   const d = new Date();
   d.setDate(d.getDate() + 2);
@@ -41,10 +41,14 @@ export function firstDayOfNextMonthFromDdMmYyyy(currentFrom: string): string {
   return `${dd}/${mm}/${yyyy}`;
 }
 
-/** `fromDate` for lift-api: setup "From" (scheduleDateRangeStart, YYYY-MM-DD) or {@link fallbackCalendarFromDate}. */
-function calendarFromDateForInstance(details: Record<string, unknown> | null | undefined): string {
-  const raw = typeof details?.scheduleDateRangeStart === "string"
-    ? details.scheduleDateRangeStart.trim().slice(0, 10)
+/**
+ * `fromDate` for lift-api: app-wide Calendar polling start date (instance 0 `calendarPollingStartDate`,
+ * YYYY-MM-DD) or {@link fallbackCalendarFromDate}.
+ */
+function calendarFromDateFromPollingStart(): string {
+  const global0 = getApplicantDetailsOverrides(0);
+  const raw = typeof global0?.calendarPollingStartDate === "string"
+    ? global0.calendarPollingStartDate.trim().slice(0, 10)
     : "";
   if (/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
     const [y, m, d] = raw.split("-");
@@ -75,7 +79,7 @@ export function buildCalendarBody(urn: string, options?: BuildCalendarBodyOption
 
   const fromDateRaw = typeof options?.fromDate === "string" ? options.fromDate.trim() : "";
   const fromDate = fromDateRaw
-    || calendarFromDateForInstance(details);
+    || calendarFromDateFromPollingStart();
 
   return {
     centerCode,

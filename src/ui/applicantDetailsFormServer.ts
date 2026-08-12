@@ -2,7 +2,6 @@ import { exec } from "node:child_process";
 import { createServer, IncomingMessage, Server, ServerResponse } from "node:http";
 import { config } from "../config/config";
 import { getApplicantFormDefaults } from "../config/saveApplicants";
-import { logger } from "../utils/logger";
 import {
   getApplicantDetailsOverrides,
   setApplicantDetailsOverrides,
@@ -10,6 +9,8 @@ import {
 } from "../utils/applicantDetails.store";
 import { getSessionLoginCredentials, setSessionLoginCredentials, getAllInstanceCredentials } from "../utils/sessionLogin.store";
 import { buildApplicantFormPageScript } from "./applicantDetailsFormClientScript";
+import { buildMonitorTabHtml } from "./monitorTab";
+import type { MonitorHooks } from "../monitoring/status.types";
 
 const APPLICANT_UI_PORT = 3847;
 
@@ -140,8 +141,7 @@ function openUrlInBrowser(url: string): void {
         ? `open "${url}"`
         : `xdg-open "${url}"`;
   exec(cmd, (err) => {
-    if (err) logger.warn({ err }, "Could not open browser for applicant form; open URL manually");
-  });
+      });
 }
 
 function readBody(req: IncomingMessage): Promise<string> {
@@ -219,11 +219,44 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
     const v = parseInt(j.userPollInterval, 10);
     if (Number.isFinite(v) && v >= 1) out.userPollInterval = v;
   }
+  if (typeof j.apologiesIntervalSec === "number" && Number.isFinite(j.apologiesIntervalSec) && j.apologiesIntervalSec >= 1) {
+    out.apologiesIntervalSec = Math.floor(j.apologiesIntervalSec);
+  } else if (typeof j.apologiesIntervalSec === "string" && j.apologiesIntervalSec.trim() !== "") {
+    const v = parseInt(j.apologiesIntervalSec, 10);
+    if (Number.isFinite(v) && v >= 1) out.apologiesIntervalSec = v;
+  } else if (typeof j.applicantsIntervalSec === "number" && Number.isFinite(j.applicantsIntervalSec) && j.applicantsIntervalSec >= 1) {
+    out.apologiesIntervalSec = Math.floor(j.applicantsIntervalSec);
+  } else if (typeof j.applicantsIntervalSec === "string" && j.applicantsIntervalSec.trim() !== "") {
+    const v = parseInt(j.applicantsIntervalSec, 10);
+    if (Number.isFinite(v) && v >= 1) out.apologiesIntervalSec = v;
+  }
+  if (typeof j.applicantsJoinStaggerSec === "number" && Number.isFinite(j.applicantsJoinStaggerSec) && j.applicantsJoinStaggerSec >= 0.1) {
+    out.applicantsJoinStaggerSec = j.applicantsJoinStaggerSec;
+  } else if (typeof j.applicantsJoinStaggerSec === "string" && j.applicantsJoinStaggerSec.trim() !== "") {
+    const v = parseFloat(j.applicantsJoinStaggerSec);
+    if (Number.isFinite(v) && v >= 0.1) out.applicantsJoinStaggerSec = v;
+  }
   if (typeof j.postLoginPollDelay === "number" && Number.isFinite(j.postLoginPollDelay) && j.postLoginPollDelay >= 0) {
     out.postLoginPollDelay = Math.floor(j.postLoginPollDelay);
   } else if (typeof j.postLoginPollDelay === "string" && j.postLoginPollDelay.trim() !== "") {
     const v = parseInt(j.postLoginPollDelay, 10);
     if (Number.isFinite(v) && v >= 0) out.postLoginPollDelay = v;
+  }
+  if (typeof j.staggerIntervalSec === "number" && Number.isFinite(j.staggerIntervalSec) && j.staggerIntervalSec >= 0) {
+    out.staggerIntervalSec = Math.floor(j.staggerIntervalSec);
+  } else if (typeof j.staggerIntervalSec === "string" && j.staggerIntervalSec.trim() !== "") {
+    const v = parseInt(j.staggerIntervalSec, 10);
+    if (Number.isFinite(v) && v >= 0) out.staggerIntervalSec = v;
+  }
+  if ("calendarPollingStartDate" in j) {
+    const v = j.calendarPollingStartDate;
+    if (typeof v === "string" && v.trim() !== "") out.calendarPollingStartDate = v.trim();
+  }
+  if (typeof j.calendarPollingInterval === "number" && Number.isFinite(j.calendarPollingInterval) && j.calendarPollingInterval >= 1) {
+    out.calendarPollingInterval = Math.floor(j.calendarPollingInterval);
+  } else if (typeof j.calendarPollingInterval === "string" && j.calendarPollingInterval.trim() !== "") {
+    const v = parseInt(j.calendarPollingInterval, 10);
+    if (Number.isFinite(v) && v >= 1) out.calendarPollingInterval = v;
   }
   if (typeof out.helloVerifyNumber === "string") {
     const digits = out.helloVerifyNumber.replace(/\D/g, "").slice(0, 6);
@@ -233,7 +266,7 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
   return out;
 }
 
-function buildPageHtml(collectLogin: boolean): string {
+function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
   /** Per-instance date range row in the applicant column. */
   const scheduleDateRangeRow = `
   <div class="schedule-range-row" role="group" aria-label="Appointment date range">
@@ -243,52 +276,97 @@ function buildPageHtml(collectLogin: boolean): string {
     <input type="date" id="scheduleDateRangeEnd" name="scheduleDateRangeEnd" />
   </div>`;
 
-  const defaultPollIntervalSec = 60;
+  const defaultPollIntervalSec = 5;
 
   const instanceSelectBlock = `
   <fieldset style="border:1px solid #38444d;border-radius:8px;padding:1rem 1rem 0.25rem;margin:0 0 1.25rem">
     <legend style="color:#8b98a5;font-size:0.9rem">Bot configuration</legend>
-    <label for="countryCode" style="margin-top:0.5rem">From country</label>
-    <select id="countryCode" name="countryCode">
-      <option value="ind">India</option>
-      <option value="egy">Egypt</option>
-      <option value="sau">Saudi Arabia</option>
-      <option value="uzb">Uzbekistan</option>
-    </select>
-    <label for="missionCode" style="margin-top:0.75rem">To country</label>
-    <select id="missionCode" name="missionCode">
-      <option value="bgr">Bulgaria</option>
-      <option value="lva">Latvia</option>
-      <option value="prt">Portugal</option>
-    </select>
-    <label for="userPollInterval" style="margin-top:0.75rem">Poll interval (seconds)</label>
-    <input type="number" id="userPollInterval" name="userPollInterval" min="1" value="${defaultPollIntervalSec}" />
-    <label for="postLoginPollDelay" style="margin-top:0.75rem">Post-login poll delay (seconds)</label>
-    <input type="number" id="postLoginPollDelay" name="postLoginPollDelay" min="0" value="30" />
-    <label for="numInstances">Number of instances</label>
-    <input type="number" id="numInstances" name="numInstances" min="1" max="50" value="1" />
-    <div id="instanceSelectWrapper" style="display:block">
-      <label for="instanceId" style="margin-top:0.75rem">Select instance to configure (each uses a different Chrome profile / IP)</label>
-      <select id="instanceId" name="instanceId">
-        <option value="1">Instance 1</option>
+    <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap;margin-top:0.5rem">
+      <label for="countryCode" style="margin:0">From</label>
+      <select id="countryCode" name="countryCode" style="flex:1;min-width:8rem">
+        <option value="ind">India</option>
+        <option value="egy">Egypt</option>
+        <option value="sau">Saudi Arabia</option>
+        <option value="uzb">Uzbekistan</option>
+      </select>
+      <label for="missionCode" style="margin:0">To</label>
+      <select id="missionCode" name="missionCode" style="flex:1;min-width:8rem">
+        <option value="bgr">Bulgaria</option>
+        <option value="lva">Latvia</option>
+        <option value="prt">Portugal</option>
       </select>
     </div>
+    <label for="userPollInterval" style="margin-top:0.75rem">Poll interval (seconds)</label>
+    <input type="number" id="userPollInterval" name="userPollInterval" min="1" value="${defaultPollIntervalSec}" />
+    
+    <div class="row2">
+      <div>
+        <label for="apologiesIntervalSec" style="margin-top:0.75rem">Apologies interval (seconds)</label>
+        <input type="number" id="apologiesIntervalSec" name="apologiesIntervalSec" min="1" value="2" />
+      </div>
+      <div>
+        <label for="applicantsJoinStaggerSec" style="margin-top:0.75rem">Applicants join stagger (seconds)</label>
+        <input type="number" id="applicantsJoinStaggerSec" name="applicantsJoinStaggerSec" min="0.1" step="0.1" value="0.5" />
+      </div>
+    </div>
+    <div class="row2">
+      <div>
+        <label for="calendarPollingStartDate" style="margin-top:0.75rem">Calendar polling start date</label>
+        <input type="date" id="calendarPollingStartDate" name="calendarPollingStartDate" />
+      </div>
+      <div>
+      <label for="calendarPollingInterval" style="margin-top:0.75rem">Calendar polling interval (seconds)</label>
+      <input type="number" id="calendarPollingInterval" name="calendarPollingInterval" min="1" value="60" />
+      </div>
+    </div>
+    <div class="row2">
+      <div>
+        <label for="postLoginPollDelay" style="margin-top:0.75rem">Post-login poll delay (seconds)</label>
+        <input type="number" id="postLoginPollDelay" name="postLoginPollDelay" min="0" value="30" />
+      </div>
+      <div>
+        <label for="numInstances">Number of instances</label>
+        <input type="number" id="numInstances" name="numInstances" min="1" max="100" value="1" />
+      </div>
+    </div>
+    <div class="row2">
+      <div>
+        <label for="staggerIntervalSec" style="margin-top:0.75rem">Start interval between bots</label>
+        <input type="number" id="staggerIntervalSec" name="staggerIntervalSec" min="0" max="120" value="6" />
+      </div>
+      <div id="instanceSelectWrapper" style="display:block">
+        <label for="instanceId" style="margin-top:0.75rem">Select instance to configure</label>
+        <select id="instanceId" name="instanceId">
+          <option value="1">Instance 1</option>
+        </select>
+      </div>
+    </div> 
   </fieldset>`;
 
   const loginBlock = collectLogin
     ? `
   <fieldset style="border:1px solid #38444d;border-radius:8px;padding:1rem 1rem 0.25rem;margin:0 0 1.25rem">
     <legend style="color:#8b98a5;font-size:0.9rem">VFS login</legend>
-    <p class="hint" style="margin-top:0">Used to sign in on the VFS portal in Chrome.</p>
-    <label for="vfsUsername">Email / username</label>
-    <input id="vfsUsername" name="vfsUsername" type="email" autocomplete="username" />
-    <label for="vfsPassword">Password</label>
-    <input id="vfsPassword" name="vfsPassword" type="text" autocomplete="current-password" />
-    <p class="hint" style="margin-top:0.75rem">Second VFS account (optional). If both are set, the bot alternates: after each poll relogin it logs out, closes Chrome, opens a new browser (each Chrome launch uses the next <code>PROXY_URLS</code> entry for this profile), then logs in with the other account (unless <code>VFS_CREDENTIAL_SWAP_BROWSER_RESTART=false</code>).</p>
-    <label for="vfsUsername2">Email / username (account 2)</label>
-    <input id="vfsUsername2" name="vfsUsername2" type="email" autocomplete="off" />
-    <label for="vfsPassword2">Password (account 2)</label>
-    <input id="vfsPassword2" name="vfsPassword2" type="text" autocomplete="off" />
+    <div class="row2">
+      <div>
+        <label for="vfsUsername">Email / username</label>
+        <input id="vfsUsername" name="vfsUsername" type="email" autocomplete="username" />
+      </div>
+      <div>
+        <label for="vfsPassword">Password</label>
+        <input id="vfsPassword" name="vfsPassword" type="text" autocomplete="current-password" />
+      </div>
+    </div>
+    <div class="row2">
+      <div>
+        <label for="vfsUsername2">Email / username (account 2)</label>
+        <input id="vfsUsername2" name="vfsUsername2" type="email" autocomplete="off" />
+      </div>
+      <div>
+        <label for="vfsPassword2">Password (account 2)</label>
+        <input id="vfsPassword2" name="vfsPassword2" type="text" autocomplete="off" />
+      </div>
+    </div>
   </fieldset>`
     : "";
 
@@ -304,7 +382,10 @@ function buildPageHtml(collectLogin: boolean): string {
   <title>${title}</title>
   <style>
     :root { font-family: system-ui, sans-serif; background: #0f1419; color: #e7e9ea; }
-    body { max-width: 1040px; margin: 2rem auto; padding: 0 1.25rem; }
+    body { max-width: none; margin: 0; padding: 0.5rem 0.9rem 1rem; }
+    /* Keep the configuration form readable; let the monitor grid use full width. */
+    #tab-configure { max-width: 95%; margin: 0 auto; }
+    #tab-monitor { max-width: none; }
     h1 { font-size: 1.25rem; margin-bottom: 0.5rem; }
     p.hint { color: #8b98a5; font-size: 0.9rem; margin-top: 0; }
     label { display: block; margin-top: 0.75rem; font-size: 0.85rem; color: #8b98a5; }
@@ -350,13 +431,31 @@ function buildPageHtml(collectLogin: boolean): string {
     }
     .picker-row { display: flex; flex-wrap: wrap; gap: 0.6rem; align-items: center; margin-top: 0.25rem; }
     .picker-row input[type="date"] { margin-top: 0; max-width: 11rem; flex: 1 1 auto; min-width: 0; }
-    .form-actions { margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid #38444d; display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; }
+    .form-actions { margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid #38444d; display: flex; flex-wrap: wrap; gap: 0.75rem; align-items: center; }
     button[type="submit"] { margin-top: 0; flex: 1; min-width: 8rem; }
     #forceBookBtn { margin-top: 0; flex: 1; min-width: 8rem; background: #f5a623; color: #15202b; font-weight: 700; }
-    #testApplicantsApiBtn { display: block; }
     button { width: 100%; padding: 0.65rem; border: none; border-radius: 8px;
       background: #1d9bf0; color: #fff; font-weight: 600; cursor: pointer; font-size: 1rem; }
     button:hover { filter: brightness(1.08); }
+    button:disabled { cursor: not-allowed; opacity: 0.8; }
+    button:disabled:hover { filter: none; }
+    #submitBtn.is-loading {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 0.5rem;
+    }
+    #submitBtn.is-loading::before {
+      content: "";
+      width: 1em;
+      height: 1em;
+      border: 2px solid rgba(255, 255, 255, 0.35);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: submitSpin 0.7s linear infinite;
+      flex-shrink: 0;
+    }
+    @keyframes submitSpin { to { transform: rotate(360deg); } }
     button.btn-inline { margin-top: 0; width: auto; padding: 0.5rem 0.9rem; font-size: 0.9rem; }
     button.btn-secondary { margin-top: 0.6rem; width: auto; background: #38444d; color: #e7e9ea; font-size: 0.85rem; padding: 0.45rem 0.75rem; }
     button.btn-secondary:hover { filter: brightness(1.12); }
@@ -365,13 +464,27 @@ function buildPageHtml(collectLogin: boolean): string {
     .date-chip-remove { margin: 0; padding: 0 0.2rem; width: auto; min-width: 0; background: transparent; color: #8b98a5; font-size: 1.15rem; line-height: 1; font-weight: 400; }
     .date-chip-remove:hover { color: #f4212e; filter: none; }
     .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
+    .row3 { display: grid; grid-template-columns: 1fr 1fr 0.5fr; gap: 0.75rem; }
+    @media (max-width: 720px) {
+      .row3 { grid-template-columns: 1fr; }
+    }
     .section-rule { margin: 1.25rem 0; border: none; border-top: 1px solid #38444d; }
     .section-title { margin: 0 0 0.5rem; font-size: 0.92rem; font-weight: 600; color: #c4cdd4; }
     .ok { color: #00ba7c; margin-top: 1rem; }
     .err { color: #f4212e; margin-top: 1rem; }
+    .tabbar { display: flex; gap: 0.35rem; border-bottom: 1px solid #38444d; margin-bottom: 0.5rem; }
+    .tabbtn { width: auto; margin: 0; background: transparent; color: #8b98a5; border: none; border-bottom: 2px solid transparent; border-radius: 0; padding: 0.6rem 1rem; font-size: 0.95rem; font-weight: 600; }
+    .tabbtn:hover { filter: none; color: #e7e9ea; }
+    .tabbtn.active { color: #1d9bf0; border-bottom-color: #1d9bf0; }
+    .tabpanel[hidden] { display: none; }
   </style>
 </head>
 <body>
+  <div class="tabbar" role="tablist">
+    <button type="button" class="tabbtn active" data-tab="configure">Configure bots</button>
+    ${hasMonitor ? `<button type="button" class="tabbtn" data-tab="monitor">Monitor bots</button>` : ""}
+  </div>
+  <div id="tab-configure" class="tabpanel">
   <form id="f">
     <div class="form-layout">
       <div class="form-col form-col--setup">
@@ -413,10 +526,14 @@ function buildPageHtml(collectLogin: boolean): string {
           </div>
         </div>
         ${scheduleDateRangeRow}
-        <label for="passportExpirtyDate">Passport expiry (DD/MM/YYYY)</label>
-        <input id="passportExpirtyDate" name="passportExpirtyDate" placeholder="23/04/2027" />
-        <label for="nationalityCode">Nationality</label>
-        <select id="nationalityCode" name="nationalityCode">
+        <div class="row3">
+          <div>
+            <label for="passportExpirtyDate">Passport expiry (DD/MM/YYYY)</label>
+            <input id="passportExpirtyDate" name="passportExpirtyDate" placeholder="23/04/2027" />
+          </div>
+          <div>
+            <label for="nationalityCode">Nationality</label>
+            <select id="nationalityCode" name="nationalityCode">
           <option value="">-- Select Nationality --</option>
           <option value="AFG">AFGHANISTAN</option>
           <option value="ALB">ALBANIA</option>
@@ -639,11 +756,15 @@ function buildPageHtml(collectLogin: boolean): string {
           <option value="ZMB">ZAMBIA</option>
           <option value="ZWE">ZIMBABWE</option>
         </select>
-        <label for="gender">Gender</label>
-        <select id="gender" name="gender">
-          <option value="1">MALE</option>
-          <option value="2">FEMALE</option>
-        </select>
+          </div>
+          <div>
+            <label for="gender">Gender</label>
+            <select id="gender" name="gender">
+              <option value="1">MALE</option>
+              <option value="2">FEMALE</option>
+            </select>
+          </div>
+        </div>
         <label for="vacCode">Visa Application Centre</label>
         <select id="vacCode" name="vacCode">
           <option value="">-- Select Centre --</option>
@@ -691,7 +812,6 @@ function buildPageHtml(collectLogin: boolean): string {
 
         <hr class="section-rule" />
         <h3 class="section-title">Center 2 (optional)</h3>
-        <p class="hint" style="margin-bottom:1rem">Leave empty to poll only Center 1</p>
 
         <label for="vacCode2">Visa Application Centre 2 (Optional)</label>
         <select id="vacCode2" name="vacCode2">
@@ -701,29 +821,36 @@ function buildPageHtml(collectLogin: boolean): string {
         <select id="selectedSubvisaCategory2" name="selectedSubvisaCategory2">
           <option value="">-- Select Category --</option>
         </select>
+        <div class="form-actions">
+          <button type="submit" id="submitBtn">Submit &amp; Run</button>
+          <button type="button" id="forceBookBtn">Book Slot</button>
+        </div>
       </div>
-    </div>
-    <div class="form-actions">
-      <button type="submit" id="submitBtn">Submit &amp; Run</button>
-      <button type="button" id="forceBookBtn">Book Slot</button>
-      <button type="button" id="testApplicantsApiBtn">Test applicants API</button>
     </div>
   </form>
   <p id="msg"></p>
+  </div>
+  ${hasMonitor ? `<div id="tab-monitor" class="tabpanel" hidden>${buildMonitorTabHtml()}</div>` : ""}
+  <script>
+  (function(){
+    var btns = Array.prototype.slice.call(document.querySelectorAll('.tabbtn'));
+    btns.forEach(function(b){
+      b.addEventListener('click', function(){
+        btns.forEach(function(x){ x.classList.remove('active'); });
+        b.classList.add('active');
+        var t = b.getAttribute('data-tab');
+        Array.prototype.slice.call(document.querySelectorAll('.tabpanel')).forEach(function(p){
+          p.hidden = (p.id !== 'tab-' + t);
+        });
+        if (t === 'monitor' && window.__monitorInit) window.__monitorInit();
+      });
+    });
+  })();
+  </script>
   ${buildApplicantFormPageScript(collectLoginJs)}
 </body>
 </html>`;
 }
-
-/** One bot instance’s outcome for POST `appointment/applicants` (test button). */
-export type TestApplicantsApiInstanceResult =
-  | { instanceId: number; ok: true; status: number; bodyPreview: string }
-  | { instanceId: number; ok: false; error: string };
-
-/** Response: every running instance runs the lift-api applicants POST (cluster: one Chrome each). */
-export type TestApplicantsApiBatchResult = {
-  results: TestApplicantsApiInstanceResult[];
-};
 
 export type ApplicantFormOptions = {
   /**
@@ -733,11 +860,8 @@ export type ApplicantFormOptions = {
   collectLogin?: boolean;
   /** Called when user clicks "Book Slot" — triggers force-booking on all instances. */
   onForceBook?: () => { ok: boolean; error?: string; queued?: number };
-  /**
-   * Called when user clicks "Test applicants API" — each running instance POSTs lift-api applicants
-   * from its own logged-in Chrome tab (cluster); single-process returns one result row.
-   */
-  onTestApplicantsApi?: () => Promise<TestApplicantsApiBatchResult>;
+  /** Monitoring dashboard hooks. When set, the page shows a "Monitor bots" tab. */
+  monitor?: MonitorHooks;
 };
 
 export type FormSubmitInfo = { firstSubmit: boolean;[key: string]: unknown };
@@ -769,12 +893,6 @@ async function bindApplicantFormServerToFreePort(server: Server, host: string, p
     if (tryPort > 65535) break;
     try {
       await listenOnce(server, tryPort, host);
-      if (i > 0) {
-        logger.warn(
-          { requestedPort: preferredPort, boundPort: tryPort },
-          "Setup form port was in use; using next free port"
-        );
-      }
       boundPort = tryPort;
       return tryPort;
     } catch (e) {
@@ -799,7 +917,6 @@ export function runApplicantFormWithSubmitHandler(
   options?: ApplicantFormOptions
 ): Promise<never> {
   const collectLogin = options?.collectLogin !== false;
-  const onTestApplicantsApi = options?.onTestApplicantsApi;
 
   const preferredPort = APPLICANT_UI_PORT;
   const host = "127.0.0.1";
@@ -820,8 +937,111 @@ export function runApplicantFormWithSubmitHandler(
         const path = u.pathname;
 
         if (req.method === "GET" && path === "/") {
-          html(res, buildPageHtml(collectLogin));
+          html(res, buildPageHtml(collectLogin, Boolean(options?.monitor)));
           return;
+        }
+
+        // ── Monitoring dashboard API (only when monitor hooks provided) ──
+        if (options?.monitor && (path === "/api/monitor/events" || path.startsWith("/api/monitor/"))) {
+          const monitor = options.monitor;
+
+          if (req.method === "GET" && path === "/api/monitor/control") {
+            json(res, 200, { ok: true, control: monitor.getControl() });
+            return;
+          }
+          if (req.method === "GET" && path === "/api/monitor/snapshot") {
+            json(res, 200, { ok: true, instances: monitor.snapshot() });
+            return;
+          }
+          if (req.method === "GET" && path === "/api/monitor/events") {
+            // Keep the streaming socket open indefinitely (no idle timeout) so the
+            // dashboard stays "live" instead of dropping to "reconnecting…".
+            req.socket.setTimeout(0);
+            req.socket.setNoDelay(true);
+            req.socket.setKeepAlive(true);
+            res.writeHead(200, {
+              "Content-Type": "text/event-stream; charset=utf-8",
+              "Cache-Control": "no-cache, no-transform",
+              Connection: "keep-alive",
+              "X-Accel-Buffering": "no",
+            });
+            res.flushHeaders?.();
+            res.write("retry: 3000\n\n");
+            for (const s of monitor.snapshot()) {
+              res.write(`data: ${JSON.stringify(s)}\n\n`);
+            }
+            const unsub = monitor.subscribe((s) => {
+              try { res.write(`data: ${JSON.stringify(s)}\n\n`); } catch { /* client gone */ }
+            });
+            const ping = setInterval(() => {
+              try { res.write(": ping\n\n"); } catch { /* client gone */ }
+            }, 20_000);
+            const cleanup = (): void => { clearInterval(ping); unsub(); };
+            req.on("close", cleanup);
+            req.on("error", cleanup);
+            return;
+          }
+          if (req.method === "POST") {
+            const raw = await readBody(req);
+            let mj: Record<string, unknown> = {};
+            try { mj = raw ? (JSON.parse(raw) as Record<string, unknown>) : {}; }
+            catch { json(res, 400, { ok: false, error: "Invalid JSON" }); return; }
+            const toNum = (v: unknown): number => (typeof v === "number" ? v : parseInt(String(v ?? ""), 10));
+            const id = toNum(mj.instanceId);
+            const action = path.slice("/api/monitor/".length);
+            try {
+              if (action === "focus") { json(res, 200, await monitor.focus(id)); return; }
+              if (action === "devtools") { json(res, 200, await monitor.devtools(id)); return; }
+              if (action === "stop") { json(res, 200, monitor.stopInstance(id)); return; }
+              if (action === "restart") { json(res, 200, monitor.restartInstance(id)); return; }
+              if (action === "pause") { json(res, 200, monitor.pauseRollout()); return; }
+              if (action === "resume") { json(res, 200, monitor.resumeRollout()); return; }
+              if (action === "pause-polling") {
+                json(res, 200, monitor.pausePolling(Number.isFinite(id) && id >= 1 ? id : undefined));
+                return;
+              }
+              if (action === "resume-polling") {
+                json(res, 200, monitor.resumePolling(Number.isFinite(id) && id >= 1 ? id : undefined));
+                return;
+              }
+              if (action === "stagger") {
+                const ms = toNum(mj.intervalMs);
+                json(res, 200, monitor.setStaggerInterval(Number.isFinite(ms) ? ms : 6000));
+                return;
+              }
+              if (action === "apologies-interval") {
+                const sec = toNum(mj.intervalSec);
+                json(res, 200, monitor.setApologiesIntervalSec(Number.isFinite(sec) ? sec : 2));
+                return;
+              }
+              if (action === "poll-interval") {
+                const sec = toNum(mj.intervalSec);
+                json(res, 200, monitor.setPollIntervalSec(Number.isFinite(sec) ? sec : 60));
+                return;
+              }
+              if (action === "applicants-join-stagger") {
+                const sec = typeof mj.intervalSec === "number" ? mj.intervalSec : parseFloat(String(mj.intervalSec ?? ""));
+                json(res, 200, monitor.setApplicantsJoinStaggerSec(Number.isFinite(sec) ? sec : 0.5));
+                return;
+              }
+              if (action === "calendar-polling-interval") {
+                const sec = toNum(mj.intervalSec);
+                json(res, 200, monitor.setCalendarPollingIntervalSec(Number.isFinite(sec) ? sec : 60));
+                return;
+              }
+              if (action === "start") {
+                const count = toNum(mj.count);
+                const ms = toNum(mj.intervalMs);
+                json(res, 200, monitor.start({ count: Number.isFinite(count) ? count : 1, intervalMs: Number.isFinite(ms) ? ms : 6000 }));
+                return;
+              }
+            } catch (e) {
+              json(res, 500, { ok: false, error: e instanceof Error ? e.message : String(e) });
+              return;
+            }
+            json(res, 404, { ok: false, error: "Unknown monitor action" });
+            return;
+          }
         }
 
         if (req.method === "GET" && path === "/api/defaults") {
@@ -841,8 +1061,22 @@ export function runApplicantFormWithSubmitHandler(
             if (globalDet && typeof globalDet.userPollInterval === "number") {
               defaults.userPollInterval = globalDet.userPollInterval;
             }
+            if (globalDet && typeof globalDet.apologiesIntervalSec === "number") {
+              defaults.apologiesIntervalSec = globalDet.apologiesIntervalSec;
+            } else if (globalDet && typeof globalDet.applicantsIntervalSec === "number") {
+              defaults.apologiesIntervalSec = globalDet.applicantsIntervalSec;
+            }
+            if (globalDet && typeof globalDet.applicantsJoinStaggerSec === "number") {
+              defaults.applicantsJoinStaggerSec = globalDet.applicantsJoinStaggerSec;
+            }
             if (globalDet && typeof globalDet.postLoginPollDelay === "number") {
               defaults.postLoginPollDelay = globalDet.postLoginPollDelay;
+            }
+            if (globalDet && typeof globalDet.calendarPollingStartDate === "string") {
+              defaults.calendarPollingStartDate = globalDet.calendarPollingStartDate;
+            }
+            if (globalDet && typeof globalDet.calendarPollingInterval === "number") {
+              defaults.calendarPollingInterval = globalDet.calendarPollingInterval;
             }
             const payload: Record<string, unknown> = { ok: true, defaults };
             if (collectLogin) {
@@ -916,13 +1150,32 @@ export function runApplicantFormWithSubmitHandler(
             ...rest
           } = j;
           const fields = parseApplicantFields(rest);
-          const { userPollInterval: upi, postLoginPollDelay: plpd, ...instanceFields } = fields;
+          const {
+            userPollInterval: upi,
+            apologiesIntervalSec: ais,
+            applicantsJoinStaggerSec: ajs,
+            postLoginPollDelay: plpd,
+            staggerIntervalSec: sis,
+            calendarPollingStartDate: cpsd,
+            calendarPollingInterval: cpi,
+            ...instanceFields
+          } = fields;
 
           {
             const global0 = getApplicantDetailsOverrides(0) ?? {};
             let changed = false;
             if (typeof upi === "number") { global0.userPollInterval = upi; changed = true; }
+            if (typeof ais === "number") {
+              global0.apologiesIntervalSec = ais;
+              delete global0.applicantsIntervalSec;
+              changed = true;
+            }
+            if (typeof ajs === "number") { global0.applicantsJoinStaggerSec = ajs; changed = true; }
             if (typeof plpd === "number") { global0.postLoginPollDelay = plpd; changed = true; }
+            if (typeof sis === "number") { global0.staggerIntervalSec = sis; changed = true; }
+            if (typeof cpsd === "string") { global0.calendarPollingStartDate = cpsd; changed = true; }
+            else if ("calendarPollingStartDate" in rest) { delete global0.calendarPollingStartDate; changed = true; }
+            if (typeof cpi === "number") { global0.calendarPollingInterval = cpi; changed = true; }
             if (typeof instanceFields.countryCode === "string") { global0.countryCode = instanceFields.countryCode; changed = true; }
             if (typeof instanceFields.missionCode === "string") { global0.missionCode = instanceFields.missionCode; changed = true; }
             if (changed) setApplicantDetailsOverrides(global0, 0);
@@ -948,6 +1201,87 @@ export function runApplicantFormWithSubmitHandler(
             typeof j.numInstances === "number" && j.numInstances > 0
               ? Math.floor(j.numInstances)
               : 1;
+
+          const submittedStaggerSec =
+            typeof j.staggerIntervalSec === "number" && j.staggerIntervalSec >= 0
+              ? Math.floor(j.staggerIntervalSec)
+              : (() => {
+                  const v = parseInt(String(j.staggerIntervalSec ?? ""), 10);
+                  return Number.isFinite(v) && v >= 0 ? v : undefined;
+                })();
+
+          const submittedApologiesIntervalSec =
+            typeof j.apologiesIntervalSec === "number" && j.apologiesIntervalSec >= 1
+              ? Math.floor(j.apologiesIntervalSec)
+              : typeof j.applicantsIntervalSec === "number" && j.applicantsIntervalSec >= 1
+                ? Math.floor(j.applicantsIntervalSec)
+                : (() => {
+                    const v = parseInt(String(j.apologiesIntervalSec ?? j.applicantsIntervalSec ?? ""), 10);
+                    return Number.isFinite(v) && v >= 1 ? v : undefined;
+                  })();
+
+          const submittedApplicantsJoinStaggerSec =
+            typeof j.applicantsJoinStaggerSec === "number" && j.applicantsJoinStaggerSec >= 0.1
+              ? j.applicantsJoinStaggerSec
+              : (() => {
+                  const v = parseFloat(String(j.applicantsJoinStaggerSec ?? ""));
+                  return Number.isFinite(v) && v >= 0.1 ? v : undefined;
+                })();
+
+          const submittedCalendarPollingInterval =
+            typeof j.calendarPollingInterval === "number" && j.calendarPollingInterval >= 1
+              ? Math.floor(j.calendarPollingInterval)
+              : (() => {
+                  const v = parseInt(String(j.calendarPollingInterval ?? ""), 10);
+                  return Number.isFinite(v) && v >= 1 ? v : undefined;
+                })();
+
+          const submittedCalendarPollingStartDate =
+            typeof j.calendarPollingStartDate === "string" && j.calendarPollingStartDate.trim() !== ""
+              ? j.calendarPollingStartDate.trim()
+              : undefined;
+
+          if (
+            submittedApologiesIntervalSec != null ||
+            submittedApplicantsJoinStaggerSec != null ||
+            submittedStaggerSec != null ||
+            typeof j.userPollInterval === "number" ||
+            submittedCalendarPollingInterval != null ||
+            "calendarPollingStartDate" in j
+          ) {
+            const global0 = getApplicantDetailsOverrides(0) ?? {};
+            let changed = false;
+            if (submittedApologiesIntervalSec != null) {
+              global0.apologiesIntervalSec = submittedApologiesIntervalSec;
+              delete global0.applicantsIntervalSec;
+              changed = true;
+            }
+            if (submittedApplicantsJoinStaggerSec != null) {
+              global0.applicantsJoinStaggerSec = submittedApplicantsJoinStaggerSec;
+              changed = true;
+            }
+            if (submittedStaggerSec != null) {
+              global0.staggerIntervalSec = submittedStaggerSec;
+              changed = true;
+            }
+            if (typeof j.userPollInterval === "number" && j.userPollInterval >= 1) {
+              global0.userPollInterval = Math.floor(j.userPollInterval);
+              changed = true;
+            }
+            if (submittedCalendarPollingInterval != null) {
+              global0.calendarPollingInterval = submittedCalendarPollingInterval;
+              changed = true;
+            }
+            if ("calendarPollingStartDate" in j) {
+              if (submittedCalendarPollingStartDate != null) {
+                global0.calendarPollingStartDate = submittedCalendarPollingStartDate;
+              } else {
+                delete global0.calendarPollingStartDate;
+              }
+              changed = true;
+            }
+            if (changed) setApplicantDetailsOverrides(global0, 0);
+          }
 
           const credentials = getAllInstanceCredentials();
           const details = getAllInstanceApplicantDetails();
@@ -979,11 +1313,12 @@ export function runApplicantFormWithSubmitHandler(
               firstSubmit: !seenSubmit,
               instanceId,
               numInstances: actualInstanceCount,
+              staggerIntervalSec: submittedStaggerSec,
               ...credentials.get(instanceId),
               ...details.get(instanceId),
             }))
               .then(() => undefined)
-              .catch((err) => logger.error({ err, instanceId }, "Form onSubmit handler failed"));
+              .catch(() => undefined);
             queued++;
           }
 
@@ -1002,28 +1337,10 @@ export function runApplicantFormWithSubmitHandler(
           return;
         }
 
-        if (req.method === "POST" && path === "/api/test-applicants") {
-          if (!onTestApplicantsApi) {
-            json(res, 400, { ok: false, error: "Test applicants API not available in this mode." });
-            return;
-          }
-          try {
-            const result = await onTestApplicantsApi();
-            json(res, 200, result);
-          } catch (e) {
-            json(res, 500, {
-              results: [],
-              error: e instanceof Error ? e.message : String(e),
-            });
-          }
-          return;
-        }
-
         res.writeHead(404);
         res.end();
       } catch (e) {
-        logger.error({ e }, "Applicant UI server error");
-        try {
+                try {
           json(res, 500, { ok: false, error: e instanceof Error ? e.message : "error" });
         } catch {
           res.destroy();
@@ -1041,8 +1358,7 @@ export function runApplicantFormWithSubmitHandler(
           server.close(() => { });
           safeReject(err);
         });
-        console.log("\n  >>> Bot setup form: " + url + "\n");
-        openUrlInBrowser(url);
+                openUrlInBrowser(url);
       } catch (err) {
         server.close(() => { });
         safeReject(err instanceof Error ? err : new Error(String(err)));

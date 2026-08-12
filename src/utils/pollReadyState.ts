@@ -1,7 +1,5 @@
 import { existsSync, readFileSync, writeFileSync, unlinkSync, watch } from "node:fs";
 import { join } from "node:path";
-import { logger } from "./logger";
-
 export interface PollReadyState {
   totalExpected: number;
   readyInstances: number[];
@@ -30,25 +28,21 @@ function writeState(state: PollReadyState): void {
   try {
     writeFileSync(POLL_READY_FILE, JSON.stringify(state, null, 2), "utf8");
   } catch (err) {
-    logger.error({ err }, "Failed to write poll-ready state");
-  }
+      }
 }
 
 export function clearPollReadyState(): void {
   try {
     if (existsSync(POLL_READY_FILE)) {
       unlinkSync(POLL_READY_FILE);
-      logger.info("Cleared poll-ready state");
-    }
+          }
   } catch (err) {
-    logger.warn({ err }, "Failed to clear poll-ready state");
-  }
+      }
 }
 
 export function initPollReadyState(totalExpected: number): void {
   writeState({ totalExpected, readyInstances: [], readyAt: {} });
-  logger.info({ totalExpected }, "Initialized poll-ready state");
-}
+  }
 
 export function markInstanceReady(instanceId: number): void {
   const state = readState();
@@ -57,11 +51,7 @@ export function markInstanceReady(instanceId: number): void {
     state.readyInstances.sort((a, b) => a - b);
     state.readyAt[instanceId] = Date.now();
     writeState(state);
-    logger.info(
-      { instanceId, ready: state.readyInstances.length, total: state.totalExpected },
-      "Instance marked ready for polling"
-    );
-  }
+      }
 }
 
 export function getPollReadyState(): PollReadyState {
@@ -113,11 +103,17 @@ export function getReadyInstanceOffset(instanceId: number, stepMs: number): numb
  * ready (not the total expected). This replaces the old `stepMs * numInstances`
  * calculation with `stepMs * readyCount` so the interval tightens when
  * some instances failed to reach the dashboard.
+ *
+ * Returns 0 when nobody is marked ready yet — callers should fall back to
+ * `stepMs * BOT_TOTAL_INSTANCES`. (Returning `stepMs * 1` here used to make
+ * every bot sleep only the user step, defeating POLL_INTERVAL_SCALED.)
  */
 export function getReadyInstancePollInterval(stepMs: number): number {
   const state = readState();
-  const readyCount = Math.max(1, state.readyInstances.length);
-  return stepMs * readyCount;
+  const readyCount = state.readyInstances.length;
+  if (readyCount > 0) return stepMs * readyCount;
+  if (state.totalExpected > 0) return stepMs * state.totalExpected;
+  return 0;
 }
 
 /**

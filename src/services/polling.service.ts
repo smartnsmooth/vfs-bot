@@ -1,10 +1,15 @@
 import { config } from "../config/config";
 import { Slot } from "../types/slot.type";
 import type { CheckIsSlotAvailableResponse } from "../types/slot.type";
-import { logger } from "../utils/logger";
+import { isCloudflareChallengeBody } from "../utils/apiCallLog";
 import { classifyVfs429 } from "../utils/vfsRateLimit";
 import type { BrowserService } from "./browser.service";
-import { VfsGatewayTimeoutError, VfsRateLimitedError } from "./browser.service";
+import {
+  VfsForbiddenError,
+  VfsGatewayTimeoutError,
+  VfsRateLimitedError,
+  isFailedToFetchError,
+} from "./browser.service";
 
 export interface PollResult {
   slot: Slot | null;
@@ -12,7 +17,7 @@ export interface PollResult {
   centerNumber?: 1 | 2;  // Which center found the slot
   centerCode?: string;
   visaCategoryCode?: string;
-  unauthorized?: boolean;  // true when API returns 401 — polling must stop
+  unauthorized?: boolean;  // true when API returns 401 — session expired; caller should relogin + resume
   /** @deprecated Prefer accountBlocked / rateLimitedIp */
   rateLimited?: boolean;
   /** 4290XX — account / User ID restricted; stop the bot */
@@ -22,6 +27,10 @@ export interface PollResult {
   rateLimitCode?: string;
   forbidden?: boolean;     // true when API returns 403 — needs full browser restart + IP rotation
   gatewayTimeout?: boolean; // true when API returns 504 — needs full browser restart + IP rotation + re-login
+  /** Cloudflare "Just a moment..." / 403201 — clear session, rotate IP, restart Chrome + relogin */
+  cloudflareChallenge?: boolean;
+  /** In-page fetch threw (Failed to fetch / net::ERR_*) — hard relogin + rotate IP */
+  fetchFailed?: boolean;
 }
 
 /**
@@ -41,13 +50,30 @@ export class PollingService {
       visaCategoryCode: options.visaCategoryCode,
     };
     try {
+      // Request/response are logged inside postLiftJsonFromPage (including failures).
       const { status, body } = await browserService.runSlotCheckInBrowser(url, payload);
+      const isCfChallenge = isCloudflareChallengeBody(body);
+
       let data: CheckIsSlotAvailableResponse;
       try {
         data = JSON.parse(body) as CheckIsSlotAvailableResponse;
       } catch {
-        logger.warn({ status, url, bodySnippet: body.slice(0, 200) }, "Slot API returned non-JSON");
-        const rateKind = status === 429 ? classifyVfs429(null, 429) : null;
+        if (isCfChallenge) {
+          return {
+            slot: null,
+            cloudflareChallenge: true,
+            response: {
+              earliestDate: null,
+              earliestSlotLists: [],
+              error: {
+                code: -1,
+                description: "cloudflareChallenge — clearing session, rotating IP, restarting Chrome.",
+                type: "Error",
+              },
+            },
+          };
+        }
+                const rateKind = status === 429 ? classifyVfs429(null, 429) : null;
         return {
           slot: null,
           response: {
@@ -59,11 +85,11 @@ export class PollingService {
                 ? "401 Unauthorized. Keep a tab on visa.vfsglobal.com open and stay logged in."
                 : status === 429
                   ? "429 Too Many Requests."
-                  : status === 403
-                    ? "403 Forbidden. IP/session blocked by Cloudflare or VFS."
-                    : status === 504
+                  : status === 504
                       ? "504 Gateway Timeout. Restarting browser + rotating IP."
-                      : `API returned non-JSON (status ${status}).`,
+                      : status === 403
+                        ? "403 Forbidden. IP/session blocked by Cloudflare or VFS."
+                        : `API returned non-JSON (status ${status}).`,
               type: "Error",
             },
           },
@@ -76,9 +102,28 @@ export class PollingService {
           gatewayTimeout: status === 504,
         };
       }
-      if (status === 504) {
-        logger.warn({ status, url, bodySnippet: body.slice(0, 200) }, "504 Gateway Timeout from slot API — need browser restart + IP rotation + re-login");
+      // 403201 / Cloudflare interstitial — clear session, rotate IP, restart Chrome.
+      const codeStr = String((data as { code?: string | number }).code ?? data.error?.code ?? "");
+      const is403201 = codeStr.startsWith("403201");
+      if (isCfChallenge || is403201) {
         return {
+          slot: null,
+          cloudflareChallenge: true,
+          response: {
+            earliestDate: null,
+            earliestSlotLists: [],
+            error: {
+              code: -1,
+              description: is403201
+                ? "cloudflareChallenge (403201) — clearing session, rotating IP, restarting Chrome."
+                : "cloudflareChallenge — clearing session, rotating IP, restarting Chrome.",
+              type: "Error",
+            },
+          },
+        };
+      }
+      if (status === 504) {
+                return {
           slot: null,
           gatewayTimeout: true,
           response: {
@@ -89,8 +134,7 @@ export class PollingService {
         };
       }
       if (status === 403) {
-        logger.warn({ status, url, bodySnippet: body.slice(0, 200) }, "403 Forbidden from slot API — need browser restart + IP rotation");
-        return {
+                return {
           slot: null,
           forbidden: true,
           response: {
@@ -115,8 +159,7 @@ export class PollingService {
       if (status === 429) {
         const code = String((data as { code?: string | number }).code ?? data.error?.code ?? "429");
         const kind = classifyVfs429(code, 429) ?? "ip";
-        logger.warn({ status, url, code, kind, bodySnippet: body.slice(0, 200) }, "429 from slot API");
-        return {
+                return {
           slot: null,
           rateLimited: kind === "ip",
           accountBlocked: kind === "account",
@@ -143,10 +186,6 @@ export class PollingService {
           date: "",
           time: "00:00:00",
         };
-        logger.info(
-          { errorCode: data.error?.code, centerCode: options.centerCode, visaCategoryCode: options.visaCategoryCode },
-          "Slot API returned code 1036 — treating as slot-available signal; proceeding to calendar"
-        );
         return {
           slot: syntheticSlot,
           response: data,
@@ -157,6 +196,7 @@ export class PollingService {
       }
       const apiError = normalizeApiError(data);
       if (apiError) {
+        const is403201 = String((data as { code?: string | number }).code ?? data.error?.code ?? "").startsWith("403201");
         return {
           slot: null,
           unauthorized: apiError.unauthorized,
@@ -164,7 +204,8 @@ export class PollingService {
           accountBlocked: apiError.accountBlocked,
           rateLimitedIp: apiError.rateLimitedIp,
           rateLimitCode: apiError.rateLimitCode,
-          forbidden: apiError.forbidden,
+          forbidden: is403201 ? false : apiError.forbidden,
+          cloudflareChallenge: is403201 ? true : undefined,
           response: {
             earliestDate: null,
             earliestSlotLists: [],
@@ -182,11 +223,7 @@ export class PollingService {
       };
     } catch (err) {
       if (err instanceof VfsRateLimitedError) {
-        logger.warn(
-          { err: err.message, code: err.code, kind: err.kind, url },
-          "429 rate-limit from slot API"
-        );
-        return {
+                return {
           slot: null,
           rateLimited: err.isIpBlock,
           accountBlocked: err.isAccountBlock,
@@ -200,8 +237,7 @@ export class PollingService {
         };
       }
       if (err instanceof VfsGatewayTimeoutError) {
-        logger.warn({ err, url }, "504 Gateway Timeout from slot API — need browser restart + IP rotation + re-login");
-        return {
+                return {
           slot: null,
           gatewayTimeout: true,
           response: {
@@ -211,8 +247,38 @@ export class PollingService {
           },
         };
       }
-      logger.debug({ err, url }, "Browser slot check failed");
-      return {
+      if (err instanceof VfsForbiddenError && /cloudflare/i.test(err.message)) {
+        return {
+          slot: null,
+          cloudflareChallenge: true,
+          response: {
+            earliestDate: null,
+            earliestSlotLists: [],
+            error: {
+              code: -1,
+              description: "cloudflareChallenge — clearing session, rotating IP, restarting Chrome.",
+              type: "Error",
+            },
+          },
+        };
+      }
+      if (isFailedToFetchError(err)) {
+        return {
+          slot: null,
+          fetchFailed: true,
+          response: {
+            earliestDate: null,
+            earliestSlotLists: [],
+            error: {
+              code: -1,
+              description:
+                "Failed to fetch — network/proxy drop. Clearing session, rotating IP, restarting Chrome.",
+              type: "Error",
+            },
+          },
+        };
+      }
+            return {
         slot: null,
         response: {
           earliestDate: null,

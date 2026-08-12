@@ -1,7 +1,5 @@
 import { existsSync, rmSync } from "node:fs";
 import path from "node:path";
-import { logger } from "./logger";
-
 /** Chrome profile folder under `user-data-dir` (e.g. `Default`, `Profile 1`). */
 export function resolveChromeProfileFolderName(): string {
   const p = process.env.CHROME_PROFILE_DIRECTORY?.trim();
@@ -32,6 +30,10 @@ const SESSION_RELATIVE_PATHS: readonly string[] = [
   "IndexedDB",
   "Service Worker",
   "Session",
+  "Current Session",
+  "Last Session",
+  "Current Tabs",
+  "Last Tabs",
   "shared_proto_db",
   "VideoDecodeStats",
   "LOG",
@@ -53,8 +55,7 @@ function tryRemove(p: string): void {
   try {
     rmSync(p, { recursive: true, force: true });
   } catch (err) {
-    logger.warn({ err, path: p }, "[Chrome] Could not remove path during session clean (in use?)");
-  }
+      }
 }
 
 /**
@@ -79,26 +80,20 @@ export async function clearChromeSessionDataBeforeLaunch(
   }
 
   if (opts?.preserveAuthSession) {
-    logger.info(
-      { userDataDir: dir, profile },
-      "[Chrome] Preserving auth session (cookies/storage) — only cleared Singleton locks for IP rotate"
-    );
-    await new Promise((r) => setTimeout(r, 200));
+        await new Promise((r) => setTimeout(r, 200));
     return;
   }
 
   if (!clearSessionOnLaunchEnabled()) return;
 
   if (!existsSync(profilePath)) {
-    logger.debug({ profilePath }, "[Chrome] Profile dir missing — skip session clean");
-    return;
+        return;
   }
 
   for (const rel of SESSION_RELATIVE_PATHS) {
     tryRemove(path.join(profilePath, ...rel.split("/")));
   }
 
-  logger.info({ userDataDir: dir, profile }, "[Chrome] Cleared cookies, storage, and caches before launch");
-
+  
   await new Promise((r) => setTimeout(r, 200));
 }

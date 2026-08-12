@@ -13,11 +13,11 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     const fromInput = (el instanceof HTMLInputElement && typeof el.valueAsNumber === "number" && Number.isFinite(el.valueAsNumber) && el.valueAsNumber >= 1)
       ? Math.floor(el.valueAsNumber)
       : NaN;
-    if (Number.isFinite(fromInput)) return Math.min(50, fromInput);
+    if (Number.isFinite(fromInput)) return Math.min(100, fromInput);
     const parsed = parseInt(String(el.value).trim(), 10);
-    if (Number.isFinite(parsed) && parsed >= 1) return Math.min(50, parsed);
+    if (Number.isFinite(parsed) && parsed >= 1) return Math.min(100, parsed);
     const fromAttr = parseInt(String(el.getAttribute("value") || "").trim(), 10);
-    if (Number.isFinite(fromAttr) && fromAttr >= 1) return Math.min(50, fromAttr);
+    if (Number.isFinite(fromAttr) && fromAttr >= 1) return Math.min(100, fromAttr);
     return 1;
   }
 
@@ -417,6 +417,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
         const k = keys[ki];
         if (skipDetailIds[k] || skipCenterCatIds[k]) continue;
         if (k === "scheduleDateRangeStart" || k === "scheduleDateRangeEnd") continue;
+        if (k === "calendarPollingStartDate" || k === "calendarPollingInterval") continue;
         const el = document.getElementById(k);
         if (el) el.value = inst.details[k] == null ? "" : String(inst.details[k]);
       }
@@ -445,12 +446,38 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     updateUzbLvaApplicantFields();
     applyInstanceScheduleRangeToForm(inst.details || {});
 
-    // Global settings (instance 0): postLoginPollDelay.
+    // Global settings (instance 0): postLoginPollDelay + staggerIntervalSec + apologiesIntervalSec + calendar polling.
     const globalInst = data.instances["0"];
     const plpdEl = document.getElementById("postLoginPollDelay");
     if (plpdEl) {
       const src = (globalInst && globalInst.details) || (inst && inst.details) || {};
       plpdEl.value = src.postLoginPollDelay != null ? String(src.postLoginPollDelay) : "30";
+    }
+    const aisEl = document.getElementById("apologiesIntervalSec");
+    if (aisEl) {
+      const gsrc = (globalInst && globalInst.details) || {};
+      const sec = gsrc.apologiesIntervalSec != null ? gsrc.apologiesIntervalSec : gsrc.applicantsIntervalSec;
+      aisEl.value = sec != null ? String(sec) : "2";
+    }
+    const ajsEl = document.getElementById("applicantsJoinStaggerSec");
+    if (ajsEl) {
+      const gsrc = (globalInst && globalInst.details) || {};
+      ajsEl.value = gsrc.applicantsJoinStaggerSec != null ? String(gsrc.applicantsJoinStaggerSec) : "0.5";
+    }
+    const sisEl = document.getElementById("staggerIntervalSec");
+    if (sisEl) {
+      const gsrc = (globalInst && globalInst.details) || {};
+      sisEl.value = gsrc.staggerIntervalSec != null ? String(gsrc.staggerIntervalSec) : "6";
+    }
+    const cpsdEl = document.getElementById("calendarPollingStartDate");
+    if (cpsdEl) {
+      const gsrc = (globalInst && globalInst.details) || {};
+      cpsdEl.value = gsrc.calendarPollingStartDate != null ? String(gsrc.calendarPollingStartDate).trim().slice(0, 10) : "";
+    }
+    const cpiEl = document.getElementById("calendarPollingInterval");
+    if (cpiEl) {
+      const gsrc = (globalInst && globalInst.details) || {};
+      cpiEl.value = gsrc.calendarPollingInterval != null ? String(gsrc.calendarPollingInterval) : "60";
     }
 
     if (showAlert) {
@@ -493,12 +520,20 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       scheduleDateRangeEnd: String(fd.get("scheduleDateRangeEnd") ?? "").trim(),
       numInstances: getNumInstances(),
       userPollInterval: parseInt(String(fd.get("userPollInterval") || "60"), 10) || 60,
+      apologiesIntervalSec: parseInt(String(fd.get("apologiesIntervalSec") || "2"), 10) || 2,
+      applicantsJoinStaggerSec: parseFloat(String(fd.get("applicantsJoinStaggerSec") || "0.5")) || 0.5,
+      calendarPollingStartDate: String(fd.get("calendarPollingStartDate") ?? "").trim(),
+      calendarPollingInterval: parseInt(String(fd.get("calendarPollingInterval") || "60"), 10) || 60,
       postLoginPollDelay: parseInt(String(fd.get("postLoginPollDelay") || "30"), 10),
+      staggerIntervalSec: parseInt(String(fd.get("staggerIntervalSec") || "6"), 10),
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
       helloVerifyNumber: String(fd.get("helloVerifyNumber") ?? "").trim() || undefined,
       juridictionCode: String(fd.get("juridictionCode") ?? "").trim() || undefined,
     };
     if (!Number.isFinite(body.postLoginPollDelay) || body.postLoginPollDelay < 0) body.postLoginPollDelay = 30;
+    if (!Number.isFinite(body.apologiesIntervalSec) || body.apologiesIntervalSec < 1) body.apologiesIntervalSec = 2;
+    if (!Number.isFinite(body.applicantsJoinStaggerSec) || body.applicantsJoinStaggerSec < 0.1) body.applicantsJoinStaggerSec = 0.5;
+    if (!Number.isFinite(body.calendarPollingInterval) || body.calendarPollingInterval < 1) body.calendarPollingInterval = 60;
     if (collectLogin) {
       body.vfsUsername = fd.get("vfsUsername");
       body.vfsPassword = fd.get("vfsPassword");
@@ -613,8 +648,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       await loadInstanceData(false);
 
       updateInstanceSelector();
-    } catch (err) {
-      console.error("initApplicantForm failed", err);
+    } catch {
+      // ignore
     }
   }
 
@@ -635,6 +670,50 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     }
   })();
   void initApplicantForm();
+
+  function setSubmitLoading(on) {
+    const btn = document.getElementById("submitBtn");
+    if (!btn) return;
+    if (on) {
+      if (!btn.dataset.prevLabel) btn.dataset.prevLabel = btn.textContent || "Submit & Run";
+      btn.disabled = true;
+      btn.classList.add("is-loading");
+      btn.textContent = "Starting\\u2026";
+    } else {
+      btn.disabled = false;
+      btn.classList.remove("is-loading");
+      btn.textContent = btn.dataset.prevLabel || "Submit & Run";
+      delete btn.dataset.prevLabel;
+    }
+  }
+
+  /** Poll monitor until any instance reports Chrome DevTools up (first window open). */
+  async function waitForFirstChrome(timeoutMs) {
+    const deadline = Date.now() + (timeoutMs || 180000);
+    let consecutiveMisses = 0;
+    while (Date.now() < deadline) {
+      try {
+        const r = await fetch("/api/monitor/snapshot");
+        if (!r.ok) {
+          consecutiveMisses += 1;
+          if (consecutiveMisses >= 3) return false;
+        } else {
+          consecutiveMisses = 0;
+          const d = await r.json();
+          if (d && d.ok && Array.isArray(d.instances)) {
+            for (let i = 0; i < d.instances.length; i++) {
+              if (d.instances[i].chromeAlive === true) return true;
+            }
+          }
+        }
+      } catch {
+        consecutiveMisses += 1;
+        if (consecutiveMisses >= 5) return false;
+      }
+      await new Promise(function (res) { setTimeout(res, 400); });
+    }
+    return false;
+  }
 
   document.getElementById("f").addEventListener("submit", async function (e) {
     e.preventDefault();
@@ -692,18 +771,27 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       scheduleDateRangeEnd: String(fd.get("scheduleDateRangeEnd") ?? "").trim(),
       numInstances: getNumInstances(),
       userPollInterval: parseInt(String(fd.get("userPollInterval") || "60"), 10) || 60,
+      apologiesIntervalSec: parseInt(String(fd.get("apologiesIntervalSec") || "2"), 10) || 2,
+      applicantsJoinStaggerSec: parseFloat(String(fd.get("applicantsJoinStaggerSec") || "0.5")) || 0.5,
+      calendarPollingStartDate: String(fd.get("calendarPollingStartDate") ?? "").trim(),
+      calendarPollingInterval: parseInt(String(fd.get("calendarPollingInterval") || "60"), 10) || 60,
       postLoginPollDelay: parseInt(String(fd.get("postLoginPollDelay") || "30"), 10),
+      staggerIntervalSec: parseInt(String(fd.get("staggerIntervalSec") || "6"), 10),
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
       helloVerifyNumber: String(fd.get("helloVerifyNumber") ?? "").trim() || undefined,
       juridictionCode: String(fd.get("juridictionCode") ?? "").trim() || undefined,
     };
     if (!Number.isFinite(body.postLoginPollDelay) || body.postLoginPollDelay < 0) body.postLoginPollDelay = 30;
+    if (!Number.isFinite(body.apologiesIntervalSec) || body.apologiesIntervalSec < 1) body.apologiesIntervalSec = 2;
+    if (!Number.isFinite(body.applicantsJoinStaggerSec) || body.applicantsJoinStaggerSec < 0.1) body.applicantsJoinStaggerSec = 0.5;
+    if (!Number.isFinite(body.calendarPollingInterval) || body.calendarPollingInterval < 1) body.calendarPollingInterval = 60;
     if (collectLogin) {
       body.vfsUsername = fd.get("vfsUsername");
       body.vfsPassword = fd.get("vfsPassword");
       body.vfsUsername2 = fd.get("vfsUsername2");
       body.vfsPassword2 = fd.get("vfsPassword2");
     }
+    setSubmitLoading(true);
     try {
       const r = await fetch("/api/submit", {
         method: "POST",
@@ -714,6 +802,9 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       if (j.ok) {
         msg.className = "ok";
         msg.textContent =
+          "\\u2713 Started " + (j.queued || "all") + " bot instance(s). Waiting for Chrome\\u2026";
+        await waitForFirstChrome(180000);
+        msg.textContent =
           "\\u2713 Started " + (j.queued || "all") + " bot instance(s). Check terminal for progress.";
       } else {
         msg.className = "err";
@@ -722,6 +813,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     } catch (err) {
       msg.className = "err";
       msg.textContent = String(err);
+    } finally {
+      setSubmitLoading(false);
     }
   });
 
@@ -749,68 +842,6 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       btn.textContent = "Book Slot";
     }
   });
-
-  var testApplicantsBtn = document.getElementById("testApplicantsApiBtn");
-  if (testApplicantsBtn) {
-    testApplicantsBtn.addEventListener("click", async function () {
-      const msg = document.getElementById("msg");
-      const btn = document.getElementById("testApplicantsApiBtn");
-      msg.textContent = "";
-      btn.disabled = false;
-      var prevLabel = btn.textContent;
-      btn.textContent = "Saving…";
-      try {
-        await saveFormData(false);
-        btn.textContent = "Calling API (all instances)…";
-        const r = await fetch("/api/test-applicants", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: "{}",
-        });
-        const j = await r.json();
-        if (!r.ok) {
-          msg.className = "err";
-          msg.textContent = j.error || "Test applicants API failed";
-          return;
-        }
-        const rows = Array.isArray(j.results) ? j.results : [];
-        if (rows.length === 0) {
-          msg.className = "err";
-          msg.textContent = "No running instances. Click Submit & Run first to spawn bots, then try again.";
-          return;
-        }
-        var lines = [];
-        var anyBad = false;
-        for (var i = 0; i < rows.length; i++) {
-          var row = rows[i];
-          var id = row.instanceId;
-          if (row.ok === true && typeof row.status === "number") {
-            var prev = typeof row.bodyPreview === "string" ? row.bodyPreview : "";
-            if (row.status < 200 || row.status >= 300) anyBad = true;
-            lines.push(
-              "Instance " +
-                id +
-                ": HTTP " +
-                row.status +
-                (prev ? " — " + prev.slice(0, 500) : "") +
-                " (see that instance’s Chrome / Network tab)."
-            );
-          } else {
-            anyBad = true;
-            lines.push("Instance " + id + ": " + (row.error || "failed"));
-          }
-        }
-        msg.className = anyBad ? "err" : "ok";
-        msg.textContent = lines.join("\\n");
-      } catch (err) {
-        msg.className = "err";
-        msg.textContent = String(err);
-      } finally {
-        btn.disabled = false;
-        btn.textContent = prevLabel;
-      }
-    });
-  }
 })();
 </script>`;
 }

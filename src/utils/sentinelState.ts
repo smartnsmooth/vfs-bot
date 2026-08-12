@@ -1,7 +1,5 @@
 import { existsSync, readFileSync, writeFileSync, unlinkSync, watch } from "node:fs";
 import { join } from "node:path";
-import { logger } from "./logger";
-
 export type BotRole = "sentinel" | "standby";
 
 export interface SentinelConfig {
@@ -84,8 +82,7 @@ export function writeRoleAssignments(assignments: RoleAssignments): void {
   try {
     writeFileSync(SENTINEL_ROLES_FILE, JSON.stringify(assignments, null, 2), "utf8");
   } catch (err) {
-    logger.error({ err }, "[Sentinel] Failed to write role assignments");
-  }
+      }
 }
 
 export function readRoleAssignments(): RoleAssignments | null {
@@ -106,15 +103,12 @@ export function clearRoleAssignments(force = false): void {
       // If there are stopped instances, the dynamic roles are meaningful
       // (login failures already triggered demotions). Don't wipe them.
       if (existing?.stoppedIds && existing.stoppedIds.length > 0) {
-        logger.info({ stoppedIds: existing.stoppedIds }, "[Sentinel] Skipping role clear — stopped instances exist, preserving dynamic roles");
-        return;
+                return;
       }
     }
     unlinkSync(SENTINEL_ROLES_FILE);
-    logger.info("[Sentinel] Role assignments cleared (reset to initial)");
-  } catch (err) {
-    logger.warn({ err }, "[Sentinel] Failed to clear role assignments");
-  }
+      } catch (err) {
+      }
 }
 
 /**
@@ -169,8 +163,7 @@ export function markInstanceStopped(instanceId: number, totalInstances: number, 
   standbyIds = standbyIds.filter((id) => id !== instanceId);
 
   writeRoleAssignments({ sentinelIds, standbyIds, stoppedIds, timestamp: Date.now() });
-  logger.info({ instanceId, sentinelIds, standbyIds, stoppedIds }, "[Sentinel] Marked instance as stopped");
-}
+  }
 
 const DEMOTE_CAS_MAX_RETRIES = 5;
 
@@ -197,16 +190,14 @@ export function demoteSentinelAndPromoteStandby(
     }
 
     if (!sentinelIds.includes(blockedInstanceId)) {
-      logger.warn({ blockedInstanceId, sentinelIds }, "[Sentinel] Instance is not currently a sentinel — already demoted");
-      return null;
+            return null;
     }
 
     // Filter out stopped instances — they must never be promoted.
     const eligibleStandbys = standbyIds.filter((id) => !stoppedIds.includes(id));
 
     if (eligibleStandbys.length === 0) {
-      logger.warn({ blockedInstanceId, stoppedIds }, "[Sentinel] No eligible standby instances to promote (all stopped or none available)");
-      sentinelIds = sentinelIds.filter((id) => id !== blockedInstanceId);
+            sentinelIds = sentinelIds.filter((id) => id !== blockedInstanceId);
       if (!stoppedIds.includes(blockedInstanceId)) stoppedIds.push(blockedInstanceId);
       writeRoleAssignments({ sentinelIds, standbyIds, stoppedIds, timestamp: Date.now() });
       return null;
@@ -226,21 +217,12 @@ export function demoteSentinelAndPromoteStandby(
     // Verify: re-read to confirm our write wasn't clobbered by a concurrent process.
     const verified = readRoleAssignments();
     if (verified && verified.sentinelIds.includes(promoted) && (verified.stoppedIds ?? []).includes(blockedInstanceId)) {
-      logger.info(
-        { blockedInstanceId, promoted, sentinelIds: assignments.sentinelIds, standbyIds: assignments.standbyIds, stoppedIds: assignments.stoppedIds },
-        "[Sentinel] Role swap: demoted blocked sentinel, promoted standby"
-      );
-      return promoted;
+            return promoted;
     }
 
-    logger.info(
-      { blockedInstanceId, attempt, promoted },
-      "[Sentinel] Concurrent role swap detected — retrying with fresh state"
-    );
-  }
+      }
 
-  logger.error({ blockedInstanceId }, "[Sentinel] Failed to demote after max retries — concurrent contention");
-  return null;
+    return null;
 }
 
 /**
@@ -287,8 +269,7 @@ export function createRoleChangeWatcher(myInstanceId: number): {
     });
     unwatch = () => w.close();
   } catch (err) {
-    logger.debug({ err }, "[Sentinel] Role change watcher unavailable");
-  }
+      }
 
   const dispose = (): void => {
     disposed = true;
@@ -322,13 +303,8 @@ export function broadcastActivationSignal(
   };
   try {
     writeFileSync(SENTINEL_SIGNAL_FILE, JSON.stringify(signal, null, 2), "utf8");
-    logger.info(
-      { activatedBy, centerCode, visaCategoryCode, slot },
-      "[Sentinel] Activation signal broadcast — all standby bots will switch to burst polling"
-    );
-  } catch (err) {
-    logger.error({ err, activatedBy }, "[Sentinel] Failed to write activation signal");
-  }
+      } catch (err) {
+      }
 }
 
 /**
@@ -353,11 +329,9 @@ export function clearActivationSignal(): void {
   try {
     if (existsSync(SENTINEL_SIGNAL_FILE)) {
       unlinkSync(SENTINEL_SIGNAL_FILE);
-      logger.info("[Sentinel] Activation signal cleared");
-    }
+          }
   } catch (err) {
-    logger.warn({ err }, "[Sentinel] Failed to clear activation signal");
-  }
+      }
 }
 
 /**
@@ -403,8 +377,7 @@ export function createActivationWatcher(myInstanceId: number): {
     });
     unwatch = () => w.close();
   } catch (err) {
-    logger.debug({ err }, "[Sentinel] Activation watcher unavailable; relying on IPC fallback");
-  }
+      }
 
   const dispose = (): void => {
     disposed = true;
