@@ -5,6 +5,8 @@ import { getEffectiveLiftLoginUser } from "../utils/liftLoginUser";
 import { getSlotCenterOverride } from "../utils/slotCenterOverride.store";
 import { getVfsLoginProfile, getOriginalLoginLastName } from "../utils/vfsLoginProfile.store.js";
 import { looksLikeEmailForVfsLogin } from "../types/vfsUserLogin.type.js";
+import { isIndDeuRoute } from "../utils/vfsRoute";
+import { ensureIndDeuInstancePhone } from "../utils/indDeuPhone";
 
 export const SAVE_APPLICANTS_URL = "https://lift-api.vfsglobal.com/appointment/applicants";
 
@@ -102,6 +104,80 @@ const SAVE_APPLICANTS_APPLICANT_KEY_ORDER: readonly string[] = [
   "missionCode",
 ];
 
+/** Exact key order from ind-deu browser capture (no applicantImage / applicant countryCode). */
+const SAVE_APPLICANTS_IND_DEU_APPLICANT_KEY_ORDER: readonly string[] = [
+  "urn",
+  "arn",
+  "centerClassCode",
+  "selectedSubvisaCategory",
+  "Subclasscode",
+  "dateOfApplication",
+  "loginUser",
+  "firstName",
+  "employerFirstName",
+  "middleName",
+  "lastName",
+  "employerLastName",
+  "salutation",
+  "gender",
+  "nationalId",
+  "VisaToken",
+  "employerContactNumber",
+  "contactNumber",
+  "dialCode",
+  "employerDialCode",
+  "passportNumber",
+  "confirmPassportNumber",
+  "passportExpirtyDate",
+  "dateOfBirth",
+  "emailId",
+  "employerEmailId",
+  "nationalityCode",
+  "state",
+  "city",
+  "isEndorsedChild",
+  "applicantType",
+  "addressline1",
+  "addressline2",
+  "pincode",
+  "referenceNumber",
+  "vlnNumber",
+  "applicantGroupId",
+  "parentPassportNumber",
+  "parentPassportExpiry",
+  "dateOfDeparture",
+  "entryType",
+  "eoiVisaType",
+  "passportType",
+  "vfsReferenceNumber",
+  "familyReunificationCerificateNumber",
+  "PVRequestRefNumber",
+  "PVStatus",
+  "PVStatusDescription",
+  "PVCanAllowRetry",
+  "PVisVerified",
+  "eefRegistrationNumber",
+  "isAutoRefresh",
+  "helloVerifyNumber",
+  "OfflineCClink",
+  "idenfystatuscheck",
+  "vafStatus",
+  "SpecialAssistance",
+  "AdditionalRefNo",
+  "juridictionCode",
+  "canInitiateVAF",
+  "canEditVAF",
+  "canDeleteVAF",
+  "canDownloadVAF",
+  "Retryleft",
+  "visaSubClass",
+  "noOfMinorDependents",
+  "fathersName",
+  "mothersName",
+  "dateOfTravel",
+  "ipAddress",
+];
+
 function orderObjectKeys(obj: Record<string, unknown>, order: readonly string[]): Record<string, unknown> {
   const out: Record<string, unknown> = {};
   const seen = new Set<string>();
@@ -144,7 +220,12 @@ function normalizeSaveApplicantsBody(body: Record<string, unknown>): Record<stri
   if (!Array.isArray(list) || list.length === 0 || typeof list[0] !== "object" || list[0] === null) {
     return orderObjectKeys(body, SAVE_APPLICANTS_ROOT_KEY_ORDER);
   }
-  const applicant = orderObjectKeys(list[0] as Record<string, unknown>, SAVE_APPLICANTS_APPLICANT_KEY_ORDER);
+  const rc = typeof body.countryCode === "string" ? body.countryCode.trim().toLowerCase() : "";
+  const rm = typeof body.missionCode === "string" ? body.missionCode.trim().toLowerCase() : "";
+  const applicantOrder = isIndDeuRoute(rc, rm)
+    ? SAVE_APPLICANTS_IND_DEU_APPLICANT_KEY_ORDER
+    : SAVE_APPLICANTS_APPLICANT_KEY_ORDER;
+  const applicant = orderObjectKeys(list[0] as Record<string, unknown>, applicantOrder);
   const next: Record<string, unknown> = { ...body, applicantList: [applicant] };
   return orderObjectKeys(next, SAVE_APPLICANTS_ROOT_KEY_ORDER);
 }
@@ -189,6 +270,58 @@ function finalizeApplicantForLiftApiPost(body: Record<string, unknown>): void {
   const rc = typeof body.countryCode === "string" ? body.countryCode.trim().toLowerCase() : "";
   const rm = typeof body.missionCode === "string" ? body.missionCode.trim().toLowerCase() : "";
   const isIndLva = rc === "ind" && rm === "lva";
+  const isIndDeu = isIndDeuRoute(rc, rm);
+
+  if (isIndDeu) {
+    const phone = ensureIndDeuInstancePhone(getCurrentInstanceId());
+    a.dialCode = phone.dialCode;
+    a.contactNumber = phone.contactNumber;
+    a.centerClassCode = null;
+    a.selectedSubvisaCategory = null;
+    a.Subclasscode = null;
+    a.dateOfApplication = null;
+    a.middleName = null;
+    a.confirmPassportNumber = null;
+    a.visaSubClass = null;
+    a.noOfMinorDependents = "0";
+    a.fathersName = null;
+    a.mothersName = null;
+    a.dateOfTravel = null;
+    a.helloVerifyNumber = "";
+    a.juridictionCode = "";
+    a.AdditionalRefNo = null;
+    delete a.applicantImage;
+    delete a.applicantImageData;
+    delete a.countryCode;
+    delete a.missionCode;
+
+    const fn = typeof a.firstName === "string" ? a.firstName.trim().toUpperCase() : "";
+    const ln = typeof a.lastName === "string" ? a.lastName.trim().toUpperCase() : "";
+    const pp = typeof a.passportNumber === "string" ? a.passportNumber.trim().toUpperCase() : "";
+    a.firstName = fn;
+    a.lastName = ln || fn;
+    a.passportNumber = pp;
+
+    const lu = getEffectiveLiftLoginUser();
+    if (lu) {
+      body.loginUser = lu;
+      a.loginUser = lu;
+      a.emailId = lu.toUpperCase();
+    } else if (typeof a.emailId === "string" && a.emailId.trim() !== "") {
+      a.emailId = a.emailId.trim().toUpperCase();
+    }
+
+    const g = a.gender;
+    if (typeof g === "string" && g.trim() !== "") {
+      const n = parseInt(g, 10);
+      if (n === 1 || n === 2) a.gender = n;
+    } else if (typeof g === "number" && g !== 1 && g !== 2) {
+      a.gender = 1;
+    }
+
+    body.juridictionCode = null;
+    return;
+  }
 
   if (isIndLva) {
     a.centerClassCode = "";
@@ -261,6 +394,7 @@ function mergeVfsLoginProfileIntoSaveApplicantsBody(body: Record<string, unknown
   const pr = p as Record<string, unknown>;
   const rc = typeof body.countryCode === "string" ? body.countryCode.trim().toLowerCase() : "";
   const rm = typeof body.missionCode === "string" ? body.missionCode.trim().toLowerCase() : "";
+  if (isIndDeuRoute(rc, rm)) return;
   const isIndLva = rc === "ind" && rm === "lva";
   const isUzbLva = rc === "uzb" && rm === "lva";
 
@@ -352,78 +486,152 @@ export function buildSaveApplicantsBodyFromEnv(): Record<string, unknown> {
   const visaCategoryCode = override?.visaCategoryCode
     || (typeof details?.selectedSubvisaCategory === "string" ? details.selectedSubvisaCategory.trim() : "");
 
-  const applicant: Record<string, unknown> = {
-    urn: "",
-    arn: "",
-    centerClassCode: null,
-    selectedSubvisaCategory: null,
-    Subclasscode: null,
-    dateOfApplication: null,
-    loginUser,
-    firstName: "",
-    employerFirstName: "",
-    middleName: "",
-    lastName: "",
-    employerLastName: "",
-    salutation: "",
-    gender: 2,
-    nationalId: null,
-    VisaToken: null,
-    employerContactNumber: "",
-    contactNumber: "",
-    dialCode: "",
-    employerDialCode: "",
-    passportNumber: "",
-    confirmPassportNumber: null,
-    passportExpirtyDate: "",
-    dateOfBirth: "",
-    emailId: "",
-    employerEmailId: "",
-    nationalityCode: "",
-    state: null,
-    city: null,
-    isEndorsedChild: false,
-    applicantType: 0,
-    addressline1: null,
-    addressline2: null,
-    pincode: null,
-    referenceNumber: null,
-    vlnNumber: null,
-    applicantGroupId: 0,
-    parentPassportNumber: "",
-    parentPassportExpiry: "",
-    dateOfDeparture: null,
-    entryType: "",
-    eoiVisaType: "",
-    passportType: "",
-    vfsReferenceNumber: "",
-    familyReunificationCerificateNumber: "",
-    PVRequestRefNumber: "",
-    PVStatus: "",
-    PVStatusDescription: "",
-    PVCanAllowRetry: true,
-    PVisVerified: false,
-    eefRegistrationNumber: "",
-    isAutoRefresh: true,
-    helloVerifyNumber: "",
-    OfflineCClink: "",
-    idenfystatuscheck: false,
-    vafStatus: null,
-    SpecialAssistance: "",
-    AdditionalRefNo: null,
-    juridictionCode: "",
-    canInitiateVAF: false,
-    canEditVAF: false,
-    canDeleteVAF: false,
-    canDownloadVAF: false,
-    Retryleft: "",
-    visaSubClass: null,
-    ipAddress: getApplicantIpForPayload(),
-    applicantImage: "",
-    applicantImageData: "",
-    countryCode,
-    missionCode,
-  };
+  const isIndDeu = isIndDeuRoute(countryCode, missionCode);
+  const applicant: Record<string, unknown> = isIndDeu
+    ? {
+      urn: "",
+      arn: "",
+      centerClassCode: null,
+      selectedSubvisaCategory: null,
+      Subclasscode: null,
+      dateOfApplication: null,
+      loginUser,
+      firstName: "",
+      employerFirstName: "",
+      middleName: null,
+      lastName: "",
+      employerLastName: "",
+      salutation: "",
+      gender: 1,
+      nationalId: null,
+      VisaToken: null,
+      employerContactNumber: "",
+      contactNumber: "",
+      dialCode: "",
+      employerDialCode: "",
+      passportNumber: "",
+      confirmPassportNumber: null,
+      passportExpirtyDate: "",
+      dateOfBirth: "",
+      emailId: "",
+      employerEmailId: "",
+      nationalityCode: "",
+      state: null,
+      city: null,
+      isEndorsedChild: false,
+      applicantType: 0,
+      addressline1: null,
+      addressline2: null,
+      pincode: null,
+      referenceNumber: null,
+      vlnNumber: null,
+      applicantGroupId: 0,
+      parentPassportNumber: "",
+      parentPassportExpiry: "",
+      dateOfDeparture: null,
+      entryType: "",
+      eoiVisaType: "",
+      passportType: "",
+      vfsReferenceNumber: "",
+      familyReunificationCerificateNumber: "",
+      PVRequestRefNumber: "",
+      PVStatus: "",
+      PVStatusDescription: "",
+      PVCanAllowRetry: true,
+      PVisVerified: false,
+      eefRegistrationNumber: "",
+      isAutoRefresh: true,
+      helloVerifyNumber: "",
+      OfflineCClink: "",
+      idenfystatuscheck: false,
+      vafStatus: null,
+      SpecialAssistance: "",
+      AdditionalRefNo: null,
+      juridictionCode: "",
+      canInitiateVAF: false,
+      canEditVAF: false,
+      canDeleteVAF: false,
+      canDownloadVAF: false,
+      Retryleft: "",
+      visaSubClass: null,
+      noOfMinorDependents: "0",
+      fathersName: null,
+      mothersName: null,
+      dateOfTravel: null,
+      ipAddress: getApplicantIpForPayload(),
+    }
+    : {
+      urn: "",
+      arn: "",
+      centerClassCode: null,
+      selectedSubvisaCategory: null,
+      Subclasscode: null,
+      dateOfApplication: null,
+      loginUser,
+      firstName: "",
+      employerFirstName: "",
+      middleName: "",
+      lastName: "",
+      employerLastName: "",
+      salutation: "",
+      gender: 2,
+      nationalId: null,
+      VisaToken: null,
+      employerContactNumber: "",
+      contactNumber: "",
+      dialCode: "",
+      employerDialCode: "",
+      passportNumber: "",
+      confirmPassportNumber: null,
+      passportExpirtyDate: "",
+      dateOfBirth: "",
+      emailId: "",
+      employerEmailId: "",
+      nationalityCode: "",
+      state: null,
+      city: null,
+      isEndorsedChild: false,
+      applicantType: 0,
+      addressline1: null,
+      addressline2: null,
+      pincode: null,
+      referenceNumber: null,
+      vlnNumber: null,
+      applicantGroupId: 0,
+      parentPassportNumber: "",
+      parentPassportExpiry: "",
+      dateOfDeparture: null,
+      entryType: "",
+      eoiVisaType: "",
+      passportType: "",
+      vfsReferenceNumber: "",
+      familyReunificationCerificateNumber: "",
+      PVRequestRefNumber: "",
+      PVStatus: "",
+      PVStatusDescription: "",
+      PVCanAllowRetry: true,
+      PVisVerified: false,
+      eefRegistrationNumber: "",
+      isAutoRefresh: true,
+      helloVerifyNumber: "",
+      OfflineCClink: "",
+      idenfystatuscheck: false,
+      vafStatus: null,
+      SpecialAssistance: "",
+      AdditionalRefNo: null,
+      juridictionCode: "",
+      canInitiateVAF: false,
+      canEditVAF: false,
+      canDeleteVAF: false,
+      canDownloadVAF: false,
+      Retryleft: "",
+      visaSubClass: null,
+      ipAddress: getApplicantIpForPayload(),
+      applicantImage: "",
+      applicantImageData: "",
+      countryCode,
+      missionCode,
+    };
 
   return normalizeSaveApplicantsBody({
     countryCode,

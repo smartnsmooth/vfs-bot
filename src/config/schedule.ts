@@ -3,6 +3,7 @@ import { getEffectiveLiftLoginUser } from "../utils/liftLoginUser";
 import { getTotalAmount, getCurrency } from "../utils/totalAmount.store";
 import { getSlotCenterOverride } from "../utils/slotCenterOverride.store";
 import { getApplicantDetailsOverrides } from "../utils/applicantDetails.store";
+import { isIndDeuRoute } from "../utils/vfsRoute";
 
 export const SCHEDULE_URL = "https://lift-api.vfsglobal.com/appointment/schedule";
 
@@ -42,7 +43,10 @@ export function buildScheduleBody(urn: string, allocationId: string): Record<str
   let currency: string;
   let paymentmode: string;
 
-  if (currencyRaw) {
+  if (isIndDeuRoute(rc, rm)) {
+    currency = "INR";
+    paymentmode = "Online";
+  } else if (currencyRaw) {
     currency = currencyRaw;
     paymentmode = "Online";
   } else if (routeDefaults) {

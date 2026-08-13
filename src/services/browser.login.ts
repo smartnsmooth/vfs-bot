@@ -11,6 +11,7 @@ import { VfsForbiddenError, VfsGatewayTimeoutError, VfsRateLimitedError, PageNot
 import { isPageNotFoundUrl } from "../flows/pageNotFound";
 import type { BrowserServiceCore } from "./browser.core";
 import { clickTurnstile, waitForManualTurnstile } from "./turnstile.click";
+import { isIndDeuRoute } from "../utils/vfsRoute";
 
 /** Pause after OTP entry so the page can settle before Turnstile (Bulgaria OTP step). */
 const OTP_BEFORE_CAPTCHA_DELAY_MS = 1000;
@@ -881,7 +882,10 @@ export async function performLoginOnFirstTab(core: BrowserServiceCore, username:
         timeoutMs: 25000,
     });
     const submitBtn = await resolveLoginSubmitButton(page);
-    const wantMailTm = config.mailTmOtpEnabled && username.trim().includes("@") && password.length > 0;
+    const wantMailTm = config.mailTmOtpEnabled
+        && username.trim().includes("@")
+        && password.length > 0
+        && !isIndDeuRoute(config.slotPayload.countryCode, config.slotPayload.missionCode);
     let mailTmReady: {
         token: string;
         baseline: Set<string>;

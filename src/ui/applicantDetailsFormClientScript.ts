@@ -45,6 +45,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     ind: [
       { label: "Bulgaria", value: "bgr" },
       { label: "Latvia", value: "lva" },
+      { label: "Germany", value: "deu" },
     ],
     egy: [{label: "Portugal", value: "prt"}],
     sau: [{label: "Portugal", value: "prt"}],
@@ -167,10 +168,23 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
         { value: "LNGRSDTJK", label: "Work(D Visa) Tajik" },
       ]},
     ],
+    "ind-deu": [
+      { value: "BLR", label: "Bangalore - Germany Visa Application Centre", categories: [
+        { value: "NV1", label: "Speciality Cook" },
+        { value: "NVBA", label: "Basic or advanced in-company or school-based vocational training (§ 16a AufenthG)" },
+        { value: "R124", label: "Conducting a quality analysis ((§ 16d Abs. 6 AufenthG)" },
+      ]},
+      { value: "COK", label: "Cochin - Visa Application Centre", categories: [
+        { value: "NV1", label: "Speciality Cook" },
+        { value: "NVBA", label: "Basic or advanced in-company or school-based vocational training (§ 16a AufenthG)" },
+        { value: "R124", label: "Conducting a quality analysis ((§ 16d Abs. 6 AufenthG)" },
+      ]},
+    ],
   };
 
-  var manualApplicantRoutes = { "egy-prt": true };
+  var manualApplicantRoutes = { "egy-prt": true, "ind-deu": true };
   var manualApplicantFieldIds = ["firstName", "lastName", "dateOfBirth", "passportNumber", "dialCode", "contactNumber"];
+  var indDeuUppercaseFieldIds = ["firstName", "lastName", "passportNumber"];
 
   function getRouteKey() {
     var cc = (document.getElementById("countryCode") || {}).value || "";
@@ -185,6 +199,72 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
   function updateManualApplicantFields() {
     var el = document.getElementById("manualApplicantFields");
     if (el) el.style.display = isManualApplicantRoute() ? "" : "none";
+    var dialWrap = document.getElementById("manualDialContactFields");
+    var route = getRouteKey();
+    if (dialWrap) dialWrap.style.display = route === "egy-prt" ? "" : "none";
+    if (route === "ind-deu") {
+      var dEl = document.getElementById("dialCode");
+      var cEl = document.getElementById("contactNumber");
+      if (dEl) dEl.value = "";
+      if (cEl) cEl.value = "";
+    }
+    updateIndDeuHiddenExtras();
+    updateIndDeuUppercaseStyle();
+  }
+
+  function updateIndDeuHiddenExtras() {
+    var on = getRouteKey() === "ind-deu";
+    var loginWrap = document.getElementById("vfsLoginFields");
+    if (loginWrap) loginWrap.style.display = on ? "none" : "";
+    var acct2 = document.getElementById("loginAccount2Fields");
+    if (acct2) acct2.style.display = on ? "none" : "";
+    var center2 = document.getElementById("center2Fields");
+    if (center2) center2.style.display = on ? "none" : "";
+    if (!on) return;
+    var u2 = document.getElementById("vfsUsername2");
+    var p2 = document.getElementById("vfsPassword2");
+    var v2 = document.getElementById("vacCode2");
+    var c2 = document.getElementById("selectedSubvisaCategory2");
+    if (u2) u2.value = "";
+    if (p2) p2.value = "";
+    if (v2) v2.value = "";
+    if (c2) {
+      c2.innerHTML = "";
+      var ph = document.createElement("option");
+      ph.value = "";
+      ph.textContent = "-- Select Category --";
+      c2.appendChild(ph);
+    }
+  }
+
+  function updateIndDeuUppercaseStyle() {
+    var on = getRouteKey() === "ind-deu";
+    for (var i = 0; i < indDeuUppercaseFieldIds.length; i++) {
+      var el = document.getElementById(indDeuUppercaseFieldIds[i]);
+      if (el) el.style.textTransform = on ? "uppercase" : "";
+    }
+  }
+
+  function forceIndDeuUppercaseInput(el) {
+    if (!el || getRouteKey() !== "ind-deu") return;
+    var start = el.selectionStart;
+    var end = el.selectionEnd;
+    var next = String(el.value || "").toUpperCase();
+    if (el.value !== next) {
+      el.value = next;
+      if (typeof start === "number" && typeof end === "number") {
+        try { el.setSelectionRange(start, end); } catch (e) {}
+      }
+    }
+  }
+
+  function wireIndDeuUppercaseInputs() {
+    for (var i = 0; i < indDeuUppercaseFieldIds.length; i++) {
+      var el = document.getElementById(indDeuUppercaseFieldIds[i]);
+      if (!el || el.dataset.indDeuUpper === "1") continue;
+      el.dataset.indDeuUpper = "1";
+      el.addEventListener("input", function () { forceIndDeuUppercaseInput(this); });
+    }
   }
 
   function updateIndLvaExtraFields() {
@@ -397,14 +477,29 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       const pEl = document.getElementById("vfsPassword");
       const u2El = document.getElementById("vfsUsername2");
       const p2El = document.getElementById("vfsPassword2");
-      if (uEl) uEl.value = inst.credentials.username || "";
-      if (pEl) pEl.value = inst.credentials.password || "";
-      if (u2El) u2El.value = inst.credentials.username2 != null ? String(inst.credentials.username2) : "";
-      if (p2El) p2El.value = inst.credentials.password2 != null ? String(inst.credentials.password2) : "";
+      var loadCredRoute = String((inst.details && inst.details.countryCode) || "") + "-" + String((inst.details && inst.details.missionCode) || "");
+      if (loadCredRoute !== "ind-deu") {
+        if (uEl) uEl.value = inst.credentials.username || "";
+        if (pEl) pEl.value = inst.credentials.password || "";
+        if (u2El) u2El.value = inst.credentials.username2 != null ? String(inst.credentials.username2) : "";
+        if (p2El) p2El.value = inst.credentials.password2 != null ? String(inst.credentials.password2) : "";
+      } else {
+        if (uEl) uEl.value = "";
+        if (pEl) pEl.value = "";
+        if (u2El) u2El.value = "";
+        if (p2El) p2El.value = "";
+      }
     }
 
     if (inst.details) {
       const skipDetailIds = { numInstances: true, instanceId: true, vfsUsername2: true, vfsPassword2: true, countryCode: true, missionCode: true };
+      var loadRouteKey = String(inst.details.countryCode || "") + "-" + String(inst.details.missionCode || "");
+      if (loadRouteKey === "ind-deu") {
+        skipDetailIds.dialCode = true;
+        skipDetailIds.contactNumber = true;
+        skipDetailIds.vacCode2 = true;
+        skipDetailIds.selectedSubvisaCategory2 = true;
+      }
       const ccEl = document.getElementById("countryCode");
       if (ccEl && inst.details.countryCode) ccEl.value = String(inst.details.countryCode);
       updateMissionOptions();
@@ -426,13 +521,23 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       updateCategoryOptions("vacCode", "selectedSubvisaCategory");
       var sc1El = document.getElementById("selectedSubvisaCategory");
       if (sc1El && inst.details.selectedSubvisaCategory) sc1El.value = String(inst.details.selectedSubvisaCategory);
-      var vc2El = document.getElementById("vacCode2");
-      if (vc2El && inst.details.vacCode2) vc2El.value = String(inst.details.vacCode2);
-      updateCategoryOptions("vacCode2", "selectedSubvisaCategory2");
-      var sc2El = document.getElementById("selectedSubvisaCategory2");
-      if (sc2El && inst.details.selectedSubvisaCategory2) sc2El.value = String(inst.details.selectedSubvisaCategory2);
+      if (loadRouteKey !== "ind-deu") {
+        var vc2El = document.getElementById("vacCode2");
+        if (vc2El && inst.details.vacCode2) vc2El.value = String(inst.details.vacCode2);
+        updateCategoryOptions("vacCode2", "selectedSubvisaCategory2");
+        var sc2El = document.getElementById("selectedSubvisaCategory2");
+        if (sc2El && inst.details.selectedSubvisaCategory2) sc2El.value = String(inst.details.selectedSubvisaCategory2);
+      }
 
-      var routeKeyForLoad = String(inst.details.countryCode || "") + "-" + String(inst.details.missionCode || "");
+      var routeKeyForLoad = loadRouteKey;
+      if (routeKeyForLoad === "ind-deu") {
+        for (var pi = 0; pi < indDeuUppercaseFieldIds.length; pi++) {
+          var upperEl = document.getElementById(indDeuUppercaseFieldIds[pi]);
+          if (upperEl && inst.details[indDeuUppercaseFieldIds[pi]]) {
+            upperEl.value = String(inst.details[indDeuUppercaseFieldIds[pi]]).toUpperCase();
+          }
+        }
+      }
       if (routeKeyForLoad === "uzb-lva") {
         var fnUzb = document.getElementById("firstNameUzbLva");
         if (fnUzb && inst.details.firstName) fnUzb.value = String(inst.details.firstName);
@@ -444,6 +549,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     }
     updateIndLvaExtraFields();
     updateUzbLvaApplicantFields();
+    updateManualApplicantFields();
     applyInstanceScheduleRangeToForm(inst.details || {});
 
     // Global settings (instance 0): postLoginPollDelay + staggerIntervalSec + apologiesIntervalSec + calendar polling.
@@ -491,6 +597,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     const cc = String(fd.get("countryCode") || "ind");
     const mc = String(fd.get("missionCode") || "bgr");
     const isUzbLva = cc + "-" + mc === "uzb-lva";
+    const isIndDeu = cc + "-" + mc === "ind-deu";
     const firstNameRaw = isUzbLva
       ? String(fd.get("firstNameUzbLva") || "").trim()
       : String(fd.get("firstName") || "").trim();
@@ -500,6 +607,9 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     const passportRaw = isUzbLva
       ? String(fd.get("passportNumberUzbLva") || "").trim()
       : String(fd.get("passportNumber") || "").trim();
+    const firstNameSave = isIndDeu ? firstNameRaw.toUpperCase() : firstNameRaw;
+    const lastNameSave = isIndDeu ? lastNameRaw.toUpperCase() : lastNameRaw;
+    const passportSave = isIndDeu ? passportRaw.toUpperCase() : passportRaw;
     const body = {
       countryCode: cc,
       missionCode: mc,
@@ -508,14 +618,14 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       vacCode: fd.get("vacCode"),
       gender: parseInt(String(fd.get("gender") || "1"), 10),
       selectedSubvisaCategory: fd.get("selectedSubvisaCategory"),
-      vacCode2: fd.get("vacCode2") || undefined,
-      selectedSubvisaCategory2: fd.get("selectedSubvisaCategory2") || undefined,
-      firstName: firstNameRaw || undefined,
-      lastName: lastNameRaw || undefined,
+      vacCode2: isIndDeu ? undefined : (fd.get("vacCode2") || undefined),
+      selectedSubvisaCategory2: isIndDeu ? undefined : (fd.get("selectedSubvisaCategory2") || undefined),
+      firstName: firstNameSave || undefined,
+      lastName: lastNameSave || undefined,
       dateOfBirth: String(fd.get("dateOfBirth") || "").trim() || undefined,
-      passportNumber: passportRaw || undefined,
-      dialCode: String(fd.get("dialCode") || "").trim() || undefined,
-      contactNumber: String(fd.get("contactNumber") || "").trim() || undefined,
+      passportNumber: passportSave || undefined,
+      dialCode: isIndDeu ? undefined : (String(fd.get("dialCode") || "").trim() || undefined),
+      contactNumber: isIndDeu ? undefined : (String(fd.get("contactNumber") || "").trim() || undefined),
       scheduleDateRangeStart: String(fd.get("scheduleDateRangeStart") ?? "").trim(),
       scheduleDateRangeEnd: String(fd.get("scheduleDateRangeEnd") ?? "").trim(),
       numInstances: getNumInstances(),
@@ -534,7 +644,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     if (!Number.isFinite(body.apologiesIntervalSec) || body.apologiesIntervalSec < 1) body.apologiesIntervalSec = 2;
     if (!Number.isFinite(body.applicantsJoinStaggerSec) || body.applicantsJoinStaggerSec < 0.1) body.applicantsJoinStaggerSec = 0.5;
     if (!Number.isFinite(body.calendarPollingInterval) || body.calendarPollingInterval < 1) body.calendarPollingInterval = 60;
-    if (collectLogin) {
+    if (collectLogin && !isIndDeu) {
       body.vfsUsername = fd.get("vfsUsername");
       body.vfsPassword = fd.get("vfsPassword");
       body.vfsUsername2 = fd.get("vfsUsername2");
@@ -595,6 +705,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       if (missionCodeSelect) {
         missionCodeSelect.addEventListener("change", function () {
           updateCenterOptions();
+          updateManualApplicantFields();
           updateIndLvaExtraFields();
           updateUzbLvaApplicantFields();
           scheduleAutoSave();
@@ -615,6 +726,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
         });
       }
       updateMissionOptions();
+      wireIndDeuUppercaseInputs();
 
       const numInstancesInput = document.getElementById("numInstances");
       if (numInstancesInput) {
@@ -723,6 +835,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     const cc = String(fd.get("countryCode") || "ind");
     const mc = String(fd.get("missionCode") || "bgr");
     const isUzbLva = cc + "-" + mc === "uzb-lva";
+    const isIndDeu = cc + "-" + mc === "ind-deu";
     const firstNameRaw = isUzbLva
       ? String(fd.get("firstNameUzbLva") || "").trim()
       : String(fd.get("firstName") || "").trim();
@@ -732,9 +845,14 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     const passportRaw = isUzbLva
       ? String(fd.get("passportNumberUzbLva") || "").trim()
       : String(fd.get("passportNumber") || "").trim();
+    const firstNameSave = isIndDeu ? firstNameRaw.toUpperCase() : firstNameRaw;
+    const lastNameSave = isIndDeu ? lastNameRaw.toUpperCase() : lastNameRaw;
+    const passportSave = isIndDeu ? passportRaw.toUpperCase() : passportRaw;
     const nationalityRaw = String(fd.get("nationalityCode") || "").trim();
     const vacCodeRaw = String(fd.get("vacCode") || "").trim();
     const subvisaRaw = String(fd.get("selectedSubvisaCategory") || "").trim();
+    const dobRaw = String(fd.get("dateOfBirth") || "").trim();
+    const expiryRaw = String(fd.get("passportExpirtyDate") || "").trim();
 
     const missing = [];
     if (!vacCodeRaw) missing.push("Visa Application Centre");
@@ -744,6 +862,14 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       if (!lastNameRaw) missing.push("Last name");
       if (!nationalityRaw) missing.push("Nationality");
       if (!passportRaw) missing.push("Passport number");
+    }
+    if (isIndDeu) {
+      if (!firstNameSave) missing.push("First name");
+      if (!lastNameSave) missing.push("Last name");
+      if (!dobRaw) missing.push("Date of birth");
+      if (!nationalityRaw) missing.push("Nationality");
+      if (!passportSave) missing.push("Passport number");
+      if (!expiryRaw) missing.push("Passport expiry");
     }
     if (missing.length > 0) {
       msg.className = "err";
@@ -759,14 +885,14 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       vacCode: fd.get("vacCode"),
       gender: parseInt(String(fd.get("gender") || "1"), 10),
       selectedSubvisaCategory: fd.get("selectedSubvisaCategory"),
-      vacCode2: fd.get("vacCode2") || undefined,
-      selectedSubvisaCategory2: fd.get("selectedSubvisaCategory2") || undefined,
-      firstName: firstNameRaw || undefined,
-      lastName: lastNameRaw || undefined,
-      dateOfBirth: String(fd.get("dateOfBirth") || "").trim() || undefined,
-      passportNumber: passportRaw || undefined,
-      dialCode: String(fd.get("dialCode") || "").trim() || undefined,
-      contactNumber: String(fd.get("contactNumber") || "").trim() || undefined,
+      vacCode2: isIndDeu ? undefined : (fd.get("vacCode2") || undefined),
+      selectedSubvisaCategory2: isIndDeu ? undefined : (fd.get("selectedSubvisaCategory2") || undefined),
+      firstName: firstNameSave || undefined,
+      lastName: lastNameSave || undefined,
+      dateOfBirth: dobRaw || undefined,
+      passportNumber: passportSave || undefined,
+      dialCode: isIndDeu ? undefined : (String(fd.get("dialCode") || "").trim() || undefined),
+      contactNumber: isIndDeu ? undefined : (String(fd.get("contactNumber") || "").trim() || undefined),
       scheduleDateRangeStart: String(fd.get("scheduleDateRangeStart") ?? "").trim(),
       scheduleDateRangeEnd: String(fd.get("scheduleDateRangeEnd") ?? "").trim(),
       numInstances: getNumInstances(),
@@ -785,7 +911,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     if (!Number.isFinite(body.apologiesIntervalSec) || body.apologiesIntervalSec < 1) body.apologiesIntervalSec = 2;
     if (!Number.isFinite(body.applicantsJoinStaggerSec) || body.applicantsJoinStaggerSec < 0.1) body.applicantsJoinStaggerSec = 0.5;
     if (!Number.isFinite(body.calendarPollingInterval) || body.calendarPollingInterval < 1) body.calendarPollingInterval = 60;
-    if (collectLogin) {
+    if (collectLogin && !isIndDeu) {
       body.vfsUsername = fd.get("vfsUsername");
       body.vfsPassword = fd.get("vfsPassword");
       body.vfsUsername2 = fd.get("vfsUsername2");

@@ -1,5 +1,6 @@
 import { chromium, Browser, BrowserContext, Page } from "playwright";
 import { config } from "../config/config";
+import { isIndDeuRoute } from "../utils/vfsRoute";
 import { ensureApplicantIpResolved } from "../utils/applicantIp";
 import { getAllocationId } from "../utils/allocationId.store";
 import { getApplicationUrn } from "../utils/applicationUrn.store";
@@ -523,6 +524,9 @@ export class BrowserService implements BrowserServiceCore {
   }
 
   async postMapVasLiftApi(): Promise<void> {
+    if (isIndDeuRoute(config.slotPayload.countryCode, config.slotPayload.missionCode)) {
+      return;
+    }
     const urn = getApplicationUrn();
     if (!urn?.trim()) {
             return;

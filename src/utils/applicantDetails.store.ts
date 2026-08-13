@@ -54,6 +54,14 @@ export function setApplicantDetailsOverrides(fields: Record<string, unknown>, in
   persistToDisk();
 }
 
+/** Merge fields into existing instance details (does not wipe unspecified keys). */
+export function patchApplicantDetailsOverrides(fields: Record<string, unknown>, instanceId?: number): void {
+  const id = instanceId ?? 0;
+  const prev = instanceApplicantDetails.get(id) ?? {};
+  instanceApplicantDetails.set(id, { ...prev, ...fields });
+  persistToDisk();
+}
+
 export function getApplicantDetailsOverrides(instanceId?: number): Record<string, unknown> | null {
   const id = instanceId ?? 0;
   return instanceApplicantDetails.get(id) ?? null;

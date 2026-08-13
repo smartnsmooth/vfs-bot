@@ -17,6 +17,7 @@ import {
   closeApplicantFormServer,
 } from "./ui/applicantDetailsFormServer";
 import { getSessionLoginCredentials, reloadSessionCredentialsFromDisk } from "./utils/sessionLogin.store";
+import { isIndDeuRoute } from "./utils/vfsRoute";
 import { reloadApplicantDetailsFromDisk, getApplicantDetailsOverrides, setApplicantDetailsOverrides } from "./utils/applicantDetails.store";
 import {
   createSlotFoundWatcher,
@@ -525,6 +526,8 @@ let instanceStopped = false;
 const pendingCredentialSlotByInstance = new Map<number, 0 | 1>();
 
 function hasSecondCredentials(instanceId?: number): boolean {
+  const details = getApplicantDetailsOverrides(instanceId);
+  if (isIndDeuRoute(details?.countryCode, details?.missionCode)) return false;
   const c = getSessionLoginCredentials(instanceId);
   return !!(c?.username2?.trim() && c.password2 != null && String(c.password2) !== "");
 }

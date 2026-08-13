@@ -4,6 +4,7 @@
  */
 
 import { getApplicantDetailsOverrides } from "./applicantDetails.store.js";
+import { isIndDeuRoute } from "./vfsRoute";
 
 export interface CenterConfig {
   vacCode: string;
@@ -31,11 +32,12 @@ export function getConfiguredCenters(instanceId?: number): CenterConfig[] {
     });
   }
   
-  // Center 2 (optional)
+  // Center 2 (optional) — not used on ind-deu
   const vacCode2 = details?.vacCode2 as string | undefined;
   const visaCategory2 = details?.selectedSubvisaCategory2 as string | undefined;
-  
-  if (vacCode2 && visaCategory2 && vacCode2.trim() !== "" && visaCategory2.trim() !== "") {
+  const skipCenter2 = isIndDeuRoute(details?.countryCode, details?.missionCode);
+
+  if (!skipCenter2 && vacCode2 && visaCategory2 && vacCode2.trim() !== "" && visaCategory2.trim() !== "") {
     centers.push({
       vacCode: vacCode2,
       visaCategoryCode: visaCategory2,

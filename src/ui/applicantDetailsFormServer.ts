@@ -7,6 +7,8 @@ import {
   setApplicantDetailsOverrides,
   getAllInstanceApplicantDetails,
 } from "../utils/applicantDetails.store";
+import { isIndDeuRoute } from "../utils/vfsRoute";
+import { applyIndDeuPhoneToInstanceFields } from "../utils/indDeuPhone";
 import { getSessionLoginCredentials, setSessionLoginCredentials, getAllInstanceCredentials } from "../utils/sessionLogin.store";
 import { buildApplicantFormPageScript } from "./applicantDetailsFormClientScript";
 import { buildMonitorTabHtml } from "./monitorTab";
@@ -78,7 +80,7 @@ export function buildApplicantFormSubmitJsonForBot(collectLogin: boolean): Recor
       return null;
     }
   }
-  if (collectLogin) {
+  if (collectLogin && mission !== "deu") {
     const s = getSessionLoginCredentials();
     if (!s?.username?.trim() || !s.password) return null;
     base.vfsUsername = s.username;
@@ -293,6 +295,7 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
       <select id="missionCode" name="missionCode" style="flex:1;min-width:8rem">
         <option value="bgr">Bulgaria</option>
         <option value="lva">Latvia</option>
+        <option value="deu">Germany</option>
         <option value="prt">Portugal</option>
       </select>
     </div>
@@ -345,7 +348,7 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
 
   const loginBlock = collectLogin
     ? `
-  <fieldset style="border:1px solid #38444d;border-radius:8px;padding:1rem 1rem 0.25rem;margin:0 0 1.25rem">
+  <fieldset id="vfsLoginFields" style="border:1px solid #38444d;border-radius:8px;padding:1rem 1rem 0.25rem;margin:0 0 1.25rem">
     <legend style="color:#8b98a5;font-size:0.9rem">VFS login</legend>
     <div class="row2">
       <div>
@@ -357,7 +360,7 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
         <input id="vfsPassword" name="vfsPassword" type="text" autocomplete="current-password" />
       </div>
     </div>
-    <div class="row2">
+    <div id="loginAccount2Fields" class="row2">
       <div>
         <label for="vfsUsername2">Email / username (account 2)</label>
         <input id="vfsUsername2" name="vfsUsername2" type="email" autocomplete="off" />
@@ -493,6 +496,7 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
       </div>
       <div class="form-col form-col--details">
         <h2 class="col-heading">Applicant details</h2>
+        ${scheduleDateRangeRow}
         <div id="manualApplicantFields" style="margin-bottom:1rem;display:none">
           <div class="row2">
             <div>
@@ -514,7 +518,7 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
               <input id="passportNumber" name="passportNumber" placeholder="A12345678" />
             </div>
           </div>
-          <div class="row2">
+          <div id="manualDialContactFields" class="row2">
             <div>
               <label for="dialCode">Dial code</label>
               <input id="dialCode" name="dialCode" placeholder="+20" />
@@ -525,7 +529,6 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
             </div>
           </div>
         </div>
-        ${scheduleDateRangeRow}
         <div class="row3">
           <div>
             <label for="passportExpirtyDate">Passport expiry (DD/MM/YYYY)</label>
@@ -810,6 +813,7 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
           <input id="passportNumberUzbLva" name="passportNumberUzbLva" placeholder="AA1234567" />
         </div>
 
+        <div id="center2Fields">
         <hr class="section-rule" />
         <h3 class="section-title">Center 2 (optional)</h3>
 
@@ -821,6 +825,7 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
         <select id="selectedSubvisaCategory2" name="selectedSubvisaCategory2">
           <option value="">-- Select Category --</option>
         </select>
+        </div>
         <div class="form-actions">
           <button type="submit" id="submitBtn">Submit &amp; Run</button>
           <button type="button" id="forceBookBtn">Book Slot</button>
@@ -1133,7 +1138,7 @@ export function runApplicantFormWithSubmitHandler(
 
           const instanceId = typeof j.instanceId === "number" ? j.instanceId : undefined;
 
-          if (collectLogin) {
+          if (collectLogin && !isIndDeuRoute(j.countryCode, j.missionCode)) {
             const vu = typeof j.vfsUsername === "string" ? j.vfsUsername.trim() : "";
             const vp = typeof j.vfsPassword === "string" ? j.vfsPassword : "";
             if (vu && vp) {
@@ -1181,6 +1186,11 @@ export function runApplicantFormWithSubmitHandler(
             if (changed) setApplicantDetailsOverrides(global0, 0);
           }
           const id = instanceId ?? 0;
+          if (isIndDeuRoute(instanceFields.countryCode, instanceFields.missionCode)) {
+            applyIndDeuPhoneToInstanceFields(instanceFields, id);
+            delete instanceFields.vacCode2;
+            delete instanceFields.selectedSubvisaCategory2;
+          }
           setApplicantDetailsOverrides(instanceFields, id);
 
           json(res, 200, { ok: true });
@@ -1298,12 +1308,17 @@ export function runApplicantFormWithSubmitHandler(
             if (instanceId > submittedNumInstances) continue;
             const creds = credentials.get(instanceId);
             const dets = details.get(instanceId);
-            if (creds && dets) validInstanceIds.push(instanceId);
+            if (!dets) continue;
+            if (isIndDeuRoute(dets.countryCode, dets.missionCode)) {
+              validInstanceIds.push(instanceId);
+              continue;
+            }
+            if (creds) validInstanceIds.push(instanceId);
           }
 
           const actualInstanceCount = validInstanceIds.length;
           if (actualInstanceCount === 0) {
-            json(res, 400, { ok: false, error: "No instances have both credentials and details saved. Use Save button first." });
+            json(res, 400, { ok: false, error: "No instances have details saved. Use Save button first." });
             return;
           }
 
