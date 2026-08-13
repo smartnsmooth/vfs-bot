@@ -36,6 +36,39 @@ export function getApplicantsJoinStaggerMs(): number {
   return Math.max(100, Math.round(resolveApplicantsJoinStaggerSec() * 1000));
 }
 
+export const DEFAULT_API_DELAY_SEC = 0;
+
+/** Setup-form / Monitor "API delay" — wait before each lift-api POST. */
+export function resolveApiDelaySec(details?: Record<string, unknown> | null): number {
+  const globalDet = details ?? getApplicantDetailsOverrides(0);
+  if (!globalDet) return DEFAULT_API_DELAY_SEC;
+  if (typeof globalDet.apiDelaySec === "number" && Number.isFinite(globalDet.apiDelaySec) && globalDet.apiDelaySec >= 0) {
+    return globalDet.apiDelaySec;
+  }
+  return DEFAULT_API_DELAY_SEC;
+}
+
+export function getApiDelayMs(): number {
+  return Math.max(0, Math.round(resolveApiDelaySec() * 1000));
+}
+
+export const DEFAULT_REPEATED_DELAY_SEC = 35;
+export const REPEATED_DELAY_STEP_SEC = 5;
+
+/** Setup-form / Monitor "409 delay" — first sleep after 409 Repeated Delay. */
+export function resolveRepeatedDelaySec(details?: Record<string, unknown> | null): number {
+  const globalDet = details ?? getApplicantDetailsOverrides(0);
+  if (!globalDet) return DEFAULT_REPEATED_DELAY_SEC;
+  if (typeof globalDet.repeatedDelaySec === "number" && Number.isFinite(globalDet.repeatedDelaySec) && globalDet.repeatedDelaySec >= 1) {
+    return Math.floor(globalDet.repeatedDelaySec);
+  }
+  return DEFAULT_REPEATED_DELAY_SEC;
+}
+
+export function getRepeatedDelayMs(): number {
+  return Math.max(1000, resolveRepeatedDelaySec() * 1000);
+}
+
 /** Fixed buffer after the login stagger ramp before the first fleet poll (ms). */
 export const FLEET_POLL_START_BUFFER_MS = 60_000;
 

@@ -16,6 +16,7 @@ import {
   classifyVfs429FromPageText,
   classifyVfs429,
 } from "../utils/vfsRateLimit";
+import { extractIndDeu4030xx, isIndDeu4030xx } from "../utils/vfs4030";
 import { isCloudflareChallengeBody } from "../utils/apiCallLog";
 
 // ── Re-exports for backward compatibility ───────────────────────────────
@@ -23,6 +24,7 @@ export {
   VfsForbiddenError,
   VfsGatewayTimeoutError,
   VfsRateLimitedError,
+  IndDeuAccountRecreateError,
   AlreadyBookedError,
   isTargetClosedError,
   isFailedToFetchError,
@@ -57,6 +59,7 @@ import {
 import {
   performLoginOnFirstTab,
   openLoginInFirstTab as loginModuleOpenLogin,
+  openRegisterInFirstTab as loginModuleOpenRegister,
   logoutVfsAndOpenLoginFirstTab as loginModuleLogoutAndOpen,
 } from "./browser.login";
 
@@ -271,7 +274,7 @@ export class BrowserService implements BrowserServiceCore {
     return kind !== "none";
   }
 
-  async detectPageBlockKind(): Promise<"none" | "account_429" | "ip_429" | "forbidden" | "cloudflare"> {
+  async detectPageBlockKind(): Promise<"none" | "account_429" | "ip_429" | "forbidden" | "cloudflare" | "account_recreate"> {
     try {
       const browser = await this.ensureBrowser();
       const pages = this.collectAllPagesFromBrowser(browser);
@@ -293,10 +296,17 @@ export class BrowserService implements BrowserServiceCore {
                 return "ip_429";
       }
 
+      if (extractIndDeu4030xx(trimmed) && isIndDeuRoute(config.slotPayload.countryCode, config.slotPayload.missionCode)) {
+        return "account_recreate";
+      }
+
       if (/^\s*\{/.test(trimmed)) {
         try {
           const parsed = JSON.parse(trimmed) as { code?: string | number };
           const codeStr = parsed.code != null ? String(parsed.code) : "";
+          if (isIndDeu4030xx(codeStr) && isIndDeuRoute(config.slotPayload.countryCode, config.slotPayload.missionCode)) {
+                        return "account_recreate";
+          }
           if (codeStr.startsWith("403201")) {
                         return "cloudflare";
           }
@@ -357,6 +367,10 @@ export class BrowserService implements BrowserServiceCore {
 
   async openLoginInFirstTab(): Promise<void> {
     await loginModuleOpenLogin(this);
+  }
+
+  async openRegisterInFirstTab(): Promise<void> {
+    await loginModuleOpenRegister(this);
   }
 
   async logoutVfsAndOpenLoginFirstTab(): Promise<void> {

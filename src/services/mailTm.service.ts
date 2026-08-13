@@ -244,3 +244,150 @@ export async function waitForOtpFromMailTm(token: string, baselineIds: ReadonlyS
     }
     throw new Error(`mail.tm: no OTP within ${opts.timeoutMs}ms`);
 }
+
+function sleepMs(ms: number): Promise<void> {
+    return new Promise((r) => setTimeout(r, ms));
+}
+
+function isMailTmRateLimited(status: number, body: string): boolean {
+    if (status === 429) return true;
+    return /too many requests|rate.?limit|retry later|slow down/i.test(body);
+}
+
+type MailTmDomain = { domain?: string; isActive?: boolean; isPrivate?: boolean };
+
+export async function pickMailTmDomain(): Promise<string> {
+    const maxAttempts = 8;
+    let lastErr = "";
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const res = await fetch(`${MAIL_TM_API}/domains`, { headers: { Accept: "application/json" } });
+        const text = await res.text();
+        if (isMailTmRateLimited(res.status, text)) {
+            lastErr = `HTTP ${res.status}`;
+            await sleepMs(Math.min(60_000, 5_000 * attempt + Math.floor(Math.random() * 2000)));
+            continue;
+        }
+        if (!res.ok) throw new Error(`mail.tm domains failed: HTTP ${res.status}`);
+        const parsed = JSON.parse(text) as { "hydra:member"?: MailTmDomain[] } | MailTmDomain[];
+        const list = Array.isArray(parsed) ? parsed : parsed["hydra:member"] ?? [];
+        const active = list.filter((d) => d.isActive !== false && d.domain);
+        if (!active.length) throw new Error("mail.tm: no active domains");
+        return active[0]!.domain!.trim();
+    }
+    throw new Error(`mail.tm domains rate-limited after retries: ${lastErr}`);
+}
+
+export type EnsureMailTmResult = "created" | "reused";
+
+export async function createMailTmAccount(
+    address: string,
+    password: string,
+    opts?: { signal?: AbortSignal },
+): Promise<EnsureMailTmResult> {
+    const maxAttempts = Math.max(5, parseInt(process.env.MAIL_TM_CREATE_MAX_ATTEMPTS ?? "15", 10) || 15);
+    const baseDelayMs = Math.max(5_000, parseInt(process.env.MAIL_TM_CREATE_RETRY_MS ?? "8000", 10) || 8_000);
+    let lastErr = "";
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        if (opts?.signal?.aborted) throw new Error("aborted");
+        const res = await fetch(`${MAIL_TM_API}/accounts`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", Accept: "application/json" },
+            body: JSON.stringify({ address: address.trim(), password }),
+        });
+        const body = await res.text();
+        if (res.status === 201 || (res.ok && res.status >= 200 && res.status < 300)) {
+            return "created";
+        }
+        if (isMailTmRateLimited(res.status, body)) {
+            lastErr = `HTTP ${res.status} ${body.slice(0, 160)}`;
+            await sleepMs(Math.min(90_000, baseDelayMs * attempt + Math.floor(Math.random() * 3000)));
+            continue;
+        }
+        const already = /This value is already used|already used|already exists/i.test(body);
+        if (already) {
+            try {
+                await fetchMailTmToken(address, password);
+                return "reused";
+            } catch {
+                throw new Error(`mail.tm address already exists (password mismatch): ${maskEmailForLog(address)}`);
+            }
+        }
+        throw new Error(`mail.tm create account failed: HTTP ${res.status} ${body.slice(0, 240)}`);
+    }
+    throw new Error(
+        `mail.tm create account rate-limited after ${maxAttempts} tries (${maskEmailForLog(address)}): ${lastErr}`,
+    );
+}
+
+async function fetchMailTmMessageHtml(token: string, id: string): Promise<{ text: string; html: string }> {
+    const res = await fetch(`${MAIL_TM_API}/messages/${encodeURIComponent(id)}`, {
+        headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+    });
+    const bodyText = await res.text();
+    if (!res.ok) return { text: "", html: "" };
+    let j: MailTmMessageDetail;
+    try {
+        j = JSON.parse(bodyText) as MailTmMessageDetail;
+    } catch {
+        return { text: "", html: "" };
+    }
+    const html = Array.isArray(j.html) ? j.html.join("\n") : typeof j.html === "string" ? j.html : "";
+    const text = [j.subject, j.intro, j.text].filter(Boolean).join("\n");
+    return { text, html };
+}
+
+export function sanitizeActivationUrl(raw: string): string {
+    return raw
+        .replace(/=\r?\n/g, "")
+        .replace(/[\r\n\u200b\u00a0]/g, "")
+        .replace(/\s+/g, "")
+        .replace(/[),.;]+$/g, "")
+        .trim();
+}
+
+export function extractVfsActivationLinks(text: string, html: string): string[] {
+    const blob = `${text}\n${html}`;
+    const hrefs = [...blob.matchAll(/href=["'](https?:\/\/[^"']+)["']/gi)].map((m) => m[1]!);
+    const bare = [...blob.matchAll(/https?:\/\/[^\s<>"']+/gi)].map((m) => m[0]!);
+    const all = [...hrefs, ...bare].map(sanitizeActivationUrl).filter(Boolean);
+    const uniq = [...new Set(all)];
+    const vfs = uniq.filter((u) => /vfsglobal\.com/i.test(u));
+    const prefer = vfs.filter((u) => /verif|activ|confirm|email|token|click/i.test(u));
+    return prefer.length ? prefer : vfs.length ? vfs : uniq.filter((u) => /verif|activ|confirm/i.test(u));
+}
+
+export async function waitForMailTmActivationLink(opts: {
+    token: string;
+    timeoutMs: number;
+    pollMs: number;
+    baselineIds?: Set<string>;
+    signal?: AbortSignal;
+}): Promise<string> {
+    const baseline = opts.baselineIds ?? new Set<string>();
+    const deadline = Date.now() + opts.timeoutMs;
+    while (Date.now() < deadline) {
+        if (opts.signal?.aborted) throw new Error("aborted");
+        let list: MailTmMessageRef[];
+        try {
+            list = await listMailTmMessages(opts.token, "activation");
+        } catch {
+            await sleepMs(opts.pollMs);
+            continue;
+        }
+        const newest = [...list].sort((a, b) => {
+            const ta = a.createdAt ? Date.parse(a.createdAt) : 0;
+            const tb = b.createdAt ? Date.parse(b.createdAt) : 0;
+            return tb - ta;
+        });
+        const fresh = newest.filter((m) => !baseline.has(m.id));
+        const early = newest.filter((m) => baseline.has(m.id));
+        for (const m of [...fresh, ...early]) {
+            const detail = await fetchMailTmMessageHtml(opts.token, m.id);
+            const links = extractVfsActivationLinks(detail.text, detail.html);
+            if (links[0]) return links[0];
+        }
+        await sleepMs(opts.pollMs);
+    }
+    throw new Error("mail.tm: no activation link within timeout");
+}
+

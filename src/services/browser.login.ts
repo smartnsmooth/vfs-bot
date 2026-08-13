@@ -7,11 +7,16 @@ import { TelegramService } from "./telegram.service";
 import type { VfsUserLoginResponse } from "../types/vfsUserLogin.type.js";
 import { flattenVfsLoginResponseForProfile, parseVfsUserLoginResponseBody, stripPasswordStepApplicantFieldsForProfileMerge, } from "../types/vfsUserLogin.type.js";
 import { clearVfsLoginProfile, mergeVfsLoginProfile } from "../utils/vfsLoginProfile.store.js";
-import { VfsForbiddenError, VfsGatewayTimeoutError, VfsRateLimitedError, PageNotFoundRestartError, isTargetClosedError, throwVfsRateLimited, responseIsLiftUserLoginPost, injectTurnstileTokenInPage, type PostOtpLoginCapture, } from "./browser.errors";
+import { VfsForbiddenError, VfsGatewayTimeoutError, VfsRateLimitedError, PageNotFoundRestartError, IndDeuAccountRecreateError, isTargetClosedError, throwVfsRateLimited, responseIsLiftUserLoginPost, injectTurnstileTokenInPage, type PostOtpLoginCapture, } from "./browser.errors";
 import { isPageNotFoundUrl } from "../flows/pageNotFound";
 import type { BrowserServiceCore } from "./browser.core";
 import { clickTurnstile, waitForManualTurnstile } from "./turnstile.click";
 import { isIndDeuRoute } from "../utils/vfsRoute";
+import { extractIndDeu4030xx } from "../utils/vfs4030";
+import { getCurrentInstanceId } from "../config/config";
+import { getStoredHeroSmsActivationId, getStoredHeroSmsLastCode } from "../utils/indDeuAccountState";
+import { heroSmsReadyForNext, heroSmsWaitForSms } from "./heroSms";
+import { patchApplicantDetailsOverrides } from "../utils/applicantDetails.store";
 
 /** Pause after OTP entry so the page can settle before Turnstile (Bulgaria OTP step). */
 const OTP_BEFORE_CAPTCHA_DELAY_MS = 1000;
@@ -54,6 +59,11 @@ function makeBlockCheck(page: Page): () => Promise<void> {
             return;
         }
         const t = text.trim();
+        const recreate = extractIndDeu4030xx(t);
+        if (recreate && isIndDeuRoute(config.slotPayload.countryCode, config.slotPayload.missionCode)) {
+            reporter.setPhase("recovering", `4030xx ${recreate} — new account`);
+            throw new IndDeuAccountRecreateError(recreate, `Block page ${recreate} during login`);
+        }
         if (/Access Restricted Due to Unusual Activity/i.test(t) || /403201/.test(t) ||
             /Permission Issues/i.test(t) || /403101/.test(t) ||
             /Session Expired or Invalid/i.test(t)) {
@@ -101,6 +111,10 @@ async function waitForLoginFormOrThrowBlock(page: Page, usernameSelectors: strin
                         throwVfsRateLimited(rateKind, codeStr, "Login page body contains rate-limit JSON block");
                     }
                     if (codeStr.startsWith("403")) {
+                        const recreate = extractIndDeu4030xx(codeStr) ?? extractIndDeu4030xx(trimmed);
+                        if (recreate && isIndDeuRoute(config.slotPayload.countryCode, config.slotPayload.missionCode)) {
+                            throw new IndDeuAccountRecreateError(recreate, `Login page WAF block ${recreate}`);
+                        }
                         throw new VfsForbiddenError(`Login page body contains WAF block: code ${parsed.code}`);
                     }
                 }
@@ -109,7 +123,13 @@ async function waitForLoginFormOrThrowBlock(page: Page, usernameSelectors: strin
                         throw e;
                     if (e instanceof VfsForbiddenError)
                         throw e;
+                    if (e instanceof IndDeuAccountRecreateError)
+                        throw e;
                 }
+            }
+            const recreateBody = extractIndDeu4030xx(trimmed);
+            if (recreateBody && isIndDeuRoute(config.slotPayload.countryCode, config.slotPayload.missionCode)) {
+                throw new IndDeuAccountRecreateError(recreateBody, `Login page ${recreateBody}`);
             }
             if (/Access Restricted Due to Unusual Activity/i.test(trimmed) || /403201/.test(trimmed)) {
                 throw new VfsForbiddenError("Login page shows 'Access Restricted Due to Unusual Activity' (403201) — IP blocked.");
@@ -125,6 +145,8 @@ async function waitForLoginFormOrThrowBlock(page: Page, usernameSelectors: strin
             if (e instanceof VfsRateLimitedError)
                 throw e;
             if (e instanceof VfsForbiddenError)
+                throw e;
+            if (e instanceof IndDeuAccountRecreateError)
                 throw e;
         }
     }
@@ -882,15 +904,17 @@ export async function performLoginOnFirstTab(core: BrowserServiceCore, username:
         timeoutMs: 25000,
     });
     const submitBtn = await resolveLoginSubmitButton(page);
+    const indDeuLogin = isIndDeuRoute(config.slotPayload.countryCode, config.slotPayload.missionCode);
     const wantMailTm = config.mailTmOtpEnabled
         && username.trim().includes("@")
         && password.length > 0
-        && !isIndDeuRoute(config.slotPayload.countryCode, config.slotPayload.missionCode);
+        && !indDeuLogin;
     let mailTmReady: {
         token: string;
         baseline: Set<string>;
     } | null = null;
     let mailOtpFetchPromise: Promise<string> | null = null;
+    const heroSmsOtp = { activationId: "", code: "" };
     if (wantMailTm) {
         try {
             const mailToken = await fetchMailTmToken(username.trim(), password);
@@ -905,7 +929,20 @@ export async function performLoginOnFirstTab(core: BrowserServiceCore, username:
         catch (err) {
         }
     }
-    else {
+    else if (indDeuLogin) {
+        const instanceId = getCurrentInstanceId();
+        const actId = getStoredHeroSmsActivationId(instanceId);
+        if (actId) {
+            heroSmsOtp.activationId = actId;
+            mailOtpFetchPromise = heroSmsWaitForSms(actId, {
+                timeoutMs: Math.max(180_000, config.mailTmOtpTimeoutMs),
+                pollMs: config.mailTmPollIntervalMs,
+                ignoreCode: getStoredHeroSmsLastCode(instanceId),
+            }).then((code) => {
+                heroSmsOtp.code = code;
+                return code;
+            });
+        }
     }
     const passwordLoginResponsePromise = page
         .waitForResponse((res) => {
@@ -942,6 +979,10 @@ export async function performLoginOnFirstTab(core: BrowserServiceCore, username:
                 description?: string;
             } | undefined;
             const bodyCode = String((pwdJson as Record<string, unknown>).code ?? errObj?.code ?? "");
+            const recreateLogin = extractIndDeu4030xx(bodyCode) ?? extractIndDeu4030xx(pwdBody);
+            if (recreateLogin && isIndDeuRoute(config.slotPayload.countryCode, config.slotPayload.missionCode)) {
+                throw new IndDeuAccountRecreateError(recreateLogin, `Login API ${recreateLogin}`);
+            }
             const bodyKind = classifyVfs429(bodyCode);
             if (bodyKind) {
                 throwVfsRateLimited(bodyKind, bodyCode, "Login API body rate-limit code");
@@ -982,6 +1023,10 @@ export async function performLoginOnFirstTab(core: BrowserServiceCore, username:
         });
     }
     await finishLoginAfterFirstSubmit(page, mailOtpFetchPromise, core);
+    if (heroSmsOtp.activationId && heroSmsOtp.code) {
+        patchApplicantDetailsOverrides({ heroSmsLastCode: heroSmsOtp.code }, getCurrentInstanceId());
+        await heroSmsReadyForNext(heroSmsOtp.activationId);
+    }
 }
 async function finishLoginAfterFirstSubmit(page: Page, mailOtpFetchPromise: Promise<string> | null, core: BrowserServiceCore): Promise<void> {
     const dash = dashboardUrlRegex();
@@ -1040,12 +1085,31 @@ export async function openLoginInFirstTab(core: BrowserServiceCore): Promise<voi
     await page.bringToFront().catch(() => { });
     const navResponse = await page.goto(config.loginPageUrl, { waitUntil: "domcontentloaded", timeout: 120000 });
     if (navResponse && navResponse.status() === 403) {
+        const body = await navResponse.text().catch(() => "");
+        const recreate = extractIndDeu4030xx(body);
+        if (recreate && isIndDeuRoute(config.slotPayload.countryCode, config.slotPayload.missionCode)) {
+            throw new IndDeuAccountRecreateError(recreate, `Login page ${recreate}`);
+        }
         throw new VfsForbiddenError("Login page returned 403 Forbidden — IP/session blocked by Cloudflare or VFS.");
     }
     throwIfBlockPage(page);
     const visibleOnly = ':not(.d-none):not([aria-hidden="true"])';
     const usernameSelectors = `#email${visibleOnly}, input[formcontrolname="username"]${visibleOnly}, input[formControlName="username"]${visibleOnly}, input[formcontrolname="email"]${visibleOnly}, input[formControlName="email"]${visibleOnly}, input[name="username"]${visibleOnly}, input[name="email"]${visibleOnly}, input[type="email"]${visibleOnly}`;
     await waitForLoginFormOrThrowBlock(page, usernameSelectors, 300000);
+}
+export async function openRegisterInFirstTab(core: BrowserServiceCore): Promise<void> {
+    const page = await core.getOrCreateNonSetupPage();
+    await page.bringToFront().catch(() => { });
+    const navResponse = await page.goto(config.registerPageUrl, { waitUntil: "domcontentloaded", timeout: 120000 });
+    if (navResponse && navResponse.status() === 403) {
+        const body = await navResponse.text().catch(() => "");
+        const recreate = extractIndDeu4030xx(body);
+        if (recreate && isIndDeuRoute(config.slotPayload.countryCode, config.slotPayload.missionCode)) {
+            throw new IndDeuAccountRecreateError(recreate, `Register page ${recreate}`);
+        }
+        throw new VfsForbiddenError("Register page returned 403 Forbidden — IP/session blocked by Cloudflare or VFS.");
+    }
+    throwIfBlockPage(page);
 }
 export async function logoutVfsAndOpenLoginFirstTab(core: BrowserServiceCore): Promise<void> {
     const page = await core.getVfsPageOrAnyNonSetup();

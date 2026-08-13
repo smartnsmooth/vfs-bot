@@ -192,6 +192,14 @@ export function buildMonitorTabHtml(): string {
     <label for="monApologiesInterval">Apologies (s)</label>
     <input type="number" id="monApologiesInterval" min="1" max="120" value="2" style="width:3.5rem;padding:0.15rem 0.25rem;border:1px solid #38444d;border-radius:4px;background:#15202b;color:#e7e9ea;font-size:0.72rem;" />
     <button type="button" id="monApologiesApply">Apply</button>
+    <span style="color:#38444d;margin:0 0.1rem;">|</span>
+    <label for="monApiDelay">API delay (s)</label>
+    <input type="number" id="monApiDelay" min="0" max="60" value="0" step="0.1" style="width:3.5rem;padding:0.15rem 0.25rem;border:1px solid #38444d;border-radius:4px;background:#15202b;color:#e7e9ea;font-size:0.72rem;" />
+    <button type="button" id="monApiDelayApply">Apply</button>
+    <span style="color:#38444d;margin:0 0.1rem;">|</span>
+    <label for="monRepeatedDelay">409 delay (s)</label>
+    <input type="number" id="monRepeatedDelay" min="1" max="600" value="35" step="1" style="width:3.5rem;padding:0.15rem 0.25rem;border:1px solid #38444d;border-radius:4px;background:#15202b;color:#e7e9ea;font-size:0.72rem;" />
+    <button type="button" id="monRepeatedDelayApply">Apply</button>
   </div>
   <div class="mon-grid" id="monGrid"></div>
 </div>
@@ -625,6 +633,14 @@ export function buildMonitorTabHtml(): string {
           var cp = document.getElementById('monCalendarPollingInterval');
           if (cp) cp.value = String(c.calendarPollingIntervalSec);
         }
+        if (c.apiDelaySec != null) {
+          var ad = document.getElementById('monApiDelay');
+          if (ad) ad.value = String(c.apiDelaySec);
+        }
+        if (c.repeatedDelaySec != null) {
+          var rd = document.getElementById('monRepeatedDelay');
+          if (rd) rd.value = String(c.repeatedDelaySec);
+        }
       }
     }).catch(function(){});
 
@@ -648,6 +664,8 @@ export function buildMonitorTabHtml(): string {
     bindApply('monPollIntervalApply', 'monPollInterval', 'poll-interval', 'Poll interval', 1, false);
     bindApply('monApplicantsJoinStaggerApply', 'monApplicantsJoinStagger', 'applicants-join-stagger', 'Join stagger', 0.1, true);
     bindApply('monCalendarPollingIntervalApply', 'monCalendarPollingInterval', 'calendar-polling-interval', 'Calendar re-poll', 1, false);
+    bindApply('monApiDelayApply', 'monApiDelay', 'api-delay', 'API delay', 0, true);
+    bindApply('monRepeatedDelayApply', 'monRepeatedDelay', 'repeated-delay', '409 delay', 1, false);
     fetch('/api/monitor/snapshot').then(function(r){ return r.json(); }).then(function(d){
       if (d && d.ok && Array.isArray(d.instances)){
         for (var i = 0; i < d.instances.length; i++){

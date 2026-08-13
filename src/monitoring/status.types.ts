@@ -186,6 +186,10 @@ export interface MonitorControlState {
   applicantsJoinStaggerSec: number;
   /** Seconds between calendar API re-poll calls in fleet booking mode. */
   calendarPollingIntervalSec: number;
+  /** Seconds to wait before each lift-api POST. */
+  apiDelaySec: number;
+  /** First sleep after HTTP 409 Repeated Delay (seconds); +5s each retry. */
+  repeatedDelaySec: number;
 }
 
 /**
@@ -222,6 +226,10 @@ export interface MonitorHooks {
   setApplicantsJoinStaggerSec(sec: number): { ok: boolean; error?: string };
   /** Set calendar polling interval (seconds between calendar re-poll calls). */
   setCalendarPollingIntervalSec(sec: number): { ok: boolean; error?: string };
+  /** Set delay before each lift-api POST (seconds). */
+  setApiDelaySec(sec: number): { ok: boolean; error?: string };
+  /** Set first 409 Repeated Delay sleep (seconds). */
+  setRepeatedDelaySec(sec: number): { ok: boolean; error?: string };
   /** Reload global settings from disk on all running bots (after /api/save). */
   reloadGlobalSettings(): { ok: boolean };
   getControl(): MonitorControlState;

@@ -18,6 +18,7 @@ import { classifyVfsFirstTabUrl } from "../flows/vfsTabUrl";
 import { AlreadyBookedError, VfsForbiddenError, VfsGatewayTimeoutError, throwVfsRateLimited } from "./browser.errors";
 import { classifyVfs429FromHttp } from "../utils/vfsRateLimit";
 import { bumpJoinStaggerOn504 } from "../utils/calendarBookingCoord";
+import { getApiDelayMs, getRepeatedDelayMs, REPEATED_DELAY_STEP_SEC } from "../utils/fleetPollSchedule";
 import { isCloudflareChallengeBody, logApiCall, liftUrlToLogKind } from "../utils/apiCallLog";
 import { reporter } from "../monitoring/statusReporter";
 import { TelegramService } from "./telegram.service";
@@ -31,6 +32,25 @@ function getLiftApiPageContextFromSource(page: Page): { origin: string; referer:
   const pathname = new URL(sourceUrl).pathname;
   const route = pathname.split("/").filter(Boolean).slice(0, -1).join("/");
   return { origin, referer, route };
+}
+
+const REPEATED_DELAY_KINDS = new Set(["polling", "applicants", "calendar", "timeslot", "fees", "schedule"]);
+
+function isRepeatedDelayConflict(status: number, body: string): boolean {
+  if (status !== 409) return false;
+  try {
+    const parsed = JSON.parse(body) as { code?: unknown; description?: unknown; error?: unknown };
+    const src =
+      parsed && typeof parsed.error === "object" && parsed.error != null
+        ? (parsed.error as { code?: unknown; description?: unknown })
+        : parsed;
+    const code = typeof src.code === "number" ? src.code : parseInt(String(src.code ?? ""), 10);
+    if (code !== 31) return false;
+    const desc = typeof src.description === "string" ? src.description : "";
+    return /repeated\s*delay/i.test(desc);
+  } catch {
+    return false;
+  }
 }
 
 function assertVfsPageLoggedInForLiftApi(page: Page): void {
@@ -74,6 +94,7 @@ export async function postLiftJsonFromPage(
 
   const { origin, referer, route } = getLiftApiPageContextFromSource(page);
   const clientSourceOverride: string | null = getCapturedClientSource()?.trim() || null;
+  let repeatedDelayMs = getRepeatedDelayMs();
 
   for (;;) {
     if (logKind === "polling") {
@@ -86,6 +107,11 @@ export async function postLiftJsonFromPage(
       logKind === "schedule"
     ) {
       reporter.flashCard(3, logKind);
+    }
+
+    const apiDelayMs = getApiDelayMs();
+    if (apiDelayMs > 0) {
+      await new Promise<void>((r) => setTimeout(r, apiDelayMs));
     }
 
     let result: { status: number; body: string };
@@ -193,6 +219,13 @@ export async function postLiftJsonFromPage(
     if (result.status === 504) {
       await new Promise<void>((r) => setTimeout(r, 1000));
       bumpJoinStaggerOn504();
+      continue;
+    }
+    if (logKind && REPEATED_DELAY_KINDS.has(logKind) && isRepeatedDelayConflict(result.status, result.body)) {
+      const sleepSec = Math.max(1, Math.round(repeatedDelayMs / 1000));
+      reporter.setDetail(`409 Repeated Delay — retry ${logKind} in ${sleepSec}s`);
+      await new Promise<void>((r) => setTimeout(r, repeatedDelayMs));
+      repeatedDelayMs += REPEATED_DELAY_STEP_SEC * 1000;
       continue;
     }
     const rate = classifyVfs429FromHttp(result.status, result.body);

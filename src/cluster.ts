@@ -16,7 +16,7 @@ import { clearSlotState } from "./utils/slotState";
 import { clearSlotCenterOverride } from "./utils/slotCenterOverride.store";
 import { clearPollReadyState, initPollReadyState } from "./utils/pollReadyState";
 import { clearFleetPollCoord, ensureFleetPollEarliest } from "./utils/fleetPollCoord";
-import { computeFleetPollAnchorAt, getFleetPollStepMs, getFleetPollIntervalSec, resolveApologiesIntervalSec, resolveApplicantsJoinStaggerSec } from "./utils/fleetPollSchedule";
+import { computeFleetPollAnchorAt, getFleetPollStepMs, getFleetPollIntervalSec, resolveApologiesIntervalSec, resolveApplicantsJoinStaggerSec, resolveApiDelaySec, resolveRepeatedDelaySec } from "./utils/fleetPollSchedule";
 import { registry } from "./monitoring/statusRegistry";
 import { startChromeStatusProbe } from "./monitoring/chromeProbe";
 import { focusChromeByPort, getDevtoolsInfo, warmupWindowHelper } from "./utils/chromeWindow";
@@ -24,6 +24,8 @@ import { makeInitialStatus, type MonitorHooks, type InstanceStatus } from "./mon
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { clearChromeSessionDataBeforeLaunch } from "./utils/chromeProfileSessionClean";
+import { beginIndDeuProcessSession } from "./utils/indDeuProcessSession";
+import { isIndDeuRoute } from "./utils/vfsRoute";
 
 /** How many bot instances are currently running. Set by ensureInstances(). */
 let currentNumInstances = 0;
@@ -187,10 +189,12 @@ function buildMonitorHooks(): MonitorHooks {
       const details = getAllInstanceApplicantDetails();
       const ids: number[] = [];
       for (let id = 1; id <= count; id++) {
-        if (creds.get(id) && details.get(id)) ids.push(id);
+        const dets = details.get(id);
+        if (!dets) continue;
+        if (isIndDeuRoute(dets.countryCode, dets.missionCode) || creds.get(id)) ids.push(id);
       }
       if (ids.length === 0) {
-        return { ok: false, error: "No saved instances with credentials + details. Configure & Save first." };
+        return { ok: false, error: "No saved instances with details. Configure & Save first." };
       }
       ensureInstances(Math.max(...ids));
       rolloutPaused = false;
@@ -323,6 +327,26 @@ function buildMonitorHooks(): MonitorHooks {
       broadcastToActiveChildren({ type: "global-settings-updated" });
       return { ok: true };
     },
+    setApiDelaySec: (sec) => {
+      if (!Number.isFinite(sec) || sec < 0) {
+        return { ok: false, error: "API delay must be at least 0 seconds." };
+      }
+      const global0 = getApplicantDetailsOverrides(0) ?? {};
+      global0.apiDelaySec = sec;
+      setApplicantDetailsOverrides(global0, 0);
+      broadcastToActiveChildren({ type: "global-settings-updated" });
+      return { ok: true };
+    },
+    setRepeatedDelaySec: (sec) => {
+      if (!Number.isFinite(sec) || sec < 1) {
+        return { ok: false, error: "409 delay must be at least 1 second." };
+      }
+      const global0 = getApplicantDetailsOverrides(0) ?? {};
+      global0.repeatedDelaySec = Math.floor(sec);
+      setApplicantDetailsOverrides(global0, 0);
+      broadcastToActiveChildren({ type: "global-settings-updated" });
+      return { ok: true };
+    },
     reloadGlobalSettings: () => {
       broadcastToActiveChildren({ type: "config-updated" });
       return { ok: true };
@@ -340,6 +364,8 @@ function buildMonitorHooks(): MonitorHooks {
         applicantsJoinStaggerSec: resolveApplicantsJoinStaggerSec(global0),
         calendarPollingIntervalSec: global0 && typeof global0.calendarPollingInterval === "number" && global0.calendarPollingInterval >= 1
           ? Math.floor(global0.calendarPollingInterval) : 60,
+        apiDelaySec: resolveApiDelaySec(global0),
+        repeatedDelaySec: resolveRepeatedDelaySec(global0),
       };
     },
   };
@@ -587,7 +613,8 @@ function spawnBotInstance(instanceId: number, totalInstances: number): ChildProc
 }
 
 async function main(): Promise<void> {
-  
+  beginIndDeuProcessSession();
+
   // Wipe stale shared state from previous sessions so new instances start clean.
   clearSlotState();
   clearPollReadyState();

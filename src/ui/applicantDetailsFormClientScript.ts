@@ -212,14 +212,45 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     updateIndDeuUppercaseStyle();
   }
 
+  function layoutIndDeuApplicantFields() {
+    var on = getRouteKey() === "ind-deu";
+    var dobWrap = document.getElementById("manualDobWrap");
+    var passWrap = document.getElementById("manualPassportNumberWrap");
+    var dobPassRow = document.getElementById("manualDobPassportRow");
+    var indDeuDobRow = document.getElementById("indDeuDobRow");
+    var expiryWrap = document.getElementById("passportExpiryFieldWrap");
+    var metaRow = document.getElementById("applicantMetaRow");
+    var natWrap = document.getElementById("nationalityFieldWrap");
+    var genderWrap = document.getElementById("genderFieldWrap");
+    if (!dobWrap || !passWrap || !dobPassRow || !expiryWrap || !metaRow || !natWrap || !genderWrap) return;
+    if (indDeuDobRow) indDeuDobRow.style.display = "none";
+    metaRow.className = "row3";
+    if (on) {
+      dobPassRow.appendChild(passWrap);
+      dobPassRow.appendChild(expiryWrap);
+      metaRow.appendChild(dobWrap);
+      metaRow.appendChild(natWrap);
+      metaRow.appendChild(genderWrap);
+    } else {
+      dobPassRow.appendChild(dobWrap);
+      dobPassRow.appendChild(passWrap);
+      metaRow.appendChild(expiryWrap);
+      metaRow.appendChild(natWrap);
+      metaRow.appendChild(genderWrap);
+    }
+  }
+
   function updateIndDeuHiddenExtras() {
     var on = getRouteKey() === "ind-deu";
     var loginWrap = document.getElementById("vfsLoginFields");
     if (loginWrap) loginWrap.style.display = on ? "none" : "";
+    var prefixWrap = document.getElementById("indDeuEmailPrefixFields");
+    if (prefixWrap) prefixWrap.style.display = on ? "" : "none";
     var acct2 = document.getElementById("loginAccount2Fields");
     if (acct2) acct2.style.display = on ? "none" : "";
     var center2 = document.getElementById("center2Fields");
     if (center2) center2.style.display = on ? "none" : "";
+    layoutIndDeuApplicantFields();
     if (!on) return;
     var u2 = document.getElementById("vfsUsername2");
     var p2 = document.getElementById("vfsPassword2");
@@ -492,7 +523,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     }
 
     if (inst.details) {
-      const skipDetailIds = { numInstances: true, instanceId: true, vfsUsername2: true, vfsPassword2: true, countryCode: true, missionCode: true };
+      const skipDetailIds = { numInstances: true, instanceId: true, vfsUsername2: true, vfsPassword2: true, countryCode: true, missionCode: true, heroSmsActivationId: true, heroSmsLastCode: true, indDeuProcessSessionId: true, indDeuEmailPrefix: true, indDeuEmailDomain: true };
       var loadRouteKey = String(inst.details.countryCode || "") + "-" + String(inst.details.missionCode || "");
       if (loadRouteKey === "ind-deu") {
         skipDetailIds.dialCode = true;
@@ -512,7 +543,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
         const k = keys[ki];
         if (skipDetailIds[k] || skipCenterCatIds[k]) continue;
         if (k === "scheduleDateRangeStart" || k === "scheduleDateRangeEnd") continue;
-        if (k === "calendarPollingStartDate" || k === "calendarPollingInterval") continue;
+        if (k === "calendarPollingStartDate" || k === "calendarPollingInterval" || k === "apiDelaySec" || k === "repeatedDelaySec") continue;
         const el = document.getElementById(k);
         if (el) el.value = inst.details[k] == null ? "" : String(inst.details[k]);
       }
@@ -585,6 +616,26 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       const gsrc = (globalInst && globalInst.details) || {};
       cpiEl.value = gsrc.calendarPollingInterval != null ? String(gsrc.calendarPollingInterval) : "60";
     }
+    const adsEl = document.getElementById("apiDelaySec");
+    if (adsEl) {
+      const gsrc = (globalInst && globalInst.details) || {};
+      adsEl.value = gsrc.apiDelaySec != null ? String(gsrc.apiDelaySec) : "0";
+    }
+    const rdsEl = document.getElementById("repeatedDelaySec");
+    if (rdsEl) {
+      const gsrc = (globalInst && globalInst.details) || {};
+      rdsEl.value = gsrc.repeatedDelaySec != null ? String(gsrc.repeatedDelaySec) : "35";
+    }
+    const prefixEl = document.getElementById("indDeuEmailPrefix");
+    if (prefixEl) {
+      const gsrc = (globalInst && globalInst.details) || {};
+      prefixEl.value = gsrc.indDeuEmailPrefix != null ? String(gsrc.indDeuEmailPrefix) : "";
+    }
+    const domainEl = document.getElementById("indDeuEmailDomain");
+    if (domainEl) {
+      const gsrc = (globalInst && globalInst.details) || {};
+      domainEl.value = gsrc.indDeuEmailDomain != null ? String(gsrc.indDeuEmailDomain) : "";
+    }
 
     if (showAlert) {
       alert("Loaded saved data for Instance " + instanceId);
@@ -634,16 +685,22 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       applicantsJoinStaggerSec: parseFloat(String(fd.get("applicantsJoinStaggerSec") || "0.5")) || 0.5,
       calendarPollingStartDate: String(fd.get("calendarPollingStartDate") ?? "").trim(),
       calendarPollingInterval: parseInt(String(fd.get("calendarPollingInterval") || "60"), 10) || 60,
+      apiDelaySec: parseFloat(String(fd.get("apiDelaySec") || "0")),
+      repeatedDelaySec: parseInt(String(fd.get("repeatedDelaySec") || "35"), 10) || 35,
       postLoginPollDelay: parseInt(String(fd.get("postLoginPollDelay") || "30"), 10),
       staggerIntervalSec: parseInt(String(fd.get("staggerIntervalSec") || "6"), 10),
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
       helloVerifyNumber: String(fd.get("helloVerifyNumber") ?? "").trim() || undefined,
       juridictionCode: String(fd.get("juridictionCode") ?? "").trim() || undefined,
+      indDeuEmailPrefix: isIndDeu ? String(fd.get("indDeuEmailPrefix") || "").trim() || undefined : undefined,
+      indDeuEmailDomain: isIndDeu ? String(fd.get("indDeuEmailDomain") || "").trim().replace(/^@+/, "") || undefined : undefined,
     };
     if (!Number.isFinite(body.postLoginPollDelay) || body.postLoginPollDelay < 0) body.postLoginPollDelay = 30;
     if (!Number.isFinite(body.apologiesIntervalSec) || body.apologiesIntervalSec < 1) body.apologiesIntervalSec = 2;
     if (!Number.isFinite(body.applicantsJoinStaggerSec) || body.applicantsJoinStaggerSec < 0.1) body.applicantsJoinStaggerSec = 0.5;
     if (!Number.isFinite(body.calendarPollingInterval) || body.calendarPollingInterval < 1) body.calendarPollingInterval = 60;
+    if (!Number.isFinite(body.apiDelaySec) || body.apiDelaySec < 0) body.apiDelaySec = 0;
+    if (!Number.isFinite(body.repeatedDelaySec) || body.repeatedDelaySec < 1) body.repeatedDelaySec = 35;
     if (collectLogin && !isIndDeu) {
       body.vfsUsername = fd.get("vfsUsername");
       body.vfsPassword = fd.get("vfsPassword");
@@ -870,6 +927,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       if (!nationalityRaw) missing.push("Nationality");
       if (!passportSave) missing.push("Passport number");
       if (!expiryRaw) missing.push("Passport expiry");
+      if (!String(fd.get("indDeuEmailPrefix") || "").trim()) missing.push("Email prefix");
+      if (!String(fd.get("indDeuEmailDomain") || "").trim()) missing.push("Email domain");
     }
     if (missing.length > 0) {
       msg.className = "err";
@@ -901,16 +960,22 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       applicantsJoinStaggerSec: parseFloat(String(fd.get("applicantsJoinStaggerSec") || "0.5")) || 0.5,
       calendarPollingStartDate: String(fd.get("calendarPollingStartDate") ?? "").trim(),
       calendarPollingInterval: parseInt(String(fd.get("calendarPollingInterval") || "60"), 10) || 60,
+      apiDelaySec: parseFloat(String(fd.get("apiDelaySec") || "0")),
+      repeatedDelaySec: parseInt(String(fd.get("repeatedDelaySec") || "35"), 10) || 35,
       postLoginPollDelay: parseInt(String(fd.get("postLoginPollDelay") || "30"), 10),
       staggerIntervalSec: parseInt(String(fd.get("staggerIntervalSec") || "6"), 10),
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
       helloVerifyNumber: String(fd.get("helloVerifyNumber") ?? "").trim() || undefined,
       juridictionCode: String(fd.get("juridictionCode") ?? "").trim() || undefined,
+      indDeuEmailPrefix: isIndDeu ? String(fd.get("indDeuEmailPrefix") || "").trim() || undefined : undefined,
+      indDeuEmailDomain: isIndDeu ? String(fd.get("indDeuEmailDomain") || "").trim().replace(/^@+/, "") || undefined : undefined,
     };
     if (!Number.isFinite(body.postLoginPollDelay) || body.postLoginPollDelay < 0) body.postLoginPollDelay = 30;
     if (!Number.isFinite(body.apologiesIntervalSec) || body.apologiesIntervalSec < 1) body.apologiesIntervalSec = 2;
     if (!Number.isFinite(body.applicantsJoinStaggerSec) || body.applicantsJoinStaggerSec < 0.1) body.applicantsJoinStaggerSec = 0.5;
     if (!Number.isFinite(body.calendarPollingInterval) || body.calendarPollingInterval < 1) body.calendarPollingInterval = 60;
+    if (!Number.isFinite(body.apiDelaySec) || body.apiDelaySec < 0) body.apiDelaySec = 0;
+    if (!Number.isFinite(body.repeatedDelaySec) || body.repeatedDelaySec < 1) body.repeatedDelaySec = 35;
     if (collectLogin && !isIndDeu) {
       body.vfsUsername = fd.get("vfsUsername");
       body.vfsPassword = fd.get("vfsPassword");

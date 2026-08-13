@@ -251,6 +251,8 @@ const APPLICANT_UI_ONLY_KEYS = [
   "staggerIntervalSec",
   "calendarPollingStartDate",
   "calendarPollingInterval",
+  "apiDelaySec",
+  "repeatedDelaySec",
 ] as const;
 
 /**

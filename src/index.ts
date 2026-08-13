@@ -10,7 +10,7 @@ import path from "node:path";
 import { config, setCurrentInstanceId } from "./config/config";
 import { classifyVfsFirstTabUrl } from "./flows/vfsTabUrl";
 import { PollingService } from "./services/polling.service";
-import { BrowserService, VfsForbiddenError, VfsGatewayTimeoutError, VfsRateLimitedError, AlreadyBookedError, isFailedToFetchError } from "./services/browser.service";
+import { BrowserService, VfsForbiddenError, VfsGatewayTimeoutError, VfsRateLimitedError, IndDeuAccountRecreateError, AlreadyBookedError, isFailedToFetchError } from "./services/browser.service";
 import { TelegramService } from "./services/telegram.service";
 import {
   runApplicantFormWithSubmitHandler,
@@ -51,6 +51,8 @@ import {
   normalizeFleetInstanceId,
   resolveApologiesIntervalSec,
   resolveApplicantsJoinStaggerSec,
+  resolveApiDelaySec,
+  resolveRepeatedDelaySec,
 } from "./utils/fleetPollSchedule";
 import {
   applicantsAttemptTargetMs,
@@ -72,6 +74,9 @@ import { focusChromeByPort, getDevtoolsInfo } from "./utils/chromeWindow";
 import type { MonitorHooks } from "./monitoring/status.types";
 import { isPageNotFoundUrl } from "./flows/pageNotFound";
 import { PageNotFoundRestartError } from "./services/browser.errors";
+import { beginIndDeuProcessSession } from "./utils/indDeuProcessSession";
+import { ensureIndDeuAccountReady } from "./flows/indDeuAccount/createAccount";
+import { extractIndDeu4030xxFromUnknown } from "./utils/vfs4030";
 
 const polling = new PollingService();
 const browser = new BrowserService();
@@ -1405,7 +1410,7 @@ async function runPollLoop(
                 reporter.setPhase("polling", `checking center ${center.centerNumber} (${center.vacCode})`);
         reporter.setPoll({ center: `${center.centerNumber}:${center.vacCode}`, pollCount: completed + 1 });
 
-        const { slot, response, centerNumber, centerCode, visaCategoryCode, unauthorized, accountBlocked, rateLimitedIp, rateLimitCode, forbidden, gatewayTimeout, cloudflareChallenge, fetchFailed } = await polling.checkSlotsInBrowser(browser, {
+        const { slot, response, centerNumber, centerCode, visaCategoryCode, unauthorized, accountBlocked, rateLimitedIp, rateLimitCode, forbidden, accountRecreate, forbiddenCode, gatewayTimeout, cloudflareChallenge, fetchFailed } = await polling.checkSlotsInBrowser(browser, {
           centerCode: center.vacCode,
           visaCategoryCode: center.visaCategoryCode,
           centerNumber: center.centerNumber,
@@ -1449,6 +1454,13 @@ async function runPollLoop(
         }
 
         if (forbidden) {
+          if (
+            accountRecreate &&
+            isIndDeuRoute(config.slotPayload.countryCode, config.slotPayload.missionCode)
+          ) {
+            await recreateIndDeuAccountAndRelogin(instanceId, forbiddenCode ?? "4030xx");
+            continue;
+          }
           reporter.setPhase("recovering", "403 Forbidden — rotating IP + relogin");
           await telegram.alert("error", `Bot ${instanceId ?? "?"} got 403 Forbidden during polling. Restarting browser + rotating IP...`).catch(() => { });
           await performHardRelogin(instanceId, "403-forbidden-recovery");
@@ -1607,6 +1619,50 @@ function getFixedTimingForInstance(instanceId?: number): { postLoginOffsetMs: nu
  * Hard relogin: kill Chrome, clear cache/cookies/session, rotate proxy IP,
  * open a new Chrome, login, settle on dashboard, prepare polling.
  */
+async function ensureIndDeuAccountIfNeeded(
+  instanceId?: number,
+  forceNew = false,
+): Promise<void> {
+  if (!isIndDeuRoute(config.slotPayload.countryCode, config.slotPayload.missionCode)) return;
+  reporter.setPhase("launching", forceNew ? "creating new ind-deu account" : "ensuring ind-deu account");
+  await ensureIndDeuAccountReady(browser, instanceId, {
+    forceNew,
+    hardRestartChrome: async () => {
+      clearApplicantIpCache();
+      await relaunchChromeAfterCredentialSwapLogout();
+      await resolveAndReportEgressIp({ logAs: "rotate-ip", instanceId });
+    },
+  });
+  reporter.setAccount(resolveLoginUsername(instanceId), getPendingCredentialSlot(instanceId));
+}
+
+async function recreateIndDeuAccountAndRelogin(
+  instanceId: number | undefined,
+  code?: string,
+): Promise<void> {
+  const label = code ?? "4030xx";
+  reporter.setPhase("recovering", `${label} — new account + IP rotate`);
+  await telegram
+    .alert("error", `Bot ${instanceId ?? "?"} got ${label} — creating a new ind-deu account...`)
+    .catch(() => {});
+  clearApplicantIpCache();
+  await relaunchChromeAfterCredentialSwapLogout();
+  await resolveAndReportEgressIp({ logAs: "rotate-ip", instanceId });
+  await ensureIndDeuAccountIfNeeded(instanceId, true);
+  await browser.openLoginInFirstTab();
+  await performVfsLoginFromStore(instanceId);
+  await resolveAndReportEgressIp({ logAs: "recover", instanceId });
+  await settleOnDashboard({
+    instanceId,
+    waitMs: RESTART_DASHBOARD_WAIT_MS,
+    reason: `ind-deu-recreate-${label}`,
+  });
+  await browser.preparePollingAfterLogin({ skipDashboardNavigate: true });
+  await telegram
+    .alert("info", `Bot ${instanceId ?? "?"} new ind-deu account ready after ${label} — resuming.`)
+    .catch(() => {});
+}
+
 async function performHardRelogin(instanceId?: number, context?: string): Promise<void> {
   const ctx = context ?? "hard-relogin";
   clearSoftIpRotateFlag();
@@ -1708,7 +1764,16 @@ async function openLoginWithForbiddenRecovery(instanceId?: number): Promise<void
       await browser.openLoginInFirstTab();
       return;
     } catch (err) {
+      if (err instanceof IndDeuAccountRecreateError) {
+        await recreateIndDeuAccountAndRelogin(instanceId, err.code);
+        return;
+      }
       if (err instanceof VfsForbiddenError) {
+        const recreate = extractIndDeu4030xxFromUnknown(err);
+        if (recreate && isIndDeuRoute(config.slotPayload.countryCode, config.slotPayload.missionCode)) {
+          await recreateIndDeuAccountAndRelogin(instanceId, recreate);
+          return;
+        }
                 await telegram.alert("error", `Bot ${instanceId ?? "?"} got 403 on login page (attempt ${attempt}/${MAX_FORBIDDEN_RETRIES}). Restarting browser + rotating IP...`).catch(() => { });
         clearApplicantIpCache();
         await relaunchChromeAfterCredentialSwapLogout();
@@ -1774,7 +1839,16 @@ async function loginWithForbiddenRecovery(instanceId?: number): Promise<void> {
       if (err instanceof PageNotFoundRestartError) {
         throw err;
       }
+      if (err instanceof IndDeuAccountRecreateError) {
+        await recreateIndDeuAccountAndRelogin(instanceId, err.code);
+        return;
+      }
       if (err instanceof VfsForbiddenError) {
+        const recreate = extractIndDeu4030xxFromUnknown(err);
+        if (recreate && isIndDeuRoute(config.slotPayload.countryCode, config.slotPayload.missionCode)) {
+          await recreateIndDeuAccountAndRelogin(instanceId, recreate);
+          return;
+        }
         forbiddenAttempts++;
         reporter.setPhase("recovering", `403 block — rotating IP + relogin (attempt ${forbiddenAttempts})`);
                 await telegram.alert("error", `Bot ${instanceId ?? "?"} got 403 during login (attempt ${forbiddenAttempts}/${MAX_FORBIDDEN_RETRIES}). Restarting browser + rotating IP...`).catch(() => { });
@@ -2251,6 +2325,10 @@ async function runOneBotCycleCore(meta: SubmitMeta): Promise<void> {
   // (no tab yet), the post-login resolve retries.
   await resolveAndReportEgressIp();
 
+  if (isIndDeuRoute(config.slotPayload.countryCode, config.slotPayload.missionCode)) {
+    await ensureIndDeuAccountIfNeeded(instanceId);
+  }
+
   let firstUrl = await browser.getFirstTabUrl();
   reporter.setPage(firstUrl);
   await checkUrlForPageNotFound(firstUrl, "after-chrome-launch");
@@ -2271,7 +2349,11 @@ async function runOneBotCycleCore(meta: SubmitMeta): Promise<void> {
   // The URL may look normal (/login, /dashboard) but the body is a block/error page.
   if (kind === "login" || kind === "dashboard" || kind === "vfs_other") {
     const blockKind = await browser.detectPageBlockKind();
-    if (blockKind === "account_429") {
+    if (blockKind === "account_recreate") {
+      await recreateIndDeuAccountAndRelogin(instanceId, "4030xx");
+      firstUrl = await browser.getFirstTabUrl();
+      kind = classifyVfsFirstTabUrl(firstUrl);
+    } else if (blockKind === "account_429") {
       await stopForAccountRateLimit(instanceId, "startup-page-block", "4290xx");
       return;
     }
@@ -2474,6 +2556,9 @@ function syncInstanceStoresFromDisk(): void {
 async function start(): Promise<void> {
   // In cluster mode, instances don't start their own server
   const isClusterMode = process.env.BOT_CLUSTER_MODE === "true";
+  if (!isClusterMode) {
+    beginIndDeuProcessSession();
+  }
 
   if (isClusterMode) {
     const myInstanceId = parseInt(process.env.BOT_INSTANCE_ID ?? "1", 10);
@@ -2647,6 +2732,24 @@ async function start(): Promise<void> {
       setApplicantDetailsOverrides(global0, 0);
       return { ok: true };
     },
+    setApiDelaySec: (sec) => {
+      if (!Number.isFinite(sec) || sec < 0) {
+        return { ok: false, error: "API delay must be at least 0 seconds." };
+      }
+      const global0 = getApplicantDetailsOverrides(0) ?? {};
+      global0.apiDelaySec = sec;
+      setApplicantDetailsOverrides(global0, 0);
+      return { ok: true };
+    },
+    setRepeatedDelaySec: (sec) => {
+      if (!Number.isFinite(sec) || sec < 1) {
+        return { ok: false, error: "409 delay must be at least 1 second." };
+      }
+      const global0 = getApplicantDetailsOverrides(0) ?? {};
+      global0.repeatedDelaySec = Math.floor(sec);
+      setApplicantDetailsOverrides(global0, 0);
+      return { ok: true };
+    },
     reloadGlobalSettings: () => {
       syncInstanceStoresFromDisk();
       return { ok: true };
@@ -2665,6 +2768,8 @@ async function start(): Promise<void> {
         applicantsJoinStaggerSec: resolveApplicantsJoinStaggerSec(globalDet),
         calendarPollingIntervalSec: globalDet && typeof globalDet.calendarPollingInterval === "number" && globalDet.calendarPollingInterval >= 1
           ? Math.floor(globalDet.calendarPollingInterval) : 60,
+        apiDelaySec: resolveApiDelaySec(globalDet),
+        repeatedDelaySec: resolveRepeatedDelaySec(globalDet),
       };
     },
   };

@@ -63,6 +63,15 @@ export const config = {
     return process.env.VFS_LOGIN_PAGE_URL ?? process.env.VFS_LOGIN_ENDPOINT
       ?? `https://visa.vfsglobal.com/${resolvedCountryCode()}/en/${resolvedMissionCode()}/login`;
   },
+  get registerPageUrl(): string {
+    const det = resolvedFormDetails();
+    const formCountry = typeof det?.countryCode === "string" ? det.countryCode.trim().toLowerCase() : "";
+    const formMission = typeof det?.missionCode === "string" ? det.missionCode.trim().toLowerCase() : "";
+    if (formCountry && formMission) {
+      return `https://visa.vfsglobal.com/${formCountry}/en/${formMission}/register`;
+    }
+    return `https://visa.vfsglobal.com/${resolvedCountryCode()}/en/${resolvedMissionCode()}/register`;
+  },
   slotEndpoint: process.env.VFS_SLOT_ENDPOINT ?? "https://lift-api.vfsglobal.com/appointment/CheckIsSlotAvailable",
   /** Base slot-check payload (center & visa category are set at runtime via the setup form). */
   slotPayload: {

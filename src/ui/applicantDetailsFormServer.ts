@@ -8,6 +8,7 @@ import {
   getAllInstanceApplicantDetails,
 } from "../utils/applicantDetails.store";
 import { isIndDeuRoute } from "../utils/vfsRoute";
+import { preserveIndDeuInternalFields } from "../utils/indDeuAccountState";
 import { applyIndDeuPhoneToInstanceFields } from "../utils/indDeuPhone";
 import { getSessionLoginCredentials, setSessionLoginCredentials, getAllInstanceCredentials } from "../utils/sessionLogin.store";
 import { buildApplicantFormPageScript } from "./applicantDetailsFormClientScript";
@@ -194,6 +195,8 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
     "missionCode",
     "helloVerifyNumber",
     "juridictionCode",
+    "indDeuEmailPrefix",
+    "indDeuEmailDomain",
   ] as const;
   for (const k of keys) {
     const v = str(k);
@@ -237,6 +240,18 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
   } else if (typeof j.applicantsJoinStaggerSec === "string" && j.applicantsJoinStaggerSec.trim() !== "") {
     const v = parseFloat(j.applicantsJoinStaggerSec);
     if (Number.isFinite(v) && v >= 0.1) out.applicantsJoinStaggerSec = v;
+  }
+  if (typeof j.apiDelaySec === "number" && Number.isFinite(j.apiDelaySec) && j.apiDelaySec >= 0) {
+    out.apiDelaySec = j.apiDelaySec;
+  } else if (typeof j.apiDelaySec === "string" && j.apiDelaySec.trim() !== "") {
+    const v = parseFloat(j.apiDelaySec);
+    if (Number.isFinite(v) && v >= 0) out.apiDelaySec = v;
+  }
+  if (typeof j.repeatedDelaySec === "number" && Number.isFinite(j.repeatedDelaySec) && j.repeatedDelaySec >= 1) {
+    out.repeatedDelaySec = Math.floor(j.repeatedDelaySec);
+  } else if (typeof j.repeatedDelaySec === "string" && j.repeatedDelaySec.trim() !== "") {
+    const v = parseInt(j.repeatedDelaySec, 10);
+    if (Number.isFinite(v) && v >= 1) out.repeatedDelaySec = v;
   }
   if (typeof j.postLoginPollDelay === "number" && Number.isFinite(j.postLoginPollDelay) && j.postLoginPollDelay >= 0) {
     out.postLoginPollDelay = Math.floor(j.postLoginPollDelay);
@@ -301,7 +316,16 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
     </div>
     <label for="userPollInterval" style="margin-top:0.75rem">Poll interval (seconds)</label>
     <input type="number" id="userPollInterval" name="userPollInterval" min="1" value="${defaultPollIntervalSec}" />
-    
+    <div class="row2">
+      <div>
+        <label for="apiDelaySec" style="margin-top:0.75rem">API delay (seconds)</label>
+        <input type="number" id="apiDelaySec" name="apiDelaySec" min="0" step="0.1" value="0" />
+      </div>
+      <div>
+        <label for="repeatedDelaySec" style="margin-top:0.75rem">409 delay (seconds)</label>
+        <input type="number" id="repeatedDelaySec" name="repeatedDelaySec" min="1" value="35" />
+      </div>
+    </div>
     <div class="row2">
       <div>
         <label for="apologiesIntervalSec" style="margin-top:0.75rem">Apologies interval (seconds)</label>
@@ -372,6 +396,22 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
     </div>
   </fieldset>`
     : "";
+
+  const indDeuEmailPrefixBlock = `
+  <fieldset id="indDeuEmailPrefixFields" style="display:none;border:1px solid #38444d;border-radius:8px;padding:1rem 1rem 0.25rem;margin:0 0 1.25rem">
+    <legend style="color:#8b98a5;font-size:0.9rem">India → Germany account email</legend>
+    <div class="row2">
+      <div>
+        <label for="indDeuEmailPrefix">Email prefix (global)</label>
+        <input id="indDeuEmailPrefix" name="indDeuEmailPrefix" placeholder="tiger" autocomplete="off" />
+      </div>
+      <div>
+        <label for="indDeuEmailDomain">Email domain (global)</label>
+        <input id="indDeuEmailDomain" name="indDeuEmailDomain" placeholder="mail.tm" autocomplete="off" />
+      </div>
+    </div>
+    <p class="hint">Uses prefix_001@domain (login only). If missing, creates prefix_001_r1, _r2, … Password is always 123qwe!Q.</p>
+  </fieldset>`;
 
   const title = collectLogin ? "VFS bot — login & applicant" : "VFS bot — applicant details";
 
@@ -493,6 +533,7 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
       <div class="form-col form-col--setup">
         ${instanceSelectBlock}
         ${loginBlock}
+        ${indDeuEmailPrefixBlock}
       </div>
       <div class="form-col form-col--details">
         <h2 class="col-heading">Applicant details</h2>
@@ -508,16 +549,17 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
               <input id="lastName" name="lastName" placeholder="Doe" />
             </div>
           </div>
-          <div class="row2">
-            <div>
+          <div id="manualDobPassportRow" class="row2">
+            <div id="manualDobWrap">
               <label for="dateOfBirth">Date of birth (DD/MM/YYYY)</label>
               <input id="dateOfBirth" name="dateOfBirth" placeholder="15/06/1990" />
             </div>
-            <div>
+            <div id="manualPassportNumberWrap">
               <label for="passportNumber">Passport number</label>
               <input id="passportNumber" name="passportNumber" placeholder="A12345678" />
             </div>
           </div>
+          <div id="indDeuDobRow" class="row2" style="display:none"></div>
           <div id="manualDialContactFields" class="row2">
             <div>
               <label for="dialCode">Dial code</label>
@@ -529,12 +571,12 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
             </div>
           </div>
         </div>
-        <div class="row3">
-          <div>
+        <div class="row3" id="applicantMetaRow">
+          <div id="passportExpiryFieldWrap">
             <label for="passportExpirtyDate">Passport expiry (DD/MM/YYYY)</label>
             <input id="passportExpirtyDate" name="passportExpirtyDate" placeholder="23/04/2027" />
           </div>
-          <div>
+          <div id="nationalityFieldWrap">
             <label for="nationalityCode">Nationality</label>
             <select id="nationalityCode" name="nationalityCode">
           <option value="">-- Select Nationality --</option>
@@ -760,7 +802,7 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
           <option value="ZWE">ZIMBABWE</option>
         </select>
           </div>
-          <div>
+          <div id="genderFieldWrap">
             <label for="gender">Gender</label>
             <select id="gender" name="gender">
               <option value="1">MALE</option>
@@ -1034,6 +1076,16 @@ export function runApplicantFormWithSubmitHandler(
                 json(res, 200, monitor.setCalendarPollingIntervalSec(Number.isFinite(sec) ? sec : 60));
                 return;
               }
+              if (action === "api-delay") {
+                const sec = typeof mj.intervalSec === "number" ? mj.intervalSec : parseFloat(String(mj.intervalSec ?? ""));
+                json(res, 200, monitor.setApiDelaySec(Number.isFinite(sec) ? sec : 0));
+                return;
+              }
+              if (action === "repeated-delay") {
+                const sec = toNum(mj.intervalSec);
+                json(res, 200, monitor.setRepeatedDelaySec(Number.isFinite(sec) ? sec : 35));
+                return;
+              }
               if (action === "start") {
                 const count = toNum(mj.count);
                 const ms = toNum(mj.intervalMs);
@@ -1082,6 +1134,18 @@ export function runApplicantFormWithSubmitHandler(
             }
             if (globalDet && typeof globalDet.calendarPollingInterval === "number") {
               defaults.calendarPollingInterval = globalDet.calendarPollingInterval;
+            }
+            if (globalDet && typeof globalDet.apiDelaySec === "number") {
+              defaults.apiDelaySec = globalDet.apiDelaySec;
+            }
+            if (globalDet && typeof globalDet.repeatedDelaySec === "number") {
+              defaults.repeatedDelaySec = globalDet.repeatedDelaySec;
+            }
+            if (globalDet && typeof globalDet.indDeuEmailPrefix === "string") {
+              defaults.indDeuEmailPrefix = globalDet.indDeuEmailPrefix;
+            }
+            if (globalDet && typeof globalDet.indDeuEmailDomain === "string") {
+              defaults.indDeuEmailDomain = globalDet.indDeuEmailDomain;
             }
             const payload: Record<string, unknown> = { ok: true, defaults };
             if (collectLogin) {
@@ -1163,6 +1227,8 @@ export function runApplicantFormWithSubmitHandler(
             staggerIntervalSec: sis,
             calendarPollingStartDate: cpsd,
             calendarPollingInterval: cpi,
+            apiDelaySec: ads,
+            repeatedDelaySec: rds,
             ...instanceFields
           } = fields;
 
@@ -1181,13 +1247,30 @@ export function runApplicantFormWithSubmitHandler(
             if (typeof cpsd === "string") { global0.calendarPollingStartDate = cpsd; changed = true; }
             else if ("calendarPollingStartDate" in rest) { delete global0.calendarPollingStartDate; changed = true; }
             if (typeof cpi === "number") { global0.calendarPollingInterval = cpi; changed = true; }
+            if (typeof ads === "number") { global0.apiDelaySec = ads; changed = true; }
+            if (typeof rds === "number") { global0.repeatedDelaySec = rds; changed = true; }
             if (typeof instanceFields.countryCode === "string") { global0.countryCode = instanceFields.countryCode; changed = true; }
             if (typeof instanceFields.missionCode === "string") { global0.missionCode = instanceFields.missionCode; changed = true; }
+            if (typeof instanceFields.indDeuEmailPrefix === "string" && instanceFields.indDeuEmailPrefix.trim()) {
+              global0.indDeuEmailPrefix = instanceFields.indDeuEmailPrefix.trim();
+              changed = true;
+            }
+            if (typeof instanceFields.indDeuEmailDomain === "string" && instanceFields.indDeuEmailDomain.trim()) {
+              global0.indDeuEmailDomain = instanceFields.indDeuEmailDomain.trim().replace(/^@+/, "");
+              changed = true;
+            }
             if (changed) setApplicantDetailsOverrides(global0, 0);
           }
           const id = instanceId ?? 0;
+          if (typeof instanceFields.indDeuEmailPrefix === "string") {
+            delete instanceFields.indDeuEmailPrefix;
+          }
+          if (typeof instanceFields.indDeuEmailDomain === "string") {
+            delete instanceFields.indDeuEmailDomain;
+          }
           if (isIndDeuRoute(instanceFields.countryCode, instanceFields.missionCode)) {
             applyIndDeuPhoneToInstanceFields(instanceFields, id);
+            preserveIndDeuInternalFields(instanceFields, id);
             delete instanceFields.vacCode2;
             delete instanceFields.selectedSubvisaCategory2;
           }
@@ -1251,12 +1334,30 @@ export function runApplicantFormWithSubmitHandler(
               ? j.calendarPollingStartDate.trim()
               : undefined;
 
+          const submittedApiDelaySec =
+            typeof j.apiDelaySec === "number" && j.apiDelaySec >= 0
+              ? j.apiDelaySec
+              : (() => {
+                  const v = parseFloat(String(j.apiDelaySec ?? ""));
+                  return Number.isFinite(v) && v >= 0 ? v : undefined;
+                })();
+
+          const submittedRepeatedDelaySec =
+            typeof j.repeatedDelaySec === "number" && j.repeatedDelaySec >= 1
+              ? Math.floor(j.repeatedDelaySec)
+              : (() => {
+                  const v = parseInt(String(j.repeatedDelaySec ?? ""), 10);
+                  return Number.isFinite(v) && v >= 1 ? v : undefined;
+                })();
+
           if (
             submittedApologiesIntervalSec != null ||
             submittedApplicantsJoinStaggerSec != null ||
             submittedStaggerSec != null ||
             typeof j.userPollInterval === "number" ||
             submittedCalendarPollingInterval != null ||
+            submittedApiDelaySec != null ||
+            submittedRepeatedDelaySec != null ||
             "calendarPollingStartDate" in j
           ) {
             const global0 = getApplicantDetailsOverrides(0) ?? {};
@@ -1282,6 +1383,14 @@ export function runApplicantFormWithSubmitHandler(
               global0.calendarPollingInterval = submittedCalendarPollingInterval;
               changed = true;
             }
+            if (submittedApiDelaySec != null) {
+              global0.apiDelaySec = submittedApiDelaySec;
+              changed = true;
+            }
+            if (submittedRepeatedDelaySec != null) {
+              global0.repeatedDelaySec = submittedRepeatedDelaySec;
+              changed = true;
+            }
             if ("calendarPollingStartDate" in j) {
               if (submittedCalendarPollingStartDate != null) {
                 global0.calendarPollingStartDate = submittedCalendarPollingStartDate;
@@ -1291,6 +1400,19 @@ export function runApplicantFormWithSubmitHandler(
               changed = true;
             }
             if (changed) setApplicantDetailsOverrides(global0, 0);
+          }
+
+          {
+            const prefixFromSubmit =
+              typeof j.indDeuEmailPrefix === "string" ? j.indDeuEmailPrefix.trim() : "";
+            const domainFromSubmit =
+              typeof j.indDeuEmailDomain === "string" ? j.indDeuEmailDomain.trim().replace(/^@+/, "") : "";
+            if (prefixFromSubmit || domainFromSubmit) {
+              const global0 = getApplicantDetailsOverrides(0) ?? {};
+              if (prefixFromSubmit) global0.indDeuEmailPrefix = prefixFromSubmit;
+              if (domainFromSubmit) global0.indDeuEmailDomain = domainFromSubmit;
+              setApplicantDetailsOverrides(global0, 0);
+            }
           }
 
           const credentials = getAllInstanceCredentials();
@@ -1310,6 +1432,21 @@ export function runApplicantFormWithSubmitHandler(
             const dets = details.get(instanceId);
             if (!dets) continue;
             if (isIndDeuRoute(dets.countryCode, dets.missionCode)) {
+              const g0 = getApplicantDetailsOverrides(0) ?? {};
+              const prefix =
+                (typeof g0.indDeuEmailPrefix === "string" ? g0.indDeuEmailPrefix.trim() : "") ||
+                (typeof j.indDeuEmailPrefix === "string" ? j.indDeuEmailPrefix.trim() : "");
+              const domain =
+                (typeof g0.indDeuEmailDomain === "string" ? g0.indDeuEmailDomain.trim() : "") ||
+                (typeof j.indDeuEmailDomain === "string" ? j.indDeuEmailDomain.trim() : "");
+              if (!prefix) {
+                json(res, 400, { ok: false, error: "Email prefix is required for India → Germany." });
+                return;
+              }
+              if (!domain) {
+                json(res, 400, { ok: false, error: "Email domain is required for India → Germany." });
+                return;
+              }
               validInstanceIds.push(instanceId);
               continue;
             }

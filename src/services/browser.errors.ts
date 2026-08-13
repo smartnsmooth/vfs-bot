@@ -16,6 +16,18 @@ export class VfsForbiddenError extends Error {
         this.name = "VfsForbiddenError";
     }
 }
+/**
+ * ind-deu only: 4030xx (4030 + two digits). Close browser, new IP, new account.
+ * Not used for 403101 / 403201 / bare HTTP 403.
+ */
+export class IndDeuAccountRecreateError extends Error {
+    readonly code: string;
+    constructor(code: string, message?: string) {
+        super(message ?? `ind-deu account recreate (${code})`);
+        this.name = "IndDeuAccountRecreateError";
+        this.code = code;
+    }
+}
 /** Thrown when a VFS API returns HTTP 504 Gateway Timeout — caller should restart browser + rotate IP + re-login. */
 export class VfsGatewayTimeoutError extends Error {
     constructor(message: string) {

@@ -8,8 +8,10 @@ import {
   VfsForbiddenError,
   VfsGatewayTimeoutError,
   VfsRateLimitedError,
+  IndDeuAccountRecreateError,
   isFailedToFetchError,
 } from "./browser.service";
+import { extractIndDeu4030xx, isIndDeu4030xx } from "../utils/vfs4030";
 
 export interface PollResult {
   slot: Slot | null;
@@ -26,6 +28,9 @@ export interface PollResult {
   rateLimitedIp?: boolean;
   rateLimitCode?: string;
   forbidden?: boolean;     // true when API returns 403 — needs full browser restart + IP rotation
+  /** ind-deu 4030xx — new account (not hard relogin) */
+  accountRecreate?: boolean;
+  forbiddenCode?: string;
   gatewayTimeout?: boolean; // true when API returns 504 — needs full browser restart + IP rotation + re-login
   /** Cloudflare "Just a moment..." / 403201 — clear session, rotate IP, restart Chrome + relogin */
   cloudflareChallenge?: boolean;
@@ -88,7 +93,7 @@ export class PollingService {
                   : status === 504
                       ? "504 Gateway Timeout. Restarting browser + rotating IP."
                       : status === 403
-                        ? "403 Forbidden. IP/session blocked by Cloudflare or VFS."
+                        ? (extractIndDeu4030xx(String(status)) ? `4030xx Forbidden.` : "403 Forbidden. IP/session blocked by Cloudflare or VFS.")
                         : `API returned non-JSON (status ${status}).`,
               type: "Error",
             },
@@ -104,6 +109,19 @@ export class PollingService {
       }
       // 403201 / Cloudflare interstitial — clear session, rotate IP, restart Chrome.
       const codeStr = String((data as { code?: string | number }).code ?? data.error?.code ?? "");
+      if (isIndDeu4030xx(codeStr)) {
+        return {
+          slot: null,
+          forbidden: true,
+          accountRecreate: true,
+          forbiddenCode: codeStr,
+          response: {
+            earliestDate: null,
+            earliestSlotLists: [],
+            error: { code: -1, description: `ind-deu account recreate (${codeStr})`, type: "Error" },
+          },
+        };
+      }
       const is403201 = codeStr.startsWith("403201");
       if (isCfChallenge || is403201) {
         return {
@@ -137,6 +155,8 @@ export class PollingService {
                 return {
           slot: null,
           forbidden: true,
+          accountRecreate: isIndDeu4030xx(codeStr),
+          forbiddenCode: isIndDeu4030xx(codeStr) ? codeStr : undefined,
           response: {
             earliestDate: null,
             earliestSlotLists: [],
@@ -196,7 +216,9 @@ export class PollingService {
       }
       const apiError = normalizeApiError(data);
       if (apiError) {
-        const is403201 = String((data as { code?: string | number }).code ?? data.error?.code ?? "").startsWith("403201");
+        const apiCodeStr = String((data as { code?: string | number }).code ?? data.error?.code ?? "");
+        const is403201 = apiCodeStr.startsWith("403201");
+        const recreate = isIndDeu4030xx(apiCodeStr) || !!extractIndDeu4030xx(apiError.message);
         return {
           slot: null,
           unauthorized: apiError.unauthorized,
@@ -205,6 +227,8 @@ export class PollingService {
           rateLimitedIp: apiError.rateLimitedIp,
           rateLimitCode: apiError.rateLimitCode,
           forbidden: is403201 ? false : apiError.forbidden,
+          accountRecreate: recreate,
+          forbiddenCode: recreate ? (isIndDeu4030xx(apiCodeStr) ? apiCodeStr : extractIndDeu4030xx(apiError.message) ?? undefined) : undefined,
           cloudflareChallenge: is403201 ? true : undefined,
           response: {
             earliestDate: null,
@@ -247,18 +271,56 @@ export class PollingService {
           },
         };
       }
-      if (err instanceof VfsForbiddenError && /cloudflare/i.test(err.message)) {
+      if (err instanceof IndDeuAccountRecreateError) {
         return {
           slot: null,
-          cloudflareChallenge: true,
+          forbidden: true,
+          accountRecreate: true,
+          forbiddenCode: err.code,
           response: {
             earliestDate: null,
             earliestSlotLists: [],
-            error: {
-              code: -1,
-              description: "cloudflareChallenge — clearing session, rotating IP, restarting Chrome.",
-              type: "Error",
+            error: { code: -1, description: err.message, type: "Error" },
+          },
+        };
+      }
+      if (err instanceof VfsForbiddenError) {
+        const recreate = extractIndDeu4030xx(err.message);
+        if (recreate) {
+          return {
+            slot: null,
+            forbidden: true,
+            accountRecreate: true,
+            forbiddenCode: recreate,
+            response: {
+              earliestDate: null,
+              earliestSlotLists: [],
+              error: { code: -1, description: err.message, type: "Error" },
             },
+          };
+        }
+        if (/cloudflare/i.test(err.message)) {
+          return {
+            slot: null,
+            cloudflareChallenge: true,
+            response: {
+              earliestDate: null,
+              earliestSlotLists: [],
+              error: {
+                code: -1,
+                description: "cloudflareChallenge — clearing session, rotating IP, restarting Chrome.",
+                type: "Error",
+              },
+            },
+          };
+        }
+        return {
+          slot: null,
+          forbidden: true,
+          response: {
+            earliestDate: null,
+            earliestSlotLists: [],
+            error: { code: -1, description: err.message, type: "Error" },
           },
         };
       }

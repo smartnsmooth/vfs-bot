@@ -1,6 +1,9 @@
 node_modules/
 dist/
 instances-data.json
+ind-deu-email-index.json
+ind-deu-email-index.lock
+ind-deu-process-session.json
 applicants-coord.json
 calendar-booking-coord.json
 fleet-poll-coord.json
