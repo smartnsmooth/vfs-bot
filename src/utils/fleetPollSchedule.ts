@@ -55,7 +55,7 @@ export function getApiDelayMs(): number {
 export const DEFAULT_REPEATED_DELAY_SEC = 35;
 export const REPEATED_DELAY_STEP_SEC = 5;
 
-/** Setup-form / Monitor "409 delay" — first sleep after 409 Repeated Delay. */
+/** Setup-form / Monitor "409 delay" — first sleep after any HTTP 409. */
 export function resolveRepeatedDelaySec(details?: Record<string, unknown> | null): number {
   const globalDet = details ?? getApplicantDetailsOverrides(0);
   if (!globalDet) return DEFAULT_REPEATED_DELAY_SEC;

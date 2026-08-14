@@ -253,6 +253,10 @@ const APPLICANT_UI_ONLY_KEYS = [
   "calendarPollingInterval",
   "apiDelaySec",
   "repeatedDelaySec",
+  "heroSmsActivationId",
+  "heroSmsLastCode",
+  "heroSmsPurchasedAt",
+  "indDeuProcessSessionId",
 ] as const;
 
 /**

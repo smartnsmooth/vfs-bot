@@ -108,9 +108,8 @@ export const config = {
   loginOnly: process.env.VFS_LOGIN_ONLY === "true" || process.env.VFS_LOGIN_ONLY === "1",
 
   /**
-   * After this many poll rounds, log out and re-login so the VFS session is refreshed.
-   * A fresh session resets the server-side 429 rate-limit counter.
-   * 0 = disabled (never relogin mid-poll).
+   * After this many CheckIsSlotAvailable calls, hard-relogin (fresh session / 429 reset).
+   * 0 = disabled. Also used as applicants 10673 retry count before hard relogin.
    */
   pollReloginInterval: (() => {
     const raw = parseInt(process.env.VFS_POLL_RELOGIN_INTERVAL ?? "0", 10);

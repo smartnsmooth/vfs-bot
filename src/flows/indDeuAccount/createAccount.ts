@@ -17,6 +17,7 @@ import {
   clearIndDeuCreatedAccount,
   getIndDeuEmailDomain,
   getIndDeuEmailPrefix,
+  persistHeroSmsPurchase,
   persistIndDeuCreatedAccount,
   shouldReuseIndDeuAccount,
 } from "../../utils/indDeuAccountState";
@@ -101,7 +102,7 @@ export async function ensureIndDeuAccountReady(
   },
 ): Promise<void> {
   if (!opts?.forceNew && shouldReuseIndDeuAccount(instanceId)) {
-    reporter.setPhase("login", "reusing ind-deu account from this process");
+    reporter.setPhase("login", "reusing ind-deu account");
     return;
   }
 
@@ -145,6 +146,7 @@ export async function ensureIndDeuAccountReady(
         phone = await heroSmsBuyGermanyOt({
           onRetry: (msg) => reporter.setDetail(msg),
         });
+        persistHeroSmsPurchase(instanceId, phone);
 
         reporter.setPhase("launching", `opening register — ${email}`);
         await browser.openRegisterInFirstTab();

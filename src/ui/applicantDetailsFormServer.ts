@@ -1271,8 +1271,6 @@ export function runApplicantFormWithSubmitHandler(
           if (isIndDeuRoute(instanceFields.countryCode, instanceFields.missionCode)) {
             applyIndDeuPhoneToInstanceFields(instanceFields, id);
             preserveIndDeuInternalFields(instanceFields, id);
-            delete instanceFields.vacCode2;
-            delete instanceFields.selectedSubvisaCategory2;
           }
           setApplicantDetailsOverrides(instanceFields, id);
 

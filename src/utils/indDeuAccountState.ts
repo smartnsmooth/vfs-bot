@@ -6,9 +6,48 @@ import {
 import { getSessionLoginCredentials, setSessionLoginCredentials, clearSessionLoginCredentials } from "./sessionLogin.store";
 import { getIndDeuProcessSessionId } from "./indDeuProcessSession";
 import { hasStoredApplicantPhone } from "./indDeuPhone";
-import { heroSmsCancel } from "../services/heroSms";
+import { heroSmsCancel, type HeroSmsNumber } from "../services/heroSms";
 
 export const IND_DEU_ACCOUNT_PASSWORD = "123qwe!Q";
+
+/** Relogin recreate + restart reuse threshold. Default 15 minutes. */
+export function getIndDeuPhoneTtlMs(): number {
+  const raw = parseInt(process.env.IND_DEU_PHONE_TTL_MINUTES ?? "15", 10);
+  const minutes = Number.isFinite(raw) && raw >= 1 ? Math.floor(raw) : 15;
+  return minutes * 60_000;
+}
+
+export function getHeroSmsPurchasedAt(instanceId?: number): number | null {
+  const d = getApplicantDetailsOverrides(instanceId) ?? {};
+  const n = typeof d.heroSmsPurchasedAt === "number" ? d.heroSmsPurchasedAt : Number(d.heroSmsPurchasedAt);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+export function getHeroSmsPhoneAgeMs(instanceId?: number): number | null {
+  const at = getHeroSmsPurchasedAt(instanceId);
+  if (at == null) return null;
+  return Math.max(0, Date.now() - at);
+}
+
+/** True when the HeroSMS number is too old for a plain relogin (missing stamp counts as expired). */
+export function isIndDeuPhoneExpiredForRelogin(instanceId?: number): boolean {
+  const age = getHeroSmsPhoneAgeMs(instanceId);
+  if (age == null) return true;
+  return age >= getIndDeuPhoneTtlMs();
+}
+
+/** Record purchase time immediately when a HeroSMS number is bought. */
+export function persistHeroSmsPurchase(instanceId: number | undefined, phone: HeroSmsNumber): void {
+  patchApplicantDetailsOverrides(
+    {
+      dialCode: phone.dialCode,
+      contactNumber: phone.localNumber,
+      heroSmsActivationId: phone.activationId,
+      heroSmsPurchasedAt: Date.now(),
+    },
+    instanceId,
+  );
+}
 
 export function getIndDeuEmailPrefix(): string {
   const g = getApplicantDetailsOverrides(0) ?? {};
@@ -43,16 +82,22 @@ export function getStoredHeroSmsLastCode(instanceId?: number): string {
 }
 
 export function shouldReuseIndDeuAccount(instanceId?: number): boolean {
+  const creds = getSessionLoginCredentials(instanceId);
+  if (!creds?.username?.trim() || !creds.password) return false;
+  const d = getApplicantDetailsOverrides(instanceId) ?? {};
+  if (!hasStoredApplicantPhone(d)) return false;
+  if (!getStoredHeroSmsActivationId(instanceId)) return false;
+
+  const age = getHeroSmsPhoneAgeMs(instanceId);
+  if (age != null) {
+    return age < getIndDeuPhoneTtlMs();
+  }
+
   const processId = getIndDeuProcessSessionId();
   if (!processId) return false;
-  const d = getApplicantDetailsOverrides(instanceId) ?? {};
   const storedSession =
     typeof d.indDeuProcessSessionId === "string" ? d.indDeuProcessSessionId.trim() : "";
   if (!storedSession || storedSession !== processId) return false;
-  const creds = getSessionLoginCredentials(instanceId);
-  if (!creds?.username?.trim() || !creds.password) return false;
-  if (!hasStoredApplicantPhone(d)) return false;
-  if (!getStoredHeroSmsActivationId(instanceId)) return false;
   return true;
 }
 
@@ -75,6 +120,7 @@ export function persistIndDeuCreatedAccount(
       contactNumber: opts.contactNumber,
       heroSmsActivationId: opts.heroSmsActivationId,
       heroSmsLastCode: opts.heroSmsLastCode ?? "",
+      heroSmsPurchasedAt: getHeroSmsPurchasedAt(instanceId) ?? Date.now(),
       indDeuProcessSessionId: processId ?? "",
     },
     instanceId,
@@ -89,6 +135,7 @@ export function preserveIndDeuInternalFields(
   const keys = [
     "heroSmsActivationId",
     "heroSmsLastCode",
+    "heroSmsPurchasedAt",
     "indDeuProcessSessionId",
     "dialCode",
     "contactNumber",
@@ -117,6 +164,7 @@ export function clearIndDeuCreatedAccount(instanceId?: number): void {
   delete next.contactNumber;
   delete next.heroSmsActivationId;
   delete next.heroSmsLastCode;
+  delete next.heroSmsPurchasedAt;
   delete next.indDeuProcessSessionId;
   setApplicantDetailsOverrides(next, instanceId);
 }

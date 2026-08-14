@@ -248,24 +248,12 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     if (prefixWrap) prefixWrap.style.display = on ? "" : "none";
     var acct2 = document.getElementById("loginAccount2Fields");
     if (acct2) acct2.style.display = on ? "none" : "";
-    var center2 = document.getElementById("center2Fields");
-    if (center2) center2.style.display = on ? "none" : "";
     layoutIndDeuApplicantFields();
     if (!on) return;
     var u2 = document.getElementById("vfsUsername2");
     var p2 = document.getElementById("vfsPassword2");
-    var v2 = document.getElementById("vacCode2");
-    var c2 = document.getElementById("selectedSubvisaCategory2");
     if (u2) u2.value = "";
     if (p2) p2.value = "";
-    if (v2) v2.value = "";
-    if (c2) {
-      c2.innerHTML = "";
-      var ph = document.createElement("option");
-      ph.value = "";
-      ph.textContent = "-- Select Category --";
-      c2.appendChild(ph);
-    }
   }
 
   function updateIndDeuUppercaseStyle() {
@@ -523,13 +511,11 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     }
 
     if (inst.details) {
-      const skipDetailIds = { numInstances: true, instanceId: true, vfsUsername2: true, vfsPassword2: true, countryCode: true, missionCode: true, heroSmsActivationId: true, heroSmsLastCode: true, indDeuProcessSessionId: true, indDeuEmailPrefix: true, indDeuEmailDomain: true };
+      const skipDetailIds = { numInstances: true, instanceId: true, vfsUsername2: true, vfsPassword2: true, countryCode: true, missionCode: true, heroSmsActivationId: true, heroSmsLastCode: true, heroSmsPurchasedAt: true, indDeuProcessSessionId: true, indDeuEmailPrefix: true, indDeuEmailDomain: true };
       var loadRouteKey = String(inst.details.countryCode || "") + "-" + String(inst.details.missionCode || "");
       if (loadRouteKey === "ind-deu") {
         skipDetailIds.dialCode = true;
         skipDetailIds.contactNumber = true;
-        skipDetailIds.vacCode2 = true;
-        skipDetailIds.selectedSubvisaCategory2 = true;
       }
       const ccEl = document.getElementById("countryCode");
       if (ccEl && inst.details.countryCode) ccEl.value = String(inst.details.countryCode);
@@ -552,13 +538,11 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       updateCategoryOptions("vacCode", "selectedSubvisaCategory");
       var sc1El = document.getElementById("selectedSubvisaCategory");
       if (sc1El && inst.details.selectedSubvisaCategory) sc1El.value = String(inst.details.selectedSubvisaCategory);
-      if (loadRouteKey !== "ind-deu") {
-        var vc2El = document.getElementById("vacCode2");
-        if (vc2El && inst.details.vacCode2) vc2El.value = String(inst.details.vacCode2);
-        updateCategoryOptions("vacCode2", "selectedSubvisaCategory2");
-        var sc2El = document.getElementById("selectedSubvisaCategory2");
-        if (sc2El && inst.details.selectedSubvisaCategory2) sc2El.value = String(inst.details.selectedSubvisaCategory2);
-      }
+      var vc2El = document.getElementById("vacCode2");
+      if (vc2El && inst.details.vacCode2) vc2El.value = String(inst.details.vacCode2);
+      updateCategoryOptions("vacCode2", "selectedSubvisaCategory2");
+      var sc2El = document.getElementById("selectedSubvisaCategory2");
+      if (sc2El && inst.details.selectedSubvisaCategory2) sc2El.value = String(inst.details.selectedSubvisaCategory2);
 
       var routeKeyForLoad = loadRouteKey;
       if (routeKeyForLoad === "ind-deu") {
@@ -669,8 +653,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       vacCode: fd.get("vacCode"),
       gender: parseInt(String(fd.get("gender") || "1"), 10),
       selectedSubvisaCategory: fd.get("selectedSubvisaCategory"),
-      vacCode2: isIndDeu ? undefined : (fd.get("vacCode2") || undefined),
-      selectedSubvisaCategory2: isIndDeu ? undefined : (fd.get("selectedSubvisaCategory2") || undefined),
+      vacCode2: fd.get("vacCode2") || undefined,
+      selectedSubvisaCategory2: fd.get("selectedSubvisaCategory2") || undefined,
       firstName: firstNameSave || undefined,
       lastName: lastNameSave || undefined,
       dateOfBirth: String(fd.get("dateOfBirth") || "").trim() || undefined,
@@ -944,8 +928,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       vacCode: fd.get("vacCode"),
       gender: parseInt(String(fd.get("gender") || "1"), 10),
       selectedSubvisaCategory: fd.get("selectedSubvisaCategory"),
-      vacCode2: isIndDeu ? undefined : (fd.get("vacCode2") || undefined),
-      selectedSubvisaCategory2: isIndDeu ? undefined : (fd.get("selectedSubvisaCategory2") || undefined),
+      vacCode2: fd.get("vacCode2") || undefined,
+      selectedSubvisaCategory2: fd.get("selectedSubvisaCategory2") || undefined,
       firstName: firstNameSave || undefined,
       lastName: lastNameSave || undefined,
       dateOfBirth: dobRaw || undefined,

@@ -188,7 +188,7 @@ export interface MonitorControlState {
   calendarPollingIntervalSec: number;
   /** Seconds to wait before each lift-api POST. */
   apiDelaySec: number;
-  /** First sleep after HTTP 409 Repeated Delay (seconds); +5s each retry. */
+  /** First sleep after HTTP 409 (seconds); +5s each retry. */
   repeatedDelaySec: number;
 }
 
@@ -228,7 +228,7 @@ export interface MonitorHooks {
   setCalendarPollingIntervalSec(sec: number): { ok: boolean; error?: string };
   /** Set delay before each lift-api POST (seconds). */
   setApiDelaySec(sec: number): { ok: boolean; error?: string };
-  /** Set first 409 Repeated Delay sleep (seconds). */
+  /** Set first 409 sleep (seconds). */
   setRepeatedDelaySec(sec: number): { ok: boolean; error?: string };
   /** Reload global settings from disk on all running bots (after /api/save). */
   reloadGlobalSettings(): { ok: boolean };

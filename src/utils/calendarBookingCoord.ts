@@ -4,6 +4,7 @@
  * Shared state (JSON file) tracks:
  * - urnHolders: instances that got a URN from applicants
  * - feeCalculatorId: first URN holder → calls Calendar + Fees
+ *   (a prior 1037/1101 retire does not block this — URN wins)
  * - availableDateList: deduped dates from Calendar (consumed by instances for Timeslot)
  * - availableDatetimeList: date+time entries from Timeslot (consumed for Schedule)
  * - fees / totalAmount: published by FeeCalculator, used by all for Schedule
@@ -35,7 +36,7 @@ export interface CalendarBookingCoordState {
   /** Instance ids that finished save-applicants with a URN. */
   urnHolders: number[];
 
-  /** First URN holder = FeeCalculator. */
+  /** First URN holder = FeeCalculator. Prior already-booked does not override a later URN. */
   feeCalculatorId: number | null;
   firstApplicantsSuccessId: number | null;
 
@@ -239,7 +240,9 @@ export function dedupeCalendarDates(dates: string[]): string[] {
 export function registerFleetUrn(instanceId: number): CalendarBookingCoordState {
   const id = Math.max(1, Math.floor(instanceId));
   return updateCalendarBookingState((s) => {
-    if (s.retired.includes(id)) return false;
+    // URN is the source of truth: un-retire so a prior 1037/1101 cannot
+    // block this instance from being FeeCalculator (first URN holder).
+    s.retired = s.retired.filter((n) => n !== id);
     if (!s.urnHolders.includes(id)) s.urnHolders.push(id);
     s.urnHolders = [...new Set(s.urnHolders)].filter((n) => n >= 1).sort((a, b) => a - b);
     if (!s.waiters.includes(id)) s.waiters.push(id);

@@ -6,6 +6,8 @@ import {
   heroSmsWaitForSms,
   type HeroSmsNumber,
 } from "../../services/heroSms";
+import { getCurrentInstanceId } from "../../config/config";
+import { persistHeroSmsPurchase } from "../../utils/indDeuAccountState";
 import { dismissIndDeuCookies } from "./cookies";
 import { updateIndDeuRegisterPhone } from "./registerForm";
 import { submitIndDeuWithTurnstile } from "./turnstileSubmit";
@@ -135,6 +137,7 @@ export async function runIndDeuSmsVerify(
     await waitUntilPhoneField(page);
     await heroSmsCancel(phone.activationId);
     phone = await heroSmsBuyGermanyOt({ onRetry: opts.onStatus });
+    persistHeroSmsPurchase(getCurrentInstanceId(), phone);
     opts.onPhone(phone);
     await updateIndDeuRegisterPhone(page, phone, opts.check);
     await page.waitForTimeout(1200);

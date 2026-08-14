@@ -36,21 +36,8 @@ function getLiftApiPageContextFromSource(page: Page): { origin: string; referer:
 
 const REPEATED_DELAY_KINDS = new Set(["polling", "applicants", "calendar", "timeslot", "fees", "schedule"]);
 
-function isRepeatedDelayConflict(status: number, body: string): boolean {
-  if (status !== 409) return false;
-  try {
-    const parsed = JSON.parse(body) as { code?: unknown; description?: unknown; error?: unknown };
-    const src =
-      parsed && typeof parsed.error === "object" && parsed.error != null
-        ? (parsed.error as { code?: unknown; description?: unknown })
-        : parsed;
-    const code = typeof src.code === "number" ? src.code : parseInt(String(src.code ?? ""), 10);
-    if (code !== 31) return false;
-    const desc = typeof src.description === "string" ? src.description : "";
-    return /repeated\s*delay/i.test(desc);
-  } catch {
-    return false;
-  }
+function isHttp409(status: number): boolean {
+  return status === 409;
 }
 
 function assertVfsPageLoggedInForLiftApi(page: Page): void {
@@ -221,9 +208,9 @@ export async function postLiftJsonFromPage(
       bumpJoinStaggerOn504();
       continue;
     }
-    if (logKind && REPEATED_DELAY_KINDS.has(logKind) && isRepeatedDelayConflict(result.status, result.body)) {
+    if (logKind && REPEATED_DELAY_KINDS.has(logKind) && isHttp409(result.status)) {
       const sleepSec = Math.max(1, Math.round(repeatedDelayMs / 1000));
-      reporter.setDetail(`409 Repeated Delay — retry ${logKind} in ${sleepSec}s`);
+      reporter.setDetail(`409 — retry ${logKind} in ${sleepSec}s`);
       await new Promise<void>((r) => setTimeout(r, repeatedDelayMs));
       repeatedDelayMs += REPEATED_DELAY_STEP_SEC * 1000;
       continue;
