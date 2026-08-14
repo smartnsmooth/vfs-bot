@@ -12,9 +12,9 @@ import {
   type HeroSmsNumber,
 } from "../../services/heroSms";
 import {
-  IND_DEU_ACCOUNT_PASSWORD,
   cancelStoredHeroSms,
   clearIndDeuCreatedAccount,
+  getIndDeuAccountPassword,
   getIndDeuEmailDomain,
   getIndDeuEmailPrefix,
   persistHeroSmsPurchase,
@@ -118,10 +118,13 @@ export async function ensureIndDeuAccountReady(
     throw new Error("HERO_SMS_API_KEY is missing — add it to vfsbot .env.");
   }
 
+  const password = getIndDeuAccountPassword();
+  if (!password) {
+    throw new Error("ind-deu account password is missing — set it on the setup form.");
+  }
+
   await cancelStoredHeroSms(instanceId);
   clearIndDeuCreatedAccount(instanceId);
-
-  const password = IND_DEU_ACCOUNT_PASSWORD;
   let lastErr = "ind-deu register/SMS failed";
 
   for (let emailRound = 1; emailRound <= EMAIL_ROUND_MAX; emailRound++) {

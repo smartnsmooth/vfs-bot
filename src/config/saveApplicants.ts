@@ -257,6 +257,9 @@ const APPLICANT_UI_ONLY_KEYS = [
   "heroSmsLastCode",
   "heroSmsPurchasedAt",
   "indDeuProcessSessionId",
+  "indDeuEmailPrefix",
+  "indDeuEmailDomain",
+  "indDeuAccountPassword",
 ] as const;
 
 /**

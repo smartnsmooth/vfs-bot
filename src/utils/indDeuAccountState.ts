@@ -10,6 +10,18 @@ import { heroSmsCancel, type HeroSmsNumber } from "../services/heroSms";
 
 export const IND_DEU_ACCOUNT_PASSWORD = "123qwe!Q";
 
+export function getIndDeuAccountPassword(): string {
+  const g = getApplicantDetailsOverrides(0) ?? {};
+  const stored = typeof g.indDeuAccountPassword === "string" ? g.indDeuAccountPassword : "";
+  return stored || IND_DEU_ACCOUNT_PASSWORD;
+}
+
+export function setIndDeuAccountPassword(password: string): void {
+  const g = getApplicantDetailsOverrides(0) ?? {};
+  g.indDeuAccountPassword = password;
+  setApplicantDetailsOverrides(g, 0);
+}
+
 /** Relogin recreate + restart reuse threshold. Default 15 minutes. */
 export function getIndDeuPhoneTtlMs(): number {
   const raw = parseInt(process.env.IND_DEU_PHONE_TTL_MINUTES ?? "15", 10);

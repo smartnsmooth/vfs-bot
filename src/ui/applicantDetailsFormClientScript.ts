@@ -511,7 +511,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     }
 
     if (inst.details) {
-      const skipDetailIds = { numInstances: true, instanceId: true, vfsUsername2: true, vfsPassword2: true, countryCode: true, missionCode: true, heroSmsActivationId: true, heroSmsLastCode: true, heroSmsPurchasedAt: true, indDeuProcessSessionId: true, indDeuEmailPrefix: true, indDeuEmailDomain: true };
+      const skipDetailIds = { numInstances: true, instanceId: true, vfsUsername2: true, vfsPassword2: true, countryCode: true, missionCode: true, heroSmsActivationId: true, heroSmsLastCode: true, heroSmsPurchasedAt: true, indDeuProcessSessionId: true, indDeuEmailPrefix: true, indDeuEmailDomain: true, indDeuAccountPassword: true };
       var loadRouteKey = String(inst.details.countryCode || "") + "-" + String(inst.details.missionCode || "");
       if (loadRouteKey === "ind-deu") {
         skipDetailIds.dialCode = true;
@@ -620,6 +620,13 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       const gsrc = (globalInst && globalInst.details) || {};
       domainEl.value = gsrc.indDeuEmailDomain != null ? String(gsrc.indDeuEmailDomain) : "";
     }
+    const pwdEl = document.getElementById("indDeuAccountPassword");
+    if (pwdEl) {
+      const gsrc = (globalInst && globalInst.details) || {};
+      pwdEl.value = gsrc.indDeuAccountPassword != null && String(gsrc.indDeuAccountPassword) !== ""
+        ? String(gsrc.indDeuAccountPassword)
+        : "123qwe!Q";
+    }
 
     if (showAlert) {
       alert("Loaded saved data for Instance " + instanceId);
@@ -678,6 +685,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       juridictionCode: String(fd.get("juridictionCode") ?? "").trim() || undefined,
       indDeuEmailPrefix: isIndDeu ? String(fd.get("indDeuEmailPrefix") || "").trim() || undefined : undefined,
       indDeuEmailDomain: isIndDeu ? String(fd.get("indDeuEmailDomain") || "").trim().replace(/^@+/, "") || undefined : undefined,
+      indDeuAccountPassword: isIndDeu ? String(fd.get("indDeuAccountPassword") || "") || undefined : undefined,
     };
     if (!Number.isFinite(body.postLoginPollDelay) || body.postLoginPollDelay < 0) body.postLoginPollDelay = 30;
     if (!Number.isFinite(body.apologiesIntervalSec) || body.apologiesIntervalSec < 1) body.apologiesIntervalSec = 2;
@@ -913,6 +921,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       if (!expiryRaw) missing.push("Passport expiry");
       if (!String(fd.get("indDeuEmailPrefix") || "").trim()) missing.push("Email prefix");
       if (!String(fd.get("indDeuEmailDomain") || "").trim()) missing.push("Email domain");
+      if (!String(fd.get("indDeuAccountPassword") || "")) missing.push("Account password");
     }
     if (missing.length > 0) {
       msg.className = "err";
@@ -953,6 +962,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       juridictionCode: String(fd.get("juridictionCode") ?? "").trim() || undefined,
       indDeuEmailPrefix: isIndDeu ? String(fd.get("indDeuEmailPrefix") || "").trim() || undefined : undefined,
       indDeuEmailDomain: isIndDeu ? String(fd.get("indDeuEmailDomain") || "").trim().replace(/^@+/, "") || undefined : undefined,
+      indDeuAccountPassword: isIndDeu ? String(fd.get("indDeuAccountPassword") || "") || undefined : undefined,
     };
     if (!Number.isFinite(body.postLoginPollDelay) || body.postLoginPollDelay < 0) body.postLoginPollDelay = 30;
     if (!Number.isFinite(body.apologiesIntervalSec) || body.apologiesIntervalSec < 1) body.apologiesIntervalSec = 2;

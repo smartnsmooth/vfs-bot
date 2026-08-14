@@ -197,6 +197,7 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
     "juridictionCode",
     "indDeuEmailPrefix",
     "indDeuEmailDomain",
+    "indDeuAccountPassword",
   ] as const;
   for (const k of keys) {
     const v = str(k);
@@ -410,7 +411,13 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
         <input id="indDeuEmailDomain" name="indDeuEmailDomain" placeholder="mail.tm" autocomplete="off" />
       </div>
     </div>
-    <p class="hint">Uses prefix_001@domain (login only). If missing, creates prefix_001_r1, _r2, … Password is always 123qwe!Q.</p>
+    <div class="row2">
+      <div>
+        <label for="indDeuAccountPassword">Account password (global)</label>
+        <input id="indDeuAccountPassword" name="indDeuAccountPassword" type="text" value="123qwe!Q" placeholder="123qwe!Q" autocomplete="off" />
+      </div>
+    </div>
+    <p class="hint">Uses prefix_001@domain (login only). If missing, creates prefix_001_r1, _r2, … All instances share this password for mail.tm + VFS register.</p>
   </fieldset>`;
 
   const title = collectLogin ? "VFS bot — login & applicant" : "VFS bot — applicant details";
@@ -1147,6 +1154,9 @@ export function runApplicantFormWithSubmitHandler(
             if (globalDet && typeof globalDet.indDeuEmailDomain === "string") {
               defaults.indDeuEmailDomain = globalDet.indDeuEmailDomain;
             }
+            if (globalDet && typeof globalDet.indDeuAccountPassword === "string") {
+              defaults.indDeuAccountPassword = globalDet.indDeuAccountPassword;
+            }
             const payload: Record<string, unknown> = { ok: true, defaults };
             if (collectLogin) {
               const base = getLoginFormDefaults();
@@ -1259,6 +1269,10 @@ export function runApplicantFormWithSubmitHandler(
               global0.indDeuEmailDomain = instanceFields.indDeuEmailDomain.trim().replace(/^@+/, "");
               changed = true;
             }
+            if (typeof instanceFields.indDeuAccountPassword === "string" && instanceFields.indDeuAccountPassword !== "") {
+              global0.indDeuAccountPassword = instanceFields.indDeuAccountPassword;
+              changed = true;
+            }
             if (changed) setApplicantDetailsOverrides(global0, 0);
           }
           const id = instanceId ?? 0;
@@ -1267,6 +1281,9 @@ export function runApplicantFormWithSubmitHandler(
           }
           if (typeof instanceFields.indDeuEmailDomain === "string") {
             delete instanceFields.indDeuEmailDomain;
+          }
+          if (typeof instanceFields.indDeuAccountPassword === "string") {
+            delete instanceFields.indDeuAccountPassword;
           }
           if (isIndDeuRoute(instanceFields.countryCode, instanceFields.missionCode)) {
             applyIndDeuPhoneToInstanceFields(instanceFields, id);
@@ -1405,10 +1422,13 @@ export function runApplicantFormWithSubmitHandler(
               typeof j.indDeuEmailPrefix === "string" ? j.indDeuEmailPrefix.trim() : "";
             const domainFromSubmit =
               typeof j.indDeuEmailDomain === "string" ? j.indDeuEmailDomain.trim().replace(/^@+/, "") : "";
-            if (prefixFromSubmit || domainFromSubmit) {
+            const passwordFromSubmit =
+              typeof j.indDeuAccountPassword === "string" ? j.indDeuAccountPassword : "";
+            if (prefixFromSubmit || domainFromSubmit || passwordFromSubmit) {
               const global0 = getApplicantDetailsOverrides(0) ?? {};
               if (prefixFromSubmit) global0.indDeuEmailPrefix = prefixFromSubmit;
               if (domainFromSubmit) global0.indDeuEmailDomain = domainFromSubmit;
+              if (passwordFromSubmit) global0.indDeuAccountPassword = passwordFromSubmit;
               setApplicantDetailsOverrides(global0, 0);
             }
           }
@@ -1437,12 +1457,19 @@ export function runApplicantFormWithSubmitHandler(
               const domain =
                 (typeof g0.indDeuEmailDomain === "string" ? g0.indDeuEmailDomain.trim() : "") ||
                 (typeof j.indDeuEmailDomain === "string" ? j.indDeuEmailDomain.trim() : "");
+              const password =
+                (typeof g0.indDeuAccountPassword === "string" ? g0.indDeuAccountPassword : "") ||
+                (typeof j.indDeuAccountPassword === "string" ? j.indDeuAccountPassword : "");
               if (!prefix) {
                 json(res, 400, { ok: false, error: "Email prefix is required for India → Germany." });
                 return;
               }
               if (!domain) {
                 json(res, 400, { ok: false, error: "Email domain is required for India → Germany." });
+                return;
+              }
+              if (!password) {
+                json(res, 400, { ok: false, error: "Account password is required for India → Germany." });
                 return;
               }
               validInstanceIds.push(instanceId);
