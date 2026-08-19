@@ -21,6 +21,58 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     return 1;
   }
 
+  function setCfgProxyUi(provider, thordataReady) {
+    var hid = document.getElementById("proxyProvider");
+    var bright = document.getElementById("cfgProxyBright");
+    var thor = document.getElementById("cfgProxyThor");
+    var hint = document.getElementById("cfgProxyHint");
+    var isThor = String(provider || "").toLowerCase() === "thordata";
+    if (hid) hid.value = isThor ? "thordata" : "brightdata";
+    if (bright) bright.classList.toggle("active", !isThor);
+    if (thor) thor.classList.toggle("active", isThor);
+    window.__thordataReady = thordataReady !== false;
+    if (hint) {
+      hint.textContent = window.__thordataReady ? "" : "Thordata credentials still placeholders in .env";
+    }
+  }
+  window.__syncConfigureProxyUi = function (provider, thordataReady) {
+    setCfgProxyUi(provider, thordataReady);
+  };
+
+  function bindCfgProxy(btnId) {
+    var btn = document.getElementById(btnId);
+    if (!btn) return;
+    btn.addEventListener("click", function () {
+      var provider = btn.getAttribute("data-provider");
+      if (!provider) return;
+      var prev = (document.getElementById("proxyProvider") || {}).value || "brightdata";
+      setCfgProxyUi(provider, window.__thordataReady !== false);
+      fetch("/api/monitor/proxy-provider", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: provider }),
+      }).then(function (r) { return r.json(); }).then(function (j) {
+        if (j && j.ok) {
+          if (window.__syncMonitorProxyUi) window.__syncMonitorProxyUi(provider, window.__thordataReady !== false);
+        } else {
+          setCfgProxyUi(prev, window.__thordataReady !== false);
+          var msg = document.getElementById("msg");
+          if (msg) {
+            msg.className = "err";
+            msg.textContent = (j && j.error) || "proxy switch failed";
+          }
+        }
+      }).catch(function (err) {
+        setCfgProxyUi(prev, window.__thordataReady !== false);
+        var msg = document.getElementById("msg");
+        if (msg) {
+          msg.className = "err";
+          msg.textContent = String(err);
+        }
+      });
+    });
+  }
+
   function updateInstanceSelector() {
     const numInstances = getNumInstances();
 
@@ -511,7 +563,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     }
 
     if (inst.details) {
-      const skipDetailIds = { numInstances: true, instanceId: true, vfsUsername2: true, vfsPassword2: true, countryCode: true, missionCode: true, heroSmsActivationId: true, heroSmsLastCode: true, heroSmsPurchasedAt: true, indDeuProcessSessionId: true, indDeuEmailPrefix: true, indDeuEmailDomain: true, indDeuAccountPassword: true };
+      const skipDetailIds = { numInstances: true, instanceId: true, vfsUsername2: true, vfsPassword2: true, countryCode: true, missionCode: true, heroSmsActivationId: true, heroSmsLastCode: true, heroSmsPurchasedAt: true, indDeuProcessSessionId: true, indDeuEmailPrefix: true, indDeuEmailDomain: true, indDeuAccountPassword: true, proxyProvider: true };
       var loadRouteKey = String(inst.details.countryCode || "") + "-" + String(inst.details.missionCode || "");
       if (loadRouteKey === "ind-deu") {
         skipDetailIds.dialCode = true;
@@ -530,6 +582,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
         if (skipDetailIds[k] || skipCenterCatIds[k]) continue;
         if (k === "scheduleDateRangeStart" || k === "scheduleDateRangeEnd") continue;
         if (k === "calendarPollingStartDate" || k === "calendarPollingInterval" || k === "apiDelaySec" || k === "repeatedDelaySec") continue;
+        if (k === "proxyProvider") continue;
         const el = document.getElementById(k);
         if (el) el.value = inst.details[k] == null ? "" : String(inst.details[k]);
       }
@@ -610,6 +663,11 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       const gsrc = (globalInst && globalInst.details) || {};
       rdsEl.value = gsrc.repeatedDelaySec != null ? String(gsrc.repeatedDelaySec) : "35";
     }
+    {
+      const gsrc = (globalInst && globalInst.details) || {};
+      var loadedProvider = gsrc.proxyProvider != null ? String(gsrc.proxyProvider) : "brightdata";
+      setCfgProxyUi(loadedProvider, window.__thordataReady !== false);
+    }
     const prefixEl = document.getElementById("indDeuEmailPrefix");
     if (prefixEl) {
       const gsrc = (globalInst && globalInst.details) || {};
@@ -680,6 +738,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       repeatedDelaySec: parseInt(String(fd.get("repeatedDelaySec") || "35"), 10) || 35,
       postLoginPollDelay: parseInt(String(fd.get("postLoginPollDelay") || "30"), 10),
       staggerIntervalSec: parseInt(String(fd.get("staggerIntervalSec") || "6"), 10),
+      proxyProvider: String(fd.get("proxyProvider") || "brightdata"),
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
       helloVerifyNumber: String(fd.get("helloVerifyNumber") ?? "").trim() || undefined,
       juridictionCode: String(fd.get("juridictionCode") ?? "").trim() || undefined,
@@ -807,6 +866,17 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       });
 
       await loadInstanceData(false);
+
+      bindCfgProxy("cfgProxyBright");
+      bindCfgProxy("cfgProxyThor");
+      fetch("/api/defaults").then(function (r) { return r.json(); }).then(function (d) {
+        if (!d || !d.ok || !d.defaults) return;
+        window.__thordataReady = !!d.defaults.thordataReady;
+        setCfgProxyUi(d.defaults.proxyProvider || "brightdata", window.__thordataReady);
+        if (window.__syncMonitorProxyUi) {
+          window.__syncMonitorProxyUi(d.defaults.proxyProvider || "brightdata", window.__thordataReady);
+        }
+      }).catch(function () {});
 
       updateInstanceSelector();
     } catch {
@@ -957,6 +1027,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       repeatedDelaySec: parseInt(String(fd.get("repeatedDelaySec") || "35"), 10) || 35,
       postLoginPollDelay: parseInt(String(fd.get("postLoginPollDelay") || "30"), 10),
       staggerIntervalSec: parseInt(String(fd.get("staggerIntervalSec") || "6"), 10),
+      proxyProvider: String(fd.get("proxyProvider") || "brightdata"),
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
       helloVerifyNumber: String(fd.get("helloVerifyNumber") ?? "").trim() || undefined,
       juridictionCode: String(fd.get("juridictionCode") ?? "").trim() || undefined,

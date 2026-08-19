@@ -14,6 +14,12 @@ import { getSessionLoginCredentials, setSessionLoginCredentials, getAllInstanceC
 import { buildApplicantFormPageScript } from "./applicantDetailsFormClientScript";
 import { buildMonitorTabHtml } from "./monitorTab";
 import type { MonitorHooks } from "../monitoring/status.types";
+import {
+  getActiveProxyProvider,
+  isThordataConfigured,
+  parseProxyProviderId,
+  persistProxyProvider,
+} from "../utils/proxyProvider";
 
 const APPLICANT_UI_PORT = 3847;
 
@@ -284,6 +290,23 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
   return out;
 }
 
+function applyProxyProviderFromBody(
+  j: Record<string, unknown>,
+  monitor: MonitorHooks | undefined
+): { ok: boolean; error?: string } {
+  if (!("proxyProvider" in j)) return { ok: true };
+  const id = parseProxyProviderId(j.proxyProvider);
+  if (!id) return { ok: false, error: "Provider must be brightdata or thordata." };
+  if (getActiveProxyProvider() === id) return { ok: true };
+  if (monitor) return monitor.setProxyProvider(id);
+  if (id === "thordata") {
+    const check = isThordataConfigured();
+    if (!check.ok) return check;
+  }
+  persistProxyProvider(id);
+  return { ok: true };
+}
+
 function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
   /** Per-instance date range row in the applicant column. */
   const scheduleDateRangeRow = `
@@ -314,6 +337,13 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
         <option value="deu">Germany</option>
         <option value="prt">Portugal</option>
       </select>
+    </div>
+    <label style="margin-top:0.75rem">Proxy</label>
+    <input type="hidden" id="proxyProvider" name="proxyProvider" value="brightdata" />
+    <div class="cfg-proxy-row" role="group" aria-label="Proxy provider">
+      <button type="button" class="cfg-proxy-btn active" id="cfgProxyBright" data-provider="brightdata" title="Bright Data (default)">Bright Data</button>
+      <button type="button" class="cfg-proxy-btn" id="cfgProxyThor" data-provider="thordata" title="Thordata">Thordata</button>
+      <span id="cfgProxyHint" style="color:#8b98a5;font-size:0.78rem;"></span>
     </div>
     <label for="userPollInterval" style="margin-top:0.75rem">Poll interval (seconds)</label>
     <input type="number" id="userPollInterval" name="userPollInterval" min="1" value="${defaultPollIntervalSec}" />
@@ -527,6 +557,11 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
     .tabbtn:hover { filter: none; color: #e7e9ea; }
     .tabbtn.active { color: #1d9bf0; border-bottom-color: #1d9bf0; }
     .tabpanel[hidden] { display: none; }
+    .cfg-proxy-row { display: flex; gap: 0.4rem; align-items: center; flex-wrap: wrap; margin-top: 0.35rem; }
+    .cfg-proxy-btn { width: auto; min-width: 0; flex: none; padding: 0.4rem 0.75rem; font-size: 0.85rem; font-weight: 600;
+      border: 1px solid #38444d; background: #1c2732; color: #c4cdd4; border-radius: 8px; }
+    .cfg-proxy-btn:hover { filter: none; background: #253341; border-color: #4a5a68; color: #e7e9ea; }
+    .cfg-proxy-btn.active { background: #1d9bf0; border-color: #1d9bf0; color: #fff; }
   </style>
 </head>
 <body>
@@ -1093,6 +1128,10 @@ export function runApplicantFormWithSubmitHandler(
                 json(res, 200, monitor.setRepeatedDelaySec(Number.isFinite(sec) ? sec : 35));
                 return;
               }
+              if (action === "proxy-provider") {
+                json(res, 200, monitor.setProxyProvider(String(mj.provider ?? "")));
+                return;
+              }
               if (action === "start") {
                 const count = toNum(mj.count);
                 const ms = toNum(mj.intervalMs);
@@ -1148,6 +1187,8 @@ export function runApplicantFormWithSubmitHandler(
             if (globalDet && typeof globalDet.repeatedDelaySec === "number") {
               defaults.repeatedDelaySec = globalDet.repeatedDelaySec;
             }
+            defaults.proxyProvider = getActiveProxyProvider();
+            defaults.thordataReady = isThordataConfigured().ok;
             if (globalDet && typeof globalDet.indDeuEmailPrefix === "string") {
               defaults.indDeuEmailPrefix = globalDet.indDeuEmailPrefix;
             }
@@ -1242,6 +1283,12 @@ export function runApplicantFormWithSubmitHandler(
             ...instanceFields
           } = fields;
 
+          const proxyResult = applyProxyProviderFromBody(j, options?.monitor);
+          if (!proxyResult.ok) {
+            json(res, 200, { ok: false, error: proxyResult.error });
+            return;
+          }
+
           {
             const global0 = getApplicantDetailsOverrides(0) ?? {};
             let changed = false;
@@ -1302,6 +1349,12 @@ export function runApplicantFormWithSubmitHandler(
             j = JSON.parse(raw) as Record<string, unknown>;
           } catch {
             json(res, 400, { ok: false, error: "Invalid JSON" });
+            return;
+          }
+
+          const proxyResult = applyProxyProviderFromBody(j, options?.monitor);
+          if (!proxyResult.ok) {
+            json(res, 200, { ok: false, error: proxyResult.error });
             return;
           }
 

@@ -172,6 +172,10 @@ export function buildMonitorTabHtml(): string {
   .mon-toolbar label { display: inline; margin: 0; }
   .mon-toolbar input { width: auto; margin: 0; }
   .mon-toolbar button { width: auto; padding: 0.15rem 0.4rem; font-size: 0.65rem; min-width: 0; flex: none; }
+  .mon-proxy-btn { width: auto; padding: 0.15rem 0.5rem; font-size: 0.65rem; min-width: 0; flex: none; border: 1px solid #38444d; background: #1c2732; color: #c4cdd4; border-radius: 4px; cursor: pointer; }
+  .mon-proxy-btn:hover { background: #253341; border-color: #4a5a68; color: #e7e9ea; }
+  .mon-proxy-btn.active { background: #1d9bf0; border-color: #1d9bf0; color: #fff; }
+  .mon-proxy-btn:disabled { opacity: 0.45; cursor: not-allowed; }
   .mon-toast { position: fixed; right: 1rem; bottom: 1rem; background: #1c2732; border: 1px solid #38444d; color: #e7e9ea; padding: 0.6rem 0.85rem; border-radius: 8px; font-size: 0.85rem; opacity: 0; transition: opacity 0.2s; pointer-events: none; z-index: 50; max-width: 22rem; }
   .mon-toast.show { opacity: 1; }
 </style>
@@ -200,6 +204,12 @@ export function buildMonitorTabHtml(): string {
     <label for="monRepeatedDelay">409 delay (s)</label>
     <input type="number" id="monRepeatedDelay" min="1" max="600" value="35" step="1" style="width:3.5rem;padding:0.15rem 0.25rem;border:1px solid #38444d;border-radius:4px;background:#15202b;color:#e7e9ea;font-size:0.72rem;" />
     <button type="button" id="monRepeatedDelayApply">Apply</button>
+  </div>
+  <div class="mon-toolbar" style="margin-bottom:0.5rem;display:flex;gap:0.4rem;align-items:center;justify-content:center;font-size:0.72rem;">
+    <span style="color:#8b98a5;">Proxy</span>
+    <button type="button" class="mon-proxy-btn active" id="monProxyBright" data-provider="brightdata" title="Bright Data (default) — all bots switch on the next API request">Bright Data</button>
+    <button type="button" class="mon-proxy-btn" id="monProxyThor" data-provider="thordata" title="Thordata — all bots switch on the next API request">Thordata</button>
+    <span id="monProxyHint" style="color:#8b98a5;font-size:0.62rem;"></span>
   </div>
   <div class="mon-grid" id="monGrid"></div>
 </div>
@@ -641,6 +651,7 @@ export function buildMonitorTabHtml(): string {
           var rd = document.getElementById('monRepeatedDelay');
           if (rd) rd.value = String(c.repeatedDelaySec);
         }
+        setProxyUi(c.proxyProvider || 'brightdata', !!c.thordataReady);
       }
     }).catch(function(){});
 
@@ -666,6 +677,47 @@ export function buildMonitorTabHtml(): string {
     bindApply('monCalendarPollingIntervalApply', 'monCalendarPollingInterval', 'calendar-polling-interval', 'Calendar re-poll', 1, false);
     bindApply('monApiDelayApply', 'monApiDelay', 'api-delay', 'API delay', 0, true);
     bindApply('monRepeatedDelayApply', 'monRepeatedDelay', 'repeated-delay', '409 delay', 1, false);
+
+    function setProxyUi(provider, thordataReady) {
+      var bright = document.getElementById('monProxyBright');
+      var thor = document.getElementById('monProxyThor');
+      var hint = document.getElementById('monProxyHint');
+      var isThor = provider === 'thordata';
+      if (bright) bright.classList.toggle('active', !isThor);
+      if (thor) thor.classList.toggle('active', isThor);
+      if (hint) {
+        hint.textContent = thordataReady ? '' : 'Thordata credentials still placeholders in .env';
+      }
+    }
+    window.__syncMonitorProxyUi = setProxyUi;
+
+    function bindProxy(btnId) {
+      var btn = document.getElementById(btnId);
+      if (!btn) return;
+      btn.addEventListener('click', function(){
+        var provider = btn.getAttribute('data-provider');
+        if (!provider) return;
+        var label = provider === 'thordata' ? 'Thordata' : 'Bright Data';
+        toast('Switching all bots to ' + label + '…');
+        post('proxy-provider', { provider: provider }).then(function(r){
+          if (r.ok) {
+            toast('All bots now use ' + label + ' from the next API request');
+            fetch('/api/monitor/control').then(function(res){ return res.json(); }).then(function(d){
+              if (d && d.ok && d.control) {
+                setProxyUi(d.control.proxyProvider || provider, !!d.control.thordataReady);
+                if (window.__syncConfigureProxyUi) {
+                  window.__syncConfigureProxyUi(d.control.proxyProvider || provider, !!d.control.thordataReady);
+                }
+              }
+            }).catch(function(){});
+          } else {
+            toast(r.error || 'proxy switch failed');
+          }
+        });
+      });
+    }
+    bindProxy('monProxyBright');
+    bindProxy('monProxyThor');
     fetch('/api/monitor/snapshot').then(function(r){ return r.json(); }).then(function(d){
       if (d && d.ok && Array.isArray(d.instances)){
         for (var i = 0; i < d.instances.length; i++){

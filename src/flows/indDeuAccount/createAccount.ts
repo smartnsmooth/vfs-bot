@@ -19,6 +19,7 @@ import {
   getIndDeuEmailPrefix,
   persistHeroSmsPurchase,
   persistIndDeuCreatedAccount,
+  getReusablePurchasedHeroSms,
   shouldReuseIndDeuAccount,
 } from "../../utils/indDeuAccountState";
 import { allocateNextIndDeuEmailIndex, buildIndDeuEmail } from "../../utils/indDeuEmailIndex";
@@ -123,8 +124,17 @@ export async function ensureIndDeuAccountReady(
     throw new Error("ind-deu account password is missing — set it on the setup form.");
   }
 
-  await cancelStoredHeroSms(instanceId);
-  clearIndDeuCreatedAccount(instanceId);
+  let resumePhone = !opts?.forceNew ? getReusablePurchasedHeroSms(instanceId) : null;
+  if (resumePhone) {
+    reporter.setPhase("launching", "phone already bought — resuming register");
+  } else {
+    await cancelStoredHeroSms(instanceId);
+    clearIndDeuCreatedAccount(instanceId);
+  }
+
+  reporter.setPhase("launching", "opening register");
+  await browser.openRegisterInFirstTab();
+
   let lastErr = "ind-deu register/SMS failed";
 
   for (let emailRound = 1; emailRound <= EMAIL_ROUND_MAX; emailRound++) {
@@ -143,13 +153,23 @@ export async function ensureIndDeuAccountReady(
           await cancelPhone(phone);
           phone = null;
           if (opts?.hardRestartChrome) await opts.hardRestartChrome();
+          reporter.setPhase("launching", "opening register");
+          await browser.openRegisterInFirstTab();
         }
 
-        reporter.setPhase("launching", `buying HeroSMS (${maskEmailForLog(email)} ${regAttempt}/${REG_SMS_INNER_MAX})`);
-        phone = await heroSmsBuyGermanyOt({
-          onRetry: (msg) => reporter.setDetail(msg),
-        });
-        persistHeroSmsPurchase(instanceId, phone);
+        if (resumePhone) {
+          phone = resumePhone;
+          resumePhone = null;
+          reporter.setPhase("launching", `register with purchased number — ${maskEmailForLog(email)}`);
+        } else {
+          reporter.setPhase("launching", `buying HeroSMS (${maskEmailForLog(email)} ${regAttempt}/${REG_SMS_INNER_MAX})`);
+          phone = await heroSmsBuyGermanyOt({
+            onRetry: (msg) => reporter.setDetail(msg),
+          });
+          persistHeroSmsPurchase(instanceId, phone);
+        }
+
+        if (!phone) throw new Error("No HeroSMS number for register");
 
         reporter.setPhase("launching", `opening register — ${email}`);
         await browser.openRegisterInFirstTab();

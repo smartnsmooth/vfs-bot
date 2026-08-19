@@ -190,6 +190,10 @@ export interface MonitorControlState {
   apiDelaySec: number;
   /** First sleep after HTTP 409 (seconds); +5s each retry. */
   repeatedDelaySec: number;
+  /** Active proxy vendor for all bots (Monitor switcher). */
+  proxyProvider: "brightdata" | "thordata";
+  /** False while Thordata URL still has USERNAME/PASSWORD placeholders. */
+  thordataReady: boolean;
 }
 
 /**
@@ -230,6 +234,8 @@ export interface MonitorHooks {
   setApiDelaySec(sec: number): { ok: boolean; error?: string };
   /** Set first 409 sleep (seconds). */
   setRepeatedDelaySec(sec: number): { ok: boolean; error?: string };
+  /** Switch all bots to Bright Data or Thordata; next API request uses the new vendor. */
+  setProxyProvider(provider: string): { ok: boolean; error?: string };
   /** Reload global settings from disk on all running bots (after /api/save). */
   reloadGlobalSettings(): { ok: boolean };
   getControl(): MonitorControlState;

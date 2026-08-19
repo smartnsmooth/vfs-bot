@@ -7,7 +7,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "
 import { get as httpGet } from "node:http";
 import { get as httpsGet } from "node:https";
 import path from "node:path";
-import { config, setCurrentInstanceId } from "./config/config";
+import { config, setCurrentInstanceId, getCurrentInstanceId } from "./config/config";
 import { classifyVfsFirstTabUrl } from "./flows/vfsTabUrl";
 import { PollingService } from "./services/polling.service";
 import { BrowserService, VfsForbiddenError, VfsGatewayTimeoutError, VfsRateLimitedError, IndDeuAccountRecreateError, AlreadyBookedError, isFailedToFetchError } from "./services/browser.service";
@@ -19,6 +19,17 @@ import {
 import { getSessionLoginCredentials, reloadSessionCredentialsFromDisk } from "./utils/sessionLogin.store";
 import { isIndDeuRoute } from "./utils/vfsRoute";
 import { reloadApplicantDetailsFromDisk, getApplicantDetailsOverrides, setApplicantDetailsOverrides } from "./utils/applicantDetails.store";
+import {
+  getActiveProxyProvider,
+  isThordataConfigured,
+  listProxyUrlsForProvider,
+  parseProxyProviderId,
+  persistProxyProvider,
+  pickProxyUrlFromList,
+  proxyProviderLabel,
+  setMemoryProxyProvider,
+  type ProxyProviderId,
+} from "./utils/proxyProvider";
 import {
   createSlotFoundWatcher,
   isSlotFoundByAnyInstance,
@@ -76,7 +87,7 @@ import { isPageNotFoundUrl } from "./flows/pageNotFound";
 import { PageNotFoundRestartError } from "./services/browser.errors";
 import { beginIndDeuProcessSession } from "./utils/indDeuProcessSession";
 import { ensureIndDeuAccountReady } from "./flows/indDeuAccount/createAccount";
-import { isIndDeuPhoneExpiredForRelogin } from "./utils/indDeuAccountState";
+import { isIndDeuPhoneExpiredForRelogin, shouldReuseIndDeuAccount } from "./utils/indDeuAccountState";
 import { extractIndDeu4030xxFromUnknown } from "./utils/vfs4030";
 
 const polling = new PollingService();
@@ -122,11 +133,13 @@ const DEFAULT_POST_LOGIN_POLL_DELAY_SEC = 30;
 const DEFAULT_POLL_INTERVAL_SEC = 60;
 
 type ProxyChainModule = {
-  anonymizeProxy(proxyUrl: string): Promise<string>;
+  anonymizeProxy(proxyUrl: string | { url: string; port?: number }): Promise<string>;
   closeAnonymizedProxy(url: string, closeConnections?: boolean): Promise<void>;
 };
 let proxyChainModule: ProxyChainModule | null = null;
 let activeAnonymizedProxyUrl: string | null = null;
+/** Stable local tunnel port so Chrome `--proxy-server` keeps working after a vendor switch. */
+let localTunnelPort: number | null = null;
 
 /** Shifts `PROXY_URLS` index for this Chrome profile on each credential-swap browser restart. */
 const proxyRotationOffsetByProfileId = new Map<string, number>();
@@ -687,14 +700,6 @@ function patchChromeProfilePrefsBeforeLaunch(userDataDir: string): void {
   }
 }
 
-function hashString(input: string): number {
-  let h = 0;
-  for (let i = 0; i < input.length; i++) {
-    h = (h * 31 + input.charCodeAt(i)) | 0;
-  }
-  return Math.abs(h);
-}
-
 /**
  * Sticky proxy session string embedded in `PROXY_URLS` via `{session}` or `{instance}`.
  * - **`PROXY_STICKY_SESSION_ID`**: same string for every launch (fixed sticky pool entry).
@@ -715,19 +720,11 @@ function stableSessionToken(instanceId: string): string {
 }
 
 function resolveProxyForInstance(instanceId: string): string | null {
-  const rawList = (process.env.PROXY_URLS ?? "").trim();
-  if (!rawList) return null;
-  const list = rawList
-    .split(/[\r\n,]+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
+  const list = listProxyUrlsForProvider(getActiveProxyProvider());
   if (list.length === 0) return null;
-  const base = hashString(instanceId) % list.length;
   const rot = getProxyRotationOffset(instanceId);
-  const idx = (base + rot) % list.length;
-  const selected = list[idx];
   const session = stableSessionToken(instanceId);
-  return selected.replace(/\{session\}/gi, session).replace(/\{instance\}/gi, instanceId);
+  return pickProxyUrlFromList(list, instanceId, rot, session);
 }
 
 type ParsedProxy = {
@@ -780,18 +777,20 @@ async function resolveLaunchProxyServer(selectedProxy: string | null): Promise<{
 
   const hasAuth = Boolean(parsedProxy.username || parsedProxy.password);
   if (!hasAuth) {
-    if (activeAnonymizedProxyUrl) {
-      try {
-        const proxyChain = await getProxyChainModule();
-        await proxyChain.closeAnonymizedProxy(activeAnonymizedProxyUrl, true);
-      } catch {
-        /* ignore */
-      }
-      activeAnonymizedProxyUrl = null;
-    }
+    await closeActiveAnonymizedProxyTunnel();
     return { launchProxy: toChromeProxyServer(parsedProxy), proxyHasAuth: false, viaLocalTunnel: false };
   }
 
+  const launchProxy = await recreateAuthProxyTunnel(selectedProxy);
+  return { launchProxy, proxyHasAuth: true, viaLocalTunnel: true };
+}
+
+/**
+ * Local proxy-chain listener Chrome uses (`--proxy-server=http://127.0.0.1:port`).
+ * Rebinding the same port with a new upstream makes the next CONNECT use the new vendor
+ * without restarting Chrome.
+ */
+async function recreateAuthProxyTunnel(selectedProxy: string): Promise<string> {
   const proxyChain = await getProxyChainModule();
   if (activeAnonymizedProxyUrl) {
     try {
@@ -801,8 +800,74 @@ async function resolveLaunchProxyServer(selectedProxy: string | null): Promise<{
     }
     activeAnonymizedProxyUrl = null;
   }
-  activeAnonymizedProxyUrl = await proxyChain.anonymizeProxy(selectedProxy);
-  return { launchProxy: activeAnonymizedProxyUrl, proxyHasAuth: true, viaLocalTunnel: true };
+
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < 8; attempt++) {
+    try {
+      const opts = localTunnelPort
+        ? { url: selectedProxy, port: localTunnelPort }
+        : { url: selectedProxy };
+      const url = await proxyChain.anonymizeProxy(opts);
+      activeAnonymizedProxyUrl = url;
+      try {
+        const p = Number.parseInt(new URL(url).port, 10);
+        if (Number.isFinite(p) && p > 0) localTunnelPort = p;
+      } catch {
+        /* ignore */
+      }
+      return url;
+    } catch (err) {
+      lastErr = err;
+      await new Promise((r) => setTimeout(r, 40 + attempt * 30));
+    }
+  }
+  throw lastErr instanceof Error ? lastErr : new Error(String(lastErr ?? "proxy-chain bind failed"));
+}
+
+/**
+ * Swap Bright Data / Thordata for this process. Chrome keeps the same local tunnel port;
+ * existing CONNECT sockets are dropped so the next page `fetch()` uses the new upstream.
+ */
+async function applyProxyProviderSwitch(provider: ProxyProviderId): Promise<{ ok: boolean; error?: string }> {
+  if (provider === "thordata") {
+    const check = isThordataConfigured();
+    if (!check.ok) return check;
+  }
+  setMemoryProxyProvider(provider);
+  const instanceId = getBotInstanceId(resolveChromeUserDataDir());
+  const selected = resolveProxyForInstance(instanceId);
+  if (!selected) {
+    return { ok: false, error: `No proxy URL configured for ${proxyProviderLabel(provider)}.` };
+  }
+  const parsed = parseProxy(selected);
+  if (!parsed) {
+    return { ok: false, error: `Invalid ${proxyProviderLabel(provider)} proxy URL.` };
+  }
+  const hasAuth = Boolean(parsed.username || parsed.password);
+  if (!hasAuth) {
+    return { ok: false, error: "Unauthenticated proxies cannot be switched without a Chrome restart." };
+  }
+  if (!activeAnonymizedProxyUrl && localTunnelPort == null) {
+    // Chrome not launched yet — next spawn picks up the new provider.
+    return { ok: true };
+  }
+  try {
+    await recreateAuthProxyTunnel(selected);
+    clearApplicantIpCache();
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message : String(err) };
+  }
+}
+
+function commitProxyProvider(provider: ProxyProviderId): { ok: boolean; error?: string } {
+  if (provider === "thordata") {
+    const check = isThordataConfigured();
+    if (!check.ok) return check;
+  }
+  persistProxyProvider(provider);
+  void applyProxyProviderSwitch(provider);
+  return { ok: true };
 }
 
 function checkDevToolsEndpoint(url: string): Promise<boolean> {
@@ -975,7 +1040,11 @@ async function ensureChromeWithDevTools(opts?: { preserveSession?: boolean }): P
   // First paint: compact bottom-right (avoids a huge left-side flash).
   chromeArgs.push(`--window-size=${firstOpen.width},${firstOpen.height}`);
   chromeArgs.push(`--window-position=${firstOpen.x},${firstOpen.y}`);
-  chromeArgs.push(config.loginPageUrl);
+  const launchInstanceId = getCurrentInstanceId() ?? numericInstanceId;
+  const startOnRegister =
+    isIndDeuRoute(config.slotPayload.countryCode, config.slotPayload.missionCode) &&
+    !shouldReuseIndDeuAccount(launchInstanceId);
+  chromeArgs.push(startOnRegister ? config.registerPageUrl : config.loginPageUrl);
 
   const child = spawn(chromePath, chromeArgs, { detached: true, stdio: "ignore" });
   child.unref();
@@ -2668,6 +2737,12 @@ async function start(): Promise<void> {
           return;
         }
 
+        if (msg?.type === "proxy-provider") {
+          const id = parseProxyProviderId(msg.provider);
+          if (id) void applyProxyProviderSwitch(id);
+          return;
+        }
+
         ipcChain = ipcChain.then(async () => {
           if (msg?.type === "run-bot-cycle") {
             syncInstanceStoresFromDisk();
@@ -2776,6 +2851,11 @@ async function start(): Promise<void> {
       setApplicantDetailsOverrides(global0, 0);
       return { ok: true };
     },
+    setProxyProvider: (provider) => {
+      const id = parseProxyProviderId(provider);
+      if (!id) return { ok: false, error: "Provider must be brightdata or thordata." };
+      return commitProxyProvider(id);
+    },
     reloadGlobalSettings: () => {
       syncInstanceStoresFromDisk();
       return { ok: true };
@@ -2796,6 +2876,8 @@ async function start(): Promise<void> {
           ? Math.floor(globalDet.calendarPollingInterval) : 60,
         apiDelaySec: resolveApiDelaySec(globalDet),
         repeatedDelaySec: resolveRepeatedDelaySec(globalDet),
+        proxyProvider: getActiveProxyProvider(),
+        thordataReady: isThordataConfigured().ok,
       };
     },
   };

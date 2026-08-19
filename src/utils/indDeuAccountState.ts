@@ -93,9 +93,36 @@ export function getStoredHeroSmsLastCode(instanceId?: number): string {
   return typeof d.heroSmsLastCode === "string" ? d.heroSmsLastCode.trim() : "";
 }
 
-export function shouldReuseIndDeuAccount(instanceId?: number): boolean {
+/** True only after register + SMS + email verify persisted credentials. */
+export function hasCompletedIndDeuAccount(instanceId?: number): boolean {
   const creds = getSessionLoginCredentials(instanceId);
-  if (!creds?.username?.trim() || !creds.password) return false;
+  return Boolean(creds?.username?.trim() && creds.password);
+}
+
+/**
+ * Phone was bought but VFS register never finished. Reuse that number on register,
+ * do not cancel it or sit on login while buying another.
+ */
+export function getReusablePurchasedHeroSms(instanceId?: number): HeroSmsNumber | null {
+  if (hasCompletedIndDeuAccount(instanceId)) return null;
+  const d = getApplicantDetailsOverrides(instanceId) ?? {};
+  const activationId = getStoredHeroSmsActivationId(instanceId);
+  if (!activationId) return null;
+  if (!hasStoredApplicantPhone(d)) return null;
+  if (isIndDeuPhoneExpiredForRelogin(instanceId)) return null;
+  const dialCode = String(d.dialCode ?? "").replace(/\D/g, "");
+  const localNumber = String(d.contactNumber ?? "").replace(/\D/g, "");
+  if (!dialCode || !localNumber) return null;
+  return {
+    activationId,
+    phoneNumber: `${dialCode}${localNumber}`,
+    dialCode,
+    localNumber,
+  };
+}
+
+export function shouldReuseIndDeuAccount(instanceId?: number): boolean {
+  if (!hasCompletedIndDeuAccount(instanceId)) return false;
   const d = getApplicantDetailsOverrides(instanceId) ?? {};
   if (!hasStoredApplicantPhone(d)) return false;
   if (!getStoredHeroSmsActivationId(instanceId)) return false;

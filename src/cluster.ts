@@ -26,6 +26,12 @@ import path from "node:path";
 import { clearChromeSessionDataBeforeLaunch } from "./utils/chromeProfileSessionClean";
 import { beginIndDeuProcessSession } from "./utils/indDeuProcessSession";
 import { isIndDeuRoute } from "./utils/vfsRoute";
+import {
+  getActiveProxyProvider,
+  isThordataConfigured,
+  parseProxyProviderId,
+  persistProxyProvider,
+} from "./utils/proxyProvider";
 
 /** How many bot instances are currently running. Set by ensureInstances(). */
 let currentNumInstances = 0;
@@ -347,6 +353,17 @@ function buildMonitorHooks(): MonitorHooks {
       broadcastToActiveChildren({ type: "global-settings-updated" });
       return { ok: true };
     },
+    setProxyProvider: (provider) => {
+      const id = parseProxyProviderId(provider);
+      if (!id) return { ok: false, error: "Provider must be brightdata or thordata." };
+      if (id === "thordata") {
+        const check = isThordataConfigured();
+        if (!check.ok) return check;
+      }
+      persistProxyProvider(id);
+      broadcastToActiveChildren({ type: "proxy-provider", provider: id });
+      return { ok: true };
+    },
     reloadGlobalSettings: () => {
       broadcastToActiveChildren({ type: "config-updated" });
       return { ok: true };
@@ -366,6 +383,8 @@ function buildMonitorHooks(): MonitorHooks {
           ? Math.floor(global0.calendarPollingInterval) : 60,
         apiDelaySec: resolveApiDelaySec(global0),
         repeatedDelaySec: resolveRepeatedDelaySec(global0),
+        proxyProvider: getActiveProxyProvider(),
+        thordataReady: isThordataConfigured().ok,
       };
     },
   };
