@@ -4,10 +4,9 @@ import { classifyVfs429, classifyVfs429FromHttp, classifyVfs429FromPageText, } f
 import { classifyVfsFirstTabUrl } from "../flows/vfsTabUrl";
 import { fetchMailTmToken, isMailTmVerbose, listMailTmMessages, maskEmailForLog, waitForOtpFromMailTm, } from "./mailTm.service";
 import { TelegramService } from "./telegram.service";
-import type { VfsUserLoginResponse } from "../types/vfsUserLogin.type.js";
 import { flattenVfsLoginResponseForProfile, parseVfsUserLoginResponseBody, stripPasswordStepApplicantFieldsForProfileMerge, } from "../types/vfsUserLogin.type.js";
-import { clearVfsLoginProfile, mergeVfsLoginProfile } from "../utils/vfsLoginProfile.store.js";
-import { VfsForbiddenError, VfsGatewayTimeoutError, VfsRateLimitedError, PageNotFoundRestartError, IndDeuAccountRecreateError, isTargetClosedError, throwVfsRateLimited, responseIsLiftUserLoginPost, injectTurnstileTokenInPage, type PostOtpLoginCapture, } from "./browser.errors";
+import { clearVfsLoginProfile, mergeVfsLoginProfile, replaceVfsLoginProfile } from "../utils/vfsLoginProfile.store.js";
+import { VfsForbiddenError, VfsGatewayTimeoutError, VfsRateLimitedError, PageNotFoundRestartError, IndDeuAccountRecreateError, isTargetClosedError, throwVfsRateLimited, responseIsLiftUserLoginPost, injectTurnstileTokenInPage, } from "./browser.errors";
 import { isPageNotFoundUrl } from "../flows/pageNotFound";
 import type { BrowserServiceCore } from "./browser.core";
 import { clickTurnstile, waitForManualTurnstile } from "./turnstile.click";
@@ -20,6 +19,8 @@ import { patchApplicantDetailsOverrides } from "../utils/applicantDetails.store"
 
 /** Pause after OTP entry so the page can settle before Turnstile (Bulgaria OTP step). */
 const OTP_BEFORE_CAPTCHA_DELAY_MS = 1000;
+/** After dashboard URL, keep listening briefly so a late last `/user/login` still replaces the profile. */
+const OTP_LOGIN_POST_DASHBOARD_GRACE_MS = 3000;
 import { reporter } from "../monitoring/statusReporter";
 // ── Block-page detection ────────────────────────────────────────────────
 function throwIfBlockPage(page: Page): void {
@@ -627,29 +628,135 @@ async function forceClickSignInButton(page: Page, submitBtn: import("playwright"
     }
 }
 // ── OTP completion flows ────────────────────────────────────────────────
-async function completeOtpWithMailPromise(page: Page, mailOtpFetchPromise: Promise<string>, dash: RegExp, core: BrowserServiceCore): Promise<void> {
+/**
+ * Every OTP-phase POST /user/login replaces the profile in full (last JSON wins).
+ * 429 / 504 still abort immediately. Listener stays until dashboard + short grace.
+ */
+async function withOtpLoginProfileWatch(page: Page, core: BrowserServiceCore, work: () => Promise<void>): Promise<void> {
+    const dash = dashboardUrlRegex();
+    let stopped = false;
+    let responseGen = 0;
+    let rejectFatal: ((err: Error) => void) | undefined;
+    const fatalPromise = new Promise<never>((_, reject) => {
+        rejectFatal = reject;
+    });
+    const fail = (err: Error): void => {
+        if (stopped)
+            return;
+        rejectFatal?.(err);
+    };
+    const applyLoginResponse = async (res: import("playwright").Response): Promise<void> => {
+        if (stopped)
+            return;
+        if (!responseIsLiftUserLoginPost(res))
+            return;
+        const gen = ++responseGen;
+        const otpStatus = res.status();
+        const body = await res.text().catch(() => "");
+        if (stopped)
+            return;
+        const json = parseVfsUserLoginResponseBody(body);
+        if (otpStatus === 429) {
+            try {
+                const classified = classifyVfs429FromHttp(otpStatus, body) ?? { kind: "ip" as const, code: "429" };
+                throwVfsRateLimited(classified.kind, classified.code, "OTP Login API HTTP 429");
+            }
+            catch (e) {
+                if (e instanceof Error)
+                    fail(e);
+            }
+            return;
+        }
+        if (otpStatus === 504) {
+            fail(new VfsGatewayTimeoutError("Login API returned 504 Gateway Timeout after OTP — restarting browser + rotating IP."));
+            return;
+        }
+        if (json) {
+            const errObj = json.error as {
+                code?: number;
+                description?: string;
+            } | undefined;
+            const bodyCode = String((json as Record<string, unknown>).code ?? errObj?.code ?? "");
+            const bodyKind = classifyVfs429(bodyCode);
+            if (bodyKind) {
+                try {
+                    throwVfsRateLimited(bodyKind, bodyCode, "OTP Login API body rate-limit code");
+                }
+                catch (e) {
+                    if (e instanceof Error)
+                        fail(e);
+                }
+                return;
+            }
+            if (errObj && errObj.code === 413 && errObj.description === "Invalid Sender User") {
+                void new TelegramService()
+                    .alert("error", "The entered email id is not registered.")
+                    .catch(() => { });
+            }
+            const flat = flattenVfsLoginResponseForProfile(json);
+            if (flat && gen === responseGen)
+                replaceVfsLoginProfile(flat);
+        }
+        if (gen !== responseGen)
+            return;
+        core.setLastPostOtpLoginResponse({
+            status: otpStatus,
+            url: res.url(),
+            body,
+            json,
+        });
+    };
+    const onResponse = (res: import("playwright").Response) => {
+        void applyLoginResponse(res).catch((err) => {
+            if (err instanceof Error)
+                fail(err);
+        });
+    };
+    page.on("response", onResponse);
+    const workDone = work();
+    void workDone.catch(() => { });
+    try {
+        await Promise.race([workDone, fatalPromise]);
+        let onDash = false;
+        try {
+            onDash = dash.test(page.url());
+        }
+        catch {
+        }
+        if (onDash) {
+            await Promise.race([page.waitForTimeout(OTP_LOGIN_POST_DASHBOARD_GRACE_MS), fatalPromise]);
+        }
+    }
+    finally {
+        stopped = true;
+        page.off("response", onResponse);
+    }
+}
+async function completeOtpWithMailPromise(page: Page, mailOtpFetchPromise: Promise<string>, dash: RegExp): Promise<void> {
     const fieldWaitMs = Math.max(config.mailTmOtpTimeoutMs + 15000, 120000);
     const fieldP = waitForLoginOtpField(page, fieldWaitMs);
     const mailP = mailOtpFetchPromise;
     const [, otp] = await Promise.all([fieldP, mailP]);
     await fillLoginOtpField(page, otp);
-    await resubmitLoginAfterOtp(page, core);
+    await resubmitLoginAfterOtp(page);
     await page.waitForURL(dash, { timeout: 60000 });
 }
 async function runLoginOtpCompletionFlow(page: Page, mailOtpFetchPromise: Promise<string> | null, dash: RegExp, core: BrowserServiceCore): Promise<void> {
-    if (mailOtpFetchPromise) {
-        try {
-            await completeOtpWithMailPromise(page, mailOtpFetchPromise, dash, core);
+    await withOtpLoginProfileWatch(page, core, async () => {
+        if (mailOtpFetchPromise) {
+            try {
+                await completeOtpWithMailPromise(page, mailOtpFetchPromise, dash);
+            }
+            catch (err) {
+                void mailOtpFetchPromise.catch(() => { });
+                throw err;
+            }
+            return;
         }
-        catch (err) {
-            void mailOtpFetchPromise.catch(() => { });
-            throw err;
-        }
-        return;
-    }
-    await page.waitForURL(dash, { timeout: 180000 });
+        await page.waitForURL(dash, { timeout: 180000 });
+    });
 }
-async function resubmitLoginAfterOtp(page: Page, core: BrowserServiceCore): Promise<void> {
+async function resubmitLoginAfterOtp(page: Page): Promise<void> {
     const submitBtn = await resolvePostOtpSubmitButton(page);
     await dismissCookieConsent(page, true);
     const deadline = Date.now() + 60000;
@@ -737,151 +844,7 @@ async function resubmitLoginAfterOtp(page: Page, core: BrowserServiceCore): Prom
         }
         await page.waitForTimeout(300);
     }
-    const dash = dashboardUrlRegex();
-    const OTP_LOGIN_CAPTURE_MS = 120000;
-    const OTP_LOGIN_POST_DASHBOARD_GRACE_MS = 3000;
-    const otpLoginCapture: {
-        res: import("playwright").Response | null;
-    } = { res: null };
-    let waitResolved = false;
-    let resolvedViaDashboard = false;
-    let responseDetachTimer: ReturnType<typeof setTimeout> | undefined;
-    let timeoutId: ReturnType<typeof setTimeout> | undefined;
-    const detachResponseListener = () => {
-        if (responseDetachTimer !== undefined) {
-            clearTimeout(responseDetachTimer);
-            responseDetachTimer = undefined;
-        }
-        page.off("response", onResponse);
-    };
-    const resolveOtpWait = () => {
-        if (waitResolved)
-            return;
-        waitResolved = true;
-        if (timeoutId !== undefined) {
-            clearTimeout(timeoutId);
-            timeoutId = undefined;
-        }
-        page.off("framenavigated", onFrameNav);
-        outerResolveOtpCapture?.();
-    };
-    const finishOtpCaptureFull = () => {
-        detachResponseListener();
-        resolveOtpWait();
-    };
-    const onResponse = (res: import("playwright").Response) => {
-        try {
-            if (!responseIsLiftUserLoginPost(res))
-                return;
-            otpLoginCapture.res = res;
-            if (!waitResolved) {
-                finishOtpCaptureFull();
-            }
-        }
-        catch {
-        }
-    };
-    const onFrameNav = (frame: import("playwright").Frame) => {
-        if (waitResolved)
-            return;
-        if (frame !== page.mainFrame())
-            return;
-        try {
-            if (!dash.test(frame.url()))
-                return;
-            resolvedViaDashboard = true;
-            if (timeoutId !== undefined) {
-                clearTimeout(timeoutId);
-                timeoutId = undefined;
-            }
-            page.off("framenavigated", onFrameNav);
-            resolveOtpWait();
-            responseDetachTimer = setTimeout(() => {
-                detachResponseListener();
-            }, OTP_LOGIN_POST_DASHBOARD_GRACE_MS);
-        }
-        catch {
-        }
-    };
-    let outerResolveOtpCapture: (() => void) | undefined;
-    const waitForOtpCaptureDone = new Promise<void>((resolve) => {
-        outerResolveOtpCapture = resolve;
-        timeoutId = setTimeout(() => {
-            if (waitResolved)
-                return;
-            finishOtpCaptureFull();
-        }, OTP_LOGIN_CAPTURE_MS);
-        page.on("response", onResponse);
-        page.on("framenavigated", onFrameNav);
-    });
-    try {
-        await forceClickSignInButton(page, submitBtn);
-    }
-    catch (err) {
-        finishOtpCaptureFull();
-        throw err;
-    }
-    await waitForOtpCaptureDone;
-    let capturedOtpLogin = otpLoginCapture.res;
-    if (!capturedOtpLogin && resolvedViaDashboard) {
-        await page.waitForTimeout(OTP_LOGIN_POST_DASHBOARD_GRACE_MS);
-        capturedOtpLogin = otpLoginCapture.res;
-    }
-    detachResponseListener();
-    let onDashboard = false;
-    try {
-        onDashboard = dash.test(page.url());
-    }
-    catch {
-    }
-    // Return captured response for the caller to store
-    const lastPostOtpLoginResponse: PostOtpLoginCapture | null = capturedOtpLogin
-        ? await (async () => {
-            const otpStatus = capturedOtpLogin!.status();
-            if (otpStatus === 429) {
-                const body = await capturedOtpLogin!.text().catch(() => "");
-                const classified = classifyVfs429FromHttp(otpStatus, body) ?? { kind: "ip" as const, code: "429" };
-                throwVfsRateLimited(classified.kind, classified.code, "OTP Login API HTTP 429");
-            }
-            if (otpStatus === 504) {
-                const body = await capturedOtpLogin!.text().catch(() => "");
-                throw new VfsGatewayTimeoutError("Login API returned 504 Gateway Timeout after OTP — restarting browser + rotating IP.");
-            }
-            const body = await capturedOtpLogin!.text().catch(() => "");
-            const json = parseVfsUserLoginResponseBody(body);
-            const capture: PostOtpLoginCapture = {
-                status: otpStatus,
-                url: capturedOtpLogin!.url(),
-                body,
-                json,
-            };
-            if (json) {
-                const errObj = json.error as {
-                    code?: number;
-                    description?: string;
-                } | undefined;
-                const bodyCode = String((json as Record<string, unknown>).code ?? errObj?.code ?? "");
-                const bodyKind = classifyVfs429(bodyCode);
-                if (bodyKind) {
-                    throwVfsRateLimited(bodyKind, bodyCode, "OTP Login API body rate-limit code");
-                }
-                if (errObj && errObj.code === 413 && errObj.description === "Invalid Sender User") {
-                    void new TelegramService()
-                        .alert("error", "The entered email id is not registered.")
-                        .catch(() => { });
-                }
-                const flat = flattenVfsLoginResponseForProfile(json);
-                if (flat)
-                    mergeVfsLoginProfile(flat);
-            }
-            return capture;
-        })()
-        : null;
-    if (!capturedOtpLogin && onDashboard) {
-    }
-    else if (!capturedOtpLogin) {
-    }
-    core.setLastPostOtpLoginResponse(lastPostOtpLoginResponse);
+    await forceClickSignInButton(page, submitBtn);
 }
 // ── Main login flow (top-level) ─────────────────────────────────────────
 export async function performLoginOnFirstTab(core: BrowserServiceCore, username: string, password: string): Promise<void> {
@@ -1059,7 +1022,7 @@ async function finishLoginAfterFirstSubmit(page: Page, mailOtpFetchPromise: Prom
         }
         else if (mailOtpFetchPromise) {
             try {
-                await completeOtpWithMailPromise(page, mailOtpFetchPromise, dash, core);
+                await withOtpLoginProfileWatch(page, core, () => completeOtpWithMailPromise(page, mailOtpFetchPromise, dash));
             }
             catch (err) {
                 void mailOtpFetchPromise.catch(() => { });
@@ -1068,7 +1031,7 @@ async function finishLoginAfterFirstSubmit(page: Page, mailOtpFetchPromise: Prom
         }
         else {
             try {
-                await page.waitForURL(dash, { timeout: 45000 });
+                await withOtpLoginProfileWatch(page, core, () => page.waitForURL(dash, { timeout: 45000 }).then(() => undefined));
             }
             catch {
             }

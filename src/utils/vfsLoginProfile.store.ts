@@ -1,5 +1,5 @@
 /**
- * Last successful `/user/login` JSON profile (password and/or OTP step), in-process only.
+ * Last `/user/login` JSON profile (password merge, then each OTP-step response replaces), in-process only.
  * Used to fill save-applicants 1:1 fields so the setup form need not duplicate them.
  */
 
@@ -13,9 +13,8 @@ export function setVfsLoginProfile(next: VfsUserLoginResponse | null): void {
 }
 
 /**
- * Shallow-merge non-empty fields into the stored profile. Password-step and OTP-step responses are merged so OTP
- * does not wipe applicant fields that only exist on one of the two JSON shapes.
- * Captures the first non-empty `lastName` from login response (before any merging) for ind/bgr logic.
+ * Shallow-merge non-empty fields into the stored profile (password step only).
+ * OTP-step responses use {@link replaceVfsLoginProfile} so the last login JSON wins in full.
  */
 export function mergeVfsLoginProfile(update: Record<string, unknown> | null | undefined): void {
   if (!update || typeof update !== "object") return;
@@ -32,11 +31,28 @@ export function mergeVfsLoginProfile(update: Record<string, unknown> | null | un
   profile = next as VfsUserLoginResponse;
 }
 
+/**
+ * Replace the stored profile with this login JSON. OTP retries overwrite in full (empty identity included)
+ * so the last response before dashboard is the one save-applicants uses.
+ */
+export function replaceVfsLoginProfile(next: Record<string, unknown> | VfsUserLoginResponse | null | undefined): void {
+  if (!next || typeof next !== "object") {
+    profile = null;
+    originalLastName = null;
+    return;
+  }
+  profile = next as VfsUserLoginResponse;
+  const ln = typeof (next as { lastName?: unknown }).lastName === "string"
+    ? (next as { lastName: string }).lastName.trim()
+    : "";
+  originalLastName = ln;
+}
+
 export function getVfsLoginProfile(): VfsUserLoginResponse | null {
   return profile;
 }
 
-/** Original `lastName` from first login response merge (before setup form overrides), for ind/bgr logic. */
+/** `lastName` from the latest replaced OTP login JSON (or first non-empty password merge). */
 export function getOriginalLoginLastName(): string {
   return originalLastName ?? "";
 }

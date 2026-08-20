@@ -1,13 +1,12 @@
 /**
- * Fleet proxy vendor: Bright Data (default) vs Thordata.
+ * Fleet proxy source: Bright Data (default) vs the IP list in `proxies.txt`.
  * Selection is runtime (Monitor tab), persisted on instance 0, and applied
  * on the next Chrome request via the local proxy-chain tunnel — no Chrome restart.
  */
 import { getApplicantDetailsOverrides, patchApplicantDetailsOverrides } from "./applicantDetails.store";
+import { buildProxyListUrl, listProxyListEntries } from "./proxyList";
 
-export type ProxyProviderId = "brightdata" | "thordata";
-
-const PLACEHOLDER_RE = /(^|[^A-Za-z0-9])(USERNAME|PASSWORD)([^A-Za-z0-9]|$)/i;
+export type ProxyProviderId = "brightdata" | "iplist";
 
 /** In-process override so IPC can apply before disk reload. */
 let memoryOverride: ProxyProviderId | null = null;
@@ -15,7 +14,9 @@ let memoryOverride: ProxyProviderId | null = null;
 export function parseProxyProviderId(raw: unknown): ProxyProviderId | null {
   const s = String(raw ?? "").trim().toLowerCase().replace(/[\s_]+/g, "-");
   if (s === "brightdata" || s === "bright-data" || s === "bd") return "brightdata";
-  if (s === "thordata" || s === "thor-data" || s === "td") return "thordata";
+  if (s === "iplist" || s === "ip-list" || s === "list" || s === "proxylist" || s === "proxy-list") {
+    return "iplist";
+  }
   return null;
 }
 
@@ -45,29 +46,19 @@ export function getActiveProxyProvider(): ProxyProviderId {
   return "brightdata";
 }
 
+/**
+ * Bright Data: the `PROXY_URLS` lines. IP list: every IP in the file, in file order —
+ * which bot gets which one is decided by `proxyClaims.ts`, not by this list.
+ */
 export function listProxyUrlsForProvider(provider: ProxyProviderId): string[] {
-  const raw =
-    provider === "thordata"
-      ? (process.env.PROXY_THORDATA_URLS ?? process.env.PROXY_THORDATA_URL ?? "").trim()
-      : (process.env.PROXY_URLS ?? "").trim();
-  return raw
+  if (provider === "iplist") {
+    return listProxyListEntries().map((entry) => buildProxyListUrl(entry));
+  }
+  return (process.env.PROXY_URLS ?? "")
+    .trim()
     .split(/[\r\n,]+/)
     .map((s) => s.trim())
     .filter(Boolean);
-}
-
-export function isThordataConfigured(): { ok: boolean; error?: string } {
-  const list = listProxyUrlsForProvider("thordata");
-  if (list.length === 0) {
-    return { ok: false, error: "PROXY_THORDATA_URL is not set in .env." };
-  }
-  if (PLACEHOLDER_RE.test(list.join(" "))) {
-    return {
-      ok: false,
-      error: "Thordata USERNAME/PASSWORD are still placeholders in .env. Fill them in and restart the bot.",
-    };
-  }
-  return { ok: true };
 }
 
 export function pickProxyUrlFromList(
@@ -85,5 +76,5 @@ export function pickProxyUrlFromList(
 }
 
 export function proxyProviderLabel(id: ProxyProviderId): string {
-  return id === "thordata" ? "Thordata" : "Bright Data";
+  return id === "iplist" ? "IP List" : "Bright Data";
 }

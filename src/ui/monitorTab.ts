@@ -208,7 +208,7 @@ export function buildMonitorTabHtml(): string {
   <div class="mon-toolbar" style="margin-bottom:0.5rem;display:flex;gap:0.4rem;align-items:center;justify-content:center;font-size:0.72rem;">
     <span style="color:#8b98a5;">Proxy</span>
     <button type="button" class="mon-proxy-btn active" id="monProxyBright" data-provider="brightdata" title="Bright Data (default) — all bots switch on the next API request">Bright Data</button>
-    <button type="button" class="mon-proxy-btn" id="monProxyThor" data-provider="thordata" title="Thordata — all bots switch on the next API request">Thordata</button>
+    <button type="button" class="mon-proxy-btn" id="monProxyList" data-provider="iplist" title="IP List (proxies.txt) — all bots switch on the next API request">IP List</button>
     <span id="monProxyHint" style="color:#8b98a5;font-size:0.62rem;"></span>
   </div>
   <div class="mon-grid" id="monGrid"></div>
@@ -651,7 +651,7 @@ export function buildMonitorTabHtml(): string {
           var rd = document.getElementById('monRepeatedDelay');
           if (rd) rd.value = String(c.repeatedDelaySec);
         }
-        setProxyUi(c.proxyProvider || 'brightdata', !!c.thordataReady);
+        setProxyUi(c.proxyProvider || 'brightdata', !!c.proxyListReady);
       }
     }).catch(function(){});
 
@@ -678,15 +678,15 @@ export function buildMonitorTabHtml(): string {
     bindApply('monApiDelayApply', 'monApiDelay', 'api-delay', 'API delay', 0, true);
     bindApply('monRepeatedDelayApply', 'monRepeatedDelay', 'repeated-delay', '409 delay', 1, false);
 
-    function setProxyUi(provider, thordataReady) {
+    function setProxyUi(provider, proxyListReady) {
       var bright = document.getElementById('monProxyBright');
-      var thor = document.getElementById('monProxyThor');
+      var list = document.getElementById('monProxyList');
       var hint = document.getElementById('monProxyHint');
-      var isThor = provider === 'thordata';
-      if (bright) bright.classList.toggle('active', !isThor);
-      if (thor) thor.classList.toggle('active', isThor);
+      var isList = provider === 'iplist';
+      if (bright) bright.classList.toggle('active', !isList);
+      if (list) list.classList.toggle('active', isList);
       if (hint) {
-        hint.textContent = thordataReady ? '' : 'Thordata credentials still placeholders in .env';
+        hint.textContent = proxyListReady ? '' : 'proxies.txt is empty/missing or credentials are placeholders';
       }
     }
     window.__syncMonitorProxyUi = setProxyUi;
@@ -697,16 +697,16 @@ export function buildMonitorTabHtml(): string {
       btn.addEventListener('click', function(){
         var provider = btn.getAttribute('data-provider');
         if (!provider) return;
-        var label = provider === 'thordata' ? 'Thordata' : 'Bright Data';
+        var label = provider === 'iplist' ? 'IP List' : 'Bright Data';
         toast('Switching all bots to ' + label + '…');
         post('proxy-provider', { provider: provider }).then(function(r){
           if (r.ok) {
             toast('All bots now use ' + label + ' from the next API request');
             fetch('/api/monitor/control').then(function(res){ return res.json(); }).then(function(d){
               if (d && d.ok && d.control) {
-                setProxyUi(d.control.proxyProvider || provider, !!d.control.thordataReady);
+                setProxyUi(d.control.proxyProvider || provider, !!d.control.proxyListReady);
                 if (window.__syncConfigureProxyUi) {
-                  window.__syncConfigureProxyUi(d.control.proxyProvider || provider, !!d.control.thordataReady);
+                  window.__syncConfigureProxyUi(d.control.proxyProvider || provider, !!d.control.proxyListReady);
                 }
               }
             }).catch(function(){});
@@ -717,7 +717,7 @@ export function buildMonitorTabHtml(): string {
       });
     }
     bindProxy('monProxyBright');
-    bindProxy('monProxyThor');
+    bindProxy('monProxyList');
     fetch('/api/monitor/snapshot').then(function(r){ return r.json(); }).then(function(d){
       if (d && d.ok && Array.isArray(d.instances)){
         for (var i = 0; i < d.instances.length; i++){

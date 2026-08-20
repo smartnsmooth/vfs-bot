@@ -16,10 +16,10 @@ import { buildMonitorTabHtml } from "./monitorTab";
 import type { MonitorHooks } from "../monitoring/status.types";
 import {
   getActiveProxyProvider,
-  isThordataConfigured,
   parseProxyProviderId,
   persistProxyProvider,
 } from "../utils/proxyProvider";
+import { isProxyListConfigured } from "../utils/proxyList";
 
 const APPLICANT_UI_PORT = 3847;
 
@@ -296,11 +296,11 @@ function applyProxyProviderFromBody(
 ): { ok: boolean; error?: string } {
   if (!("proxyProvider" in j)) return { ok: true };
   const id = parseProxyProviderId(j.proxyProvider);
-  if (!id) return { ok: false, error: "Provider must be brightdata or thordata." };
+  if (!id) return { ok: false, error: "Provider must be brightdata or iplist." };
   if (getActiveProxyProvider() === id) return { ok: true };
   if (monitor) return monitor.setProxyProvider(id);
-  if (id === "thordata") {
-    const check = isThordataConfigured();
+  if (id === "iplist") {
+    const check = isProxyListConfigured();
     if (!check.ok) return check;
   }
   persistProxyProvider(id);
@@ -342,7 +342,7 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
     <input type="hidden" id="proxyProvider" name="proxyProvider" value="brightdata" />
     <div class="cfg-proxy-row" role="group" aria-label="Proxy provider">
       <button type="button" class="cfg-proxy-btn active" id="cfgProxyBright" data-provider="brightdata" title="Bright Data (default)">Bright Data</button>
-      <button type="button" class="cfg-proxy-btn" id="cfgProxyThor" data-provider="thordata" title="Thordata">Thordata</button>
+      <button type="button" class="cfg-proxy-btn" id="cfgProxyList" data-provider="iplist" title="IP List (proxies.txt)">IP List</button>
       <span id="cfgProxyHint" style="color:#8b98a5;font-size:0.78rem;"></span>
     </div>
     <label for="userPollInterval" style="margin-top:0.75rem">Poll interval (seconds)</label>
@@ -1188,7 +1188,7 @@ export function runApplicantFormWithSubmitHandler(
               defaults.repeatedDelaySec = globalDet.repeatedDelaySec;
             }
             defaults.proxyProvider = getActiveProxyProvider();
-            defaults.thordataReady = isThordataConfigured().ok;
+            defaults.proxyListReady = isProxyListConfigured().ok;
             if (globalDet && typeof globalDet.indDeuEmailPrefix === "string") {
               defaults.indDeuEmailPrefix = globalDet.indDeuEmailPrefix;
             }

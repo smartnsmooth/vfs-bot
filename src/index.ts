@@ -3,7 +3,7 @@ import dotenv from "dotenv";
 dotenv.config({ override: false });
 import { exec, spawn } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync, watchFile, unwatchFile } from "node:fs";
 import { get as httpGet } from "node:http";
 import { get as httpsGet } from "node:https";
 import path from "node:path";
@@ -21,7 +21,6 @@ import { isIndDeuRoute } from "./utils/vfsRoute";
 import { reloadApplicantDetailsFromDisk, getApplicantDetailsOverrides, setApplicantDetailsOverrides } from "./utils/applicantDetails.store";
 import {
   getActiveProxyProvider,
-  isThordataConfigured,
   listProxyUrlsForProvider,
   parseProxyProviderId,
   persistProxyProvider,
@@ -30,6 +29,18 @@ import {
   setMemoryProxyProvider,
   type ProxyProviderId,
 } from "./utils/proxyProvider";
+import {
+  getProxyListFilePath,
+  isProxyListConfigured,
+  listProxyListEntries,
+  proxyListUrlForKey,
+} from "./utils/proxyList";
+import {
+  claimProxyForInstance,
+  getClaimedProxyKey,
+  heartbeatProxyClaim,
+  releaseProxyClaim,
+} from "./utils/proxyClaims";
 import {
   createSlotFoundWatcher,
   isSlotFoundByAnyInstance,
@@ -719,12 +730,94 @@ function stableSessionToken(instanceId: string): string {
   return `${base}-r${rot}`.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 40);
 }
 
-function resolveProxyForInstance(instanceId: string): string | null {
-  const list = listProxyUrlsForProvider(getActiveProxyProvider());
+const PROXY_CLAIM_HEARTBEAT_MS = 30_000;
+const PROXY_LIST_WATCH_INTERVAL_MS = 5_000;
+const PROXY_LIST_WATCH_DEBOUNCE_MS = 800;
+
+function numericBotInstanceId(): number {
+  const n = Number.parseInt(process.env.BOT_INSTANCE_ID ?? "1", 10);
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : 1;
+}
+
+let proxyClaimHeartbeatTimer: NodeJS.Timeout | null = null;
+
+/** Keeps this bot's IP claim alive; a silent claim is handed back to the fleet after 2 min. */
+function ensureProxyClaimHeartbeat(): void {
+  if (proxyClaimHeartbeatTimer) return;
+  proxyClaimHeartbeatTimer = setInterval(() => {
+    if (getActiveProxyProvider() !== "iplist") return;
+    heartbeatProxyClaim(numericBotInstanceId());
+  }, PROXY_CLAIM_HEARTBEAT_MS);
+  proxyClaimHeartbeatTimer.unref();
+}
+
+/**
+ * Bright Data: hash this instance onto `PROXY_URLS` + rotation offset.
+ * IP list: an exclusive claim from `proxies.txt`, where `takeNew` (every real Chrome launch)
+ * releases the current IP into its cooldown and takes the next unused one — the IP rotate.
+ */
+function resolveProxyForInstance(instanceId: string, opts?: { takeNew?: boolean }): string | null {
+  const provider = getActiveProxyProvider();
+  if (provider === "iplist") {
+    const keys = listProxyListEntries().map((entry) => entry.key);
+    if (keys.length === 0) return null;
+    const key = claimProxyForInstance(numericBotInstanceId(), keys, { takeNew: opts?.takeNew === true });
+    if (!key) return null;
+    ensureProxyClaimHeartbeat();
+    startProxyListFileWatcher();
+    return proxyListUrlForKey(key);
+  }
+  const list = listProxyUrlsForProvider(provider);
   if (list.length === 0) return null;
   const rot = getProxyRotationOffset(instanceId);
   const session = stableSessionToken(instanceId);
   return pickProxyUrlFromList(list, instanceId, rot, session);
+}
+
+let proxyListWatchPath: string | null = null;
+let proxyListWatchTimer: NodeJS.Timeout | null = null;
+
+/**
+ * Live reload of `proxies.txt`. `watchFile` (stat polling) rather than `fs.watch` because
+ * editors replace the file on save, which leaves `fs.watch` bound to the old handle on Windows.
+ */
+function startProxyListFileWatcher(): void {
+  const file = getProxyListFilePath();
+  if (proxyListWatchPath === file) return;
+  if (proxyListWatchPath) unwatchFile(proxyListWatchPath);
+  proxyListWatchPath = file;
+  watchFile(file, { interval: PROXY_LIST_WATCH_INTERVAL_MS }, (curr, prev) => {
+    if (curr.mtimeMs === prev.mtimeMs && curr.size === prev.size) return;
+    if (proxyListWatchTimer) clearTimeout(proxyListWatchTimer);
+    proxyListWatchTimer = setTimeout(() => {
+      void onProxyListFileChanged();
+    }, PROXY_LIST_WATCH_DEBOUNCE_MS);
+    proxyListWatchTimer.unref();
+  });
+}
+
+/**
+ * Only bots whose IP was removed from the file move; the rest keep the IP they are on, so
+ * appending IPs never disturbs a live session. The swap reuses the local tunnel port, so
+ * Chrome is not restarted.
+ */
+async function onProxyListFileChanged(): Promise<void> {
+  if (getActiveProxyProvider() !== "iplist") return;
+  const entries = listProxyListEntries();
+  if (entries.length === 0) return;
+
+  const current = getClaimedProxyKey(numericBotInstanceId());
+  if (current && entries.some((entry) => entry.key === current)) return;
+
+  const selected = resolveProxyForInstance(getBotInstanceId(resolveChromeUserDataDir()));
+  if (!selected) return;
+  if (!activeAnonymizedProxyUrl && localTunnelPort == null) return;
+  try {
+    await recreateAuthProxyTunnel(selected);
+    clearApplicantIpCache();
+  } catch {
+    /* keep the current tunnel; the next Chrome launch picks up the new list */
+  }
 }
 
 type ParsedProxy = {
@@ -825,12 +918,12 @@ async function recreateAuthProxyTunnel(selectedProxy: string): Promise<string> {
 }
 
 /**
- * Swap Bright Data / Thordata for this process. Chrome keeps the same local tunnel port;
+ * Swap Bright Data / IP list for this process. Chrome keeps the same local tunnel port;
  * existing CONNECT sockets are dropped so the next page `fetch()` uses the new upstream.
  */
 async function applyProxyProviderSwitch(provider: ProxyProviderId): Promise<{ ok: boolean; error?: string }> {
-  if (provider === "thordata") {
-    const check = isThordataConfigured();
+  if (provider === "iplist") {
+    const check = isProxyListConfigured();
     if (!check.ok) return check;
   }
   setMemoryProxyProvider(provider);
@@ -861,8 +954,8 @@ async function applyProxyProviderSwitch(provider: ProxyProviderId): Promise<{ ok
 }
 
 function commitProxyProvider(provider: ProxyProviderId): { ok: boolean; error?: string } {
-  if (provider === "thordata") {
-    const check = isThordataConfigured();
+  if (provider === "iplist") {
+    const check = isProxyListConfigured();
     if (!check.ok) return check;
   }
   persistProxyProvider(provider);
@@ -1003,7 +1096,8 @@ async function ensureChromeWithDevTools(opts?: { preserveSession?: boolean }): P
     preserveAuthSession: opts?.preserveSession === true,
   });
 
-  const selectedProxy = resolveProxyForInstance(instanceId);
+  // Every real Chrome spawn is an IP rotate: take the next unused entry from the list.
+  const selectedProxy = resolveProxyForInstance(instanceId, { takeNew: true });
   bumpProxyRotationForProfile(instanceId);
   clearApplicantIpCache();
 
@@ -2362,10 +2456,11 @@ async function performVfsLoginFromStore(instanceId?: number): Promise<void> {
  * **Cycle (this codebase):** a single invocation of this function for one cluster child (or one local run).
  * Cluster: parent sends `run-bot-cycle` after each Submit; on failure the child retries after 15s (`firstSubmit` is
  * only true on the first attempt). **Instance:** `instanceId` / `BOT_INSTANCE_ID` / `vfs-bot-profile-N` — each
- * instance uses its own `PROXY_URLS` slot and default sticky token `vfs-<instanceId>` (see `stableSessionToken`).
+ * instance uses its own `PROXY_URLS` slot and default sticky token `vfs-<instanceId>` (see `stableSessionToken`),
+ * or in IP-list mode its own exclusively claimed IP from `proxies.txt` (see `proxyClaims.ts`).
  *
- * **Different public IP per instance:** use multiple `PROXY_URLS` lines and/or `{session}` / `{instance}`; each
- * instance hashes to a different base index.
+ * **Different public IP per instance:** Bright Data — use multiple `PROXY_URLS` lines and/or `{session}` /
+ * `{instance}`; each instance hashes to a different base index. IP list — guaranteed by the claim store.
  *
  * **Different public IP per cycle:** today the proxy index advances and applicant IP cache clears only when
  * **Chrome is spawned** (`ensureChromeWithDevTools` does not early-return). If DevTools already runs, the same
@@ -2853,7 +2948,7 @@ async function start(): Promise<void> {
     },
     setProxyProvider: (provider) => {
       const id = parseProxyProviderId(provider);
-      if (!id) return { ok: false, error: "Provider must be brightdata or thordata." };
+      if (!id) return { ok: false, error: "Provider must be brightdata or iplist." };
       return commitProxyProvider(id);
     },
     reloadGlobalSettings: () => {
@@ -2877,7 +2972,7 @@ async function start(): Promise<void> {
         apiDelaySec: resolveApiDelaySec(globalDet),
         repeatedDelaySec: resolveRepeatedDelaySec(globalDet),
         proxyProvider: getActiveProxyProvider(),
-        thordataReady: isThordataConfigured().ok,
+        proxyListReady: isProxyListConfigured().ok,
       };
     },
   };
@@ -2940,7 +3035,17 @@ function shutdown(): void {
   if (isShuttingDown) return;
   isShuttingDown = true;
   const debugPort = getRemoteDebuggingPort();
-  
+
+  // Hand this bot's IP back to the pool (into its cooldown) instead of waiting for the
+  // heartbeat to go stale.
+  if (getActiveProxyProvider() === "iplist") {
+    try {
+      releaseProxyClaim(numericBotInstanceId());
+    } catch {
+      /* best effort */
+    }
+  }
+
   // Synchronous Chrome kill — completes immediately, no lingering PowerShell processes
   // that could kill newly launched Chrome on restart.
   killChromeTreeByCdpPortSync(debugPort);

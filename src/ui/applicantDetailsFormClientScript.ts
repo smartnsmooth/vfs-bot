@@ -21,22 +21,22 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     return 1;
   }
 
-  function setCfgProxyUi(provider, thordataReady) {
+  function setCfgProxyUi(provider, proxyListReady) {
     var hid = document.getElementById("proxyProvider");
     var bright = document.getElementById("cfgProxyBright");
-    var thor = document.getElementById("cfgProxyThor");
+    var list = document.getElementById("cfgProxyList");
     var hint = document.getElementById("cfgProxyHint");
-    var isThor = String(provider || "").toLowerCase() === "thordata";
-    if (hid) hid.value = isThor ? "thordata" : "brightdata";
-    if (bright) bright.classList.toggle("active", !isThor);
-    if (thor) thor.classList.toggle("active", isThor);
-    window.__thordataReady = thordataReady !== false;
+    var isList = String(provider || "").toLowerCase() === "iplist";
+    if (hid) hid.value = isList ? "iplist" : "brightdata";
+    if (bright) bright.classList.toggle("active", !isList);
+    if (list) list.classList.toggle("active", isList);
+    window.__proxyListReady = proxyListReady !== false;
     if (hint) {
-      hint.textContent = window.__thordataReady ? "" : "Thordata credentials still placeholders in .env";
+      hint.textContent = window.__proxyListReady ? "" : "proxies.txt is empty/missing or credentials are placeholders";
     }
   }
-  window.__syncConfigureProxyUi = function (provider, thordataReady) {
-    setCfgProxyUi(provider, thordataReady);
+  window.__syncConfigureProxyUi = function (provider, proxyListReady) {
+    setCfgProxyUi(provider, proxyListReady);
   };
 
   function bindCfgProxy(btnId) {
@@ -46,16 +46,16 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       var provider = btn.getAttribute("data-provider");
       if (!provider) return;
       var prev = (document.getElementById("proxyProvider") || {}).value || "brightdata";
-      setCfgProxyUi(provider, window.__thordataReady !== false);
+      setCfgProxyUi(provider, window.__proxyListReady !== false);
       fetch("/api/monitor/proxy-provider", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ provider: provider }),
       }).then(function (r) { return r.json(); }).then(function (j) {
         if (j && j.ok) {
-          if (window.__syncMonitorProxyUi) window.__syncMonitorProxyUi(provider, window.__thordataReady !== false);
+          if (window.__syncMonitorProxyUi) window.__syncMonitorProxyUi(provider, window.__proxyListReady !== false);
         } else {
-          setCfgProxyUi(prev, window.__thordataReady !== false);
+          setCfgProxyUi(prev, window.__proxyListReady !== false);
           var msg = document.getElementById("msg");
           if (msg) {
             msg.className = "err";
@@ -63,7 +63,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
           }
         }
       }).catch(function (err) {
-        setCfgProxyUi(prev, window.__thordataReady !== false);
+        setCfgProxyUi(prev, window.__proxyListReady !== false);
         var msg = document.getElementById("msg");
         if (msg) {
           msg.className = "err";
@@ -666,7 +666,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     {
       const gsrc = (globalInst && globalInst.details) || {};
       var loadedProvider = gsrc.proxyProvider != null ? String(gsrc.proxyProvider) : "brightdata";
-      setCfgProxyUi(loadedProvider, window.__thordataReady !== false);
+      setCfgProxyUi(loadedProvider, window.__proxyListReady !== false);
     }
     const prefixEl = document.getElementById("indDeuEmailPrefix");
     if (prefixEl) {
@@ -868,13 +868,13 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       await loadInstanceData(false);
 
       bindCfgProxy("cfgProxyBright");
-      bindCfgProxy("cfgProxyThor");
+      bindCfgProxy("cfgProxyList");
       fetch("/api/defaults").then(function (r) { return r.json(); }).then(function (d) {
         if (!d || !d.ok || !d.defaults) return;
-        window.__thordataReady = !!d.defaults.thordataReady;
-        setCfgProxyUi(d.defaults.proxyProvider || "brightdata", window.__thordataReady);
+        window.__proxyListReady = !!d.defaults.proxyListReady;
+        setCfgProxyUi(d.defaults.proxyProvider || "brightdata", window.__proxyListReady);
         if (window.__syncMonitorProxyUi) {
-          window.__syncMonitorProxyUi(d.defaults.proxyProvider || "brightdata", window.__thordataReady);
+          window.__syncMonitorProxyUi(d.defaults.proxyProvider || "brightdata", window.__proxyListReady);
         }
       }).catch(function () {});
 

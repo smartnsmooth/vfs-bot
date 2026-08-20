@@ -11,7 +11,7 @@ The bot now supports running multiple instances simultaneously, each with its ow
 - **Instance Isolation**: Each instance has:
   - Unique Chrome profile: `C:/vfs-bot-profile-1`, `C:/vfs-bot-profile-2`, etc.
   - Unique debugging port: 9222, 9223, 9224, etc.
-  - Unique proxy IP (if `PROXY_URLS` is configured)
+  - Unique proxy IP (from `PROXY_URLS`, or an exclusive IP from `proxies.txt` in IP List mode)
   - Independent job queue
 
 ## Setup
@@ -19,9 +19,17 @@ The bot now supports running multiple instances simultaneously, each with its ow
 ### 1. Configure `.env`
 
 ```env
-# Proxy URLs - each instance automatically gets a different IP
+# Bright Data: each instance automatically gets a different IP.
 # Using the {session} placeholder ensures sticky sessions per instance
 PROXY_URLS=http://user-session-{session}:pass@host:port
+
+# IP List: one proxy IP per line in proxies.txt, shared port/credentials here.
+PROXY_PROVIDER=iplist
+PROXY_LIST_FILE=proxies.txt
+PROXY_LIST_PROTOCOL=http
+PROXY_LIST_PORT=8080
+PROXY_LIST_USERNAME=user
+PROXY_LIST_PASSWORD=pass
 
 # Optionally set BOT_INSTANCE_ID to override the auto-generated ID
 # BOT_INSTANCE_ID=custom-id
@@ -90,7 +98,10 @@ Each instance gets a unique IP based on its `BOT_INSTANCE_ID`:
 3. Instance 3 → `BOT_INSTANCE_ID=3` → Proxy IP #3
 4. ...and so on
 
-The proxy selection uses a hash of the instance ID to pick from `PROXY_URLS` list, and the `{session}` placeholder is replaced with a stable session token derived from the instance ID.
+How the IP is picked depends on the proxy source selected in the Monitor / Configure tab:
+
+- **Bright Data** (`PROXY_PROVIDER=brightdata`) — a hash of the instance ID picks a line from `PROXY_URLS`, and the `{session}` placeholder is replaced with a stable session token derived from the instance ID.
+- **IP List** (`PROXY_PROVIDER=iplist`) — every IP in `proxies.txt` (one per line, shared port/credentials from `PROXY_LIST_*` in `.env`) is claimed exclusively through `proxy-claims.json`, so instance 1 takes the first free IP, instance 2 the next, and no two running bots share an IP. Every Chrome launch or IP rotate releases the current IP into a cooldown (`PROXY_LIST_COOLDOWN_MIN`, default 20 minutes) and takes the next unused one. When the list runs out the pool wraps around rather than failing. Editing `proxies.txt` while bots run only moves the bots whose IP was removed — no Chrome or fleet restart.
 
 ### Process Architecture
 

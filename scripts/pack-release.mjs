@@ -88,7 +88,8 @@ How to run:
 1) Install Google Chrome.
 ${nodeLine}
 3) Put your .env in this folder (copy .env.example to .env and edit).
-4) Double click start.bat (single instance) OR start-cluster.bat (multiple instances).
+4) For IP List proxy mode, put your proxy IPs in proxies.txt (one per line).
+5) Double click start.bat (single instance) OR start-cluster.bat (multiple instances).
 
 Note: For cluster mode, set the number of instances from the setup form UI.
 `;
@@ -179,6 +180,11 @@ async function main() {
     copyIfExists(path.join(root, ".env.example"), path.join(outDir, ".env.example"));
   } else {
     copyIfExists(path.join(root, ".env"), path.join(outDir, ".env.example"));
+  }
+
+  const copiedProxies = copyIfExists(path.join(root, "proxies.txt"), path.join(outDir, "proxies.txt"));
+  if (!copiedProxies) {
+    copyIfExists(path.join(root, "proxies.txt.example"), path.join(outDir, "proxies.txt.example"));
   }
 
   if (withPortableNode) {

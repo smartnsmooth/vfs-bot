@@ -28,10 +28,10 @@ import { beginIndDeuProcessSession } from "./utils/indDeuProcessSession";
 import { isIndDeuRoute } from "./utils/vfsRoute";
 import {
   getActiveProxyProvider,
-  isThordataConfigured,
   parseProxyProviderId,
   persistProxyProvider,
 } from "./utils/proxyProvider";
+import { isProxyListConfigured } from "./utils/proxyList";
 
 /** How many bot instances are currently running. Set by ensureInstances(). */
 let currentNumInstances = 0;
@@ -355,9 +355,9 @@ function buildMonitorHooks(): MonitorHooks {
     },
     setProxyProvider: (provider) => {
       const id = parseProxyProviderId(provider);
-      if (!id) return { ok: false, error: "Provider must be brightdata or thordata." };
-      if (id === "thordata") {
-        const check = isThordataConfigured();
+      if (!id) return { ok: false, error: "Provider must be brightdata or iplist." };
+      if (id === "iplist") {
+        const check = isProxyListConfigured();
         if (!check.ok) return check;
       }
       persistProxyProvider(id);
@@ -384,7 +384,7 @@ function buildMonitorHooks(): MonitorHooks {
         apiDelaySec: resolveApiDelaySec(global0),
         repeatedDelaySec: resolveRepeatedDelaySec(global0),
         proxyProvider: getActiveProxyProvider(),
-        thordataReady: isThordataConfigured().ok,
+        proxyListReady: isProxyListConfigured().ok,
       };
     },
   };
