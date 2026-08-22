@@ -879,6 +879,17 @@ async function resolveLaunchProxyServer(selectedProxy: string | null): Promise<{
 }
 
 /**
+ * proxy-chain defaults to port 8000 when `port` is omitted. In cluster mode every child
+ * would fight for 8000 — bot 1 wins, bots 2+ hang in anonymizeProxy and never spawn Chrome.
+ * Pin a per-instance port (sticky for vendor switches within this process).
+ */
+function preferredLocalTunnelPort(): number {
+  if (localTunnelPort != null && localTunnelPort > 0) return localTunnelPort;
+  const id = Math.max(1, parseInt(process.env.BOT_INSTANCE_ID ?? "1", 10) || 1);
+  return 28000 + id;
+}
+
+/**
  * Local proxy-chain listener Chrome uses (`--proxy-server=http://127.0.0.1:port`).
  * Rebinding the same port with a new upstream makes the next CONNECT use the new vendor
  * without restarting Chrome.
@@ -894,13 +905,13 @@ async function recreateAuthProxyTunnel(selectedProxy: string): Promise<string> {
     activeAnonymizedProxyUrl = null;
   }
 
+  const basePort = preferredLocalTunnelPort();
   let lastErr: unknown;
   for (let attempt = 0; attempt < 8; attempt++) {
     try {
-      const opts = localTunnelPort
-        ? { url: selectedProxy, port: localTunnelPort }
-        : { url: selectedProxy };
-      const url = await proxyChain.anonymizeProxy(opts);
+      // Always pass an explicit port — never let proxy-chain fall back to shared 8000.
+      const port = basePort + attempt;
+      const url = await proxyChain.anonymizeProxy({ url: selectedProxy, port });
       activeAnonymizedProxyUrl = url;
       try {
         const p = Number.parseInt(new URL(url).port, 10);
@@ -911,6 +922,8 @@ async function recreateAuthProxyTunnel(selectedProxy: string): Promise<string> {
       return url;
     } catch (err) {
       lastErr = err;
+      // Sticky port was busy/stale — allow the next attempt to pick basePort+attempt.
+      if (attempt === 0) localTunnelPort = null;
       await new Promise((r) => setTimeout(r, 40 + attempt * 30));
     }
   }
