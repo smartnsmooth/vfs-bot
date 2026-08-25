@@ -137,6 +137,47 @@ function sendStartNow(id: number): void {
   inst.process.send({ type: "run-bot-cycle", instanceId: id, pollStartAt: rolloutPollStartAt });
 }
 
+/** Delay before re-running a cycle that ended without a booking. */
+const CYCLE_RESTART_DELAY_MS = 10_000;
+const cycleRestartTimers = new Map<number, NodeJS.Timeout>();
+
+/**
+ * An instance must keep trying until it books a slot, so a cycle that ends without one is
+ * fed straight back in. Instances that booked, retired, or hit an account block report
+ * `settled` and are left alone.
+ */
+function scheduleCycleRestart(id: number, reason: string): void {
+  if (cycleRestartTimers.has(id)) return;
+  const inst = instances.find((i) => i.id === id);
+  if (!inst || !inst.process || inst.process.killed) return;
+
+  const cur = registry.get(id);
+  if (cur) {
+    registry.applyStatus({
+      ...cur,
+      phase: "recovering",
+      detail: `cycle ended (${reason}) — restarting`,
+      heartbeatAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+  }
+
+  const timer = setTimeout(() => {
+    cycleRestartTimers.delete(id);
+    sendStartNow(id);
+  }, CYCLE_RESTART_DELAY_MS);
+  timer.unref?.();
+  cycleRestartTimers.set(id, timer);
+}
+
+function cancelCycleRestart(id: number): void {
+  const timer = cycleRestartTimers.get(id);
+  if (timer) {
+    clearTimeout(timer);
+    cycleRestartTimers.delete(id);
+  }
+}
+
 async function runScheduler(): Promise<void> {
   if (rolloutActive) return;
   rolloutActive = true;
@@ -570,6 +611,7 @@ function spawnBotInstance(instanceId: number, totalInstances: number): ChildProc
         const inst = instances.find((i) => i.id === instanceId);
     // Only clear if this exit is still the active process (restart replaces the child).
     if (inst && inst.process === child) {
+      cancelCycleRestart(instanceId);
       inst.process = null;
       registry.setProcessAlive(instanceId, false);
       registry.markStopped(instanceId, code != null && code !== 0 ? `exited (code ${code})` : "process exited");
@@ -578,10 +620,14 @@ function spawnBotInstance(instanceId: number, totalInstances: number): ChildProc
 
   child.on("message", (msg: any) => {
     if (msg?.type === "bot-cycle-complete") {
-            return;
+      if (!msg.settled) {
+        scheduleCycleRestart(instanceId, msg.reason ? String(msg.reason) : "no booking");
+      }
+      return;
     }
     if (msg?.type === "instance-retired" && typeof msg.instanceId === "number") {
       const id = Math.floor(msg.instanceId);
+      cancelCycleRestart(id);
       const inst = instances.find((i) => i.id === id);
       if (inst) {
         inst.process = null;

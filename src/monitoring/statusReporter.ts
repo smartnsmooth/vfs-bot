@@ -33,6 +33,8 @@ class StatusReporter {
   private localFocus: LocalFocus | null = null;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+  /** Phase before `needs_attention`, restored when attention is cleared. */
+  private phaseBeforeAttention: BotPhase | null = null;
 
   init(instanceId: number, opts?: { debugPort?: number | null }): void {
     this.status = makeInitialStatus(instanceId, opts?.debugPort ?? null);
@@ -161,12 +163,19 @@ class StatusReporter {
     if (reason === null) {
       this.status.attention = null;
       // Clearing attention must also leave needs_attention — otherwise the
-      // Monitor card keeps the infinite blink forever.
+      // Monitor card keeps the infinite blink forever. Restore the prior
+      // workflow phase (login/turnstile) instead of idle so a solved captcha
+      // cannot strand the card while login is still finishing.
       if (this.status.phase === "needs_attention") {
-        this.status.phase = "idle";
+        const prior = this.phaseBeforeAttention;
+        this.status.phase = prior && prior !== "needs_attention" ? prior : "login";
       }
+      this.phaseBeforeAttention = null;
       this.flushNow();
       return;
+    }
+    if (this.status.phase !== "needs_attention") {
+      this.phaseBeforeAttention = this.status.phase;
     }
     this.status.attention = { reason, since: Date.now() };
     this.status.phase = "needs_attention";

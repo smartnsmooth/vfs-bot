@@ -24,8 +24,11 @@ export {
   VfsForbiddenError,
   VfsGatewayTimeoutError,
   VfsRateLimitedError,
+  VfsUnauthorizedError,
+  VfsAlreadyLoggedInError,
   IndDeuAccountRecreateError,
   AlreadyBookedError,
+  MissingUrnError,
   isTargetClosedError,
   isFailedToFetchError,
   readClientSourceHeader,
@@ -37,6 +40,7 @@ export {
 
 import {
   VfsForbiddenError,
+  MissingUrnError,
   readClientSourceHeader,
   LIFT_API_HOST_MARKER,
   throwVfsRateLimited,
@@ -53,6 +57,7 @@ import {
   postMapVasOnPage,
   postScheduleOnPage,
   type FleetTimeslotEntry,
+  type ScheduleResult,
 } from "./browser.booking";
 
 // ── Login module ────────────────────────────────────────────────────────
@@ -506,7 +511,7 @@ export class BrowserService implements BrowserServiceCore {
   async postFeesLiftApi(): Promise<void> {
     const urn = getApplicationUrn();
     if (!urn?.trim()) {
-            return;
+      throw new MissingUrnError("Fees: no urn; save applicants must run again");
     }
     const page = await this.getVfsPage();
     await postFeesOnPage(page, urn);
@@ -516,7 +521,7 @@ export class BrowserService implements BrowserServiceCore {
   async fetchCalendarDatesForFleet(): Promise<string[]> {
     const urn = getApplicationUrn();
     if (!urn?.trim()) {
-      throw new Error("Fleet calendar: no urn; save applicants successfully first");
+      throw new MissingUrnError("Fleet calendar: no urn; save applicants must run again");
     }
     const page = await this.getVfsPage();
     return fetchCalendarDatesForFleetOnPage(page, urn);
@@ -528,7 +533,7 @@ export class BrowserService implements BrowserServiceCore {
   ): Promise<FleetTimeslotEntry[]> {
     const urn = getApplicationUrn();
     if (!urn?.trim()) {
-      throw new Error("Fleet timeslot: no urn; save applicants successfully first");
+      throw new MissingUrnError("Fleet timeslot: no urn; save applicants must run again");
     }
     if (!slotDate?.trim()) {
       throw new Error("Fleet timeslot: no slotDate assigned");
@@ -543,20 +548,20 @@ export class BrowserService implements BrowserServiceCore {
     }
     const urn = getApplicationUrn();
     if (!urn?.trim()) {
-            return;
+      throw new MissingUrnError("MapVas: no urn; save applicants must run again");
     }
     const page = await this.getVfsPage();
     await postMapVasOnPage(page, urn);
   }
 
-  async postScheduleLiftApi(): Promise<{ paymentUrl: string | null }> {
+  async postScheduleLiftApi(): Promise<ScheduleResult> {
     const urn = getApplicationUrn();
     const allocationId = getAllocationId();
     if (!urn?.trim()) {
-            return { paymentUrl: null };
+      throw new MissingUrnError("Schedule: no urn; save applicants must run again");
     }
     if (!allocationId?.trim()) {
-            return { paymentUrl: null };
+            return { paymentUrl: null, booked: false };
     }
     const page = await this.getVfsPage();
     return postScheduleOnPage(page, urn, allocationId);

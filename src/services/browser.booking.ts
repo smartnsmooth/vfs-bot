@@ -15,9 +15,10 @@ import { saveBookingConfirmationFile } from "../utils/bookingConfirmationFile";
 import { isScheduleAlreadyBooked, saveAlreadyBookedAccountFile } from "../utils/alreadyBookedAccountFile";
 import { buildScheduleRedirectUrl } from "../utils/scheduleRedirectUrl";
 import { classifyVfsFirstTabUrl } from "../flows/vfsTabUrl";
-import { AlreadyBookedError, VfsForbiddenError, VfsGatewayTimeoutError, throwVfsRateLimited } from "./browser.errors";
+import { AlreadyBookedError, VfsForbiddenError, VfsGatewayTimeoutError, isFailedToFetchError, throwVfsRateLimited } from "./browser.errors";
 import { classifyVfs429FromHttp } from "../utils/vfsRateLimit";
-import { bumpJoinStaggerOn504 } from "../utils/calendarBookingCoord";
+import { throwIfLiftAuthBlocked } from "../utils/vfsAuthBlock";
+import { bumpJoinStaggerOn504 } from "../utils/joinStaggerCoord";
 import { getApiDelayMs, getRepeatedDelayMs, REPEATED_DELAY_STEP_SEC } from "../utils/fleetPollSchedule";
 import { isCloudflareChallengeBody, logApiCall, liftUrlToLogKind } from "../utils/apiCallLog";
 import { reporter } from "../monitoring/statusReporter";
@@ -35,6 +36,10 @@ function getLiftApiPageContextFromSource(page: Page): { origin: string; referer:
 }
 
 const REPEATED_DELAY_KINDS = new Set(["polling", "applicants", "calendar", "timeslot", "fees", "schedule"]);
+
+/** In-page retries for a dropped proxy connection before the caller rotates the IP. */
+const MAX_IN_PAGE_FETCH_RETRIES = 3;
+const IN_PAGE_FETCH_RETRY_STEP_MS = 1_000;
 
 function isHttp409(status: number): boolean {
   return status === 409;
@@ -82,6 +87,7 @@ export async function postLiftJsonFromPage(
   const { origin, referer, route } = getLiftApiPageContextFromSource(page);
   const clientSourceOverride: string | null = getCapturedClientSource()?.trim() || null;
   let repeatedDelayMs = getRepeatedDelayMs();
+  let fetchFailures = 0;
 
   for (;;) {
     if (logKind === "polling") {
@@ -176,6 +182,14 @@ export async function postLiftJsonFromPage(
     { url, payload, origin, referer, route, clientSourceOverride }
     );
     } catch (err) {
+      // A dropped proxy connection surfaces as "Failed to fetch". The VFS session is still
+      // valid, so retry in place before letting the caller rotate the IP or relogin.
+      if (isFailedToFetchError(err) && fetchFailures < MAX_IN_PAGE_FETCH_RETRIES) {
+        fetchFailures += 1;
+        reporter.setDetail(`fetch failed — retry ${fetchFailures}/${MAX_IN_PAGE_FETCH_RETRIES}`);
+        await new Promise<void>((r) => setTimeout(r, IN_PAGE_FETCH_RETRY_STEP_MS * fetchFailures));
+        continue;
+      }
       if (logKind) {
         logApiCall(
           logKind,
@@ -219,6 +233,7 @@ export async function postLiftJsonFromPage(
     if (rate) {
           throwVfsRateLimited(rate.kind, rate.code, `Lift API ${url}`);
     }
+    throwIfLiftAuthBlocked(result.status, result.body, `Lift API ${url}`);
     return result;
   }
 }
@@ -407,20 +422,31 @@ export async function fetchTimeslotAllocationsForFleetOnPage(
     if (!alloc) continue;
     entries.push({ allocationId: alloc, date: dateLabel, time: time || "unknown" });
   }
-    const inst = getCurrentInstanceId() ?? 1;
-  void new TelegramService()
-    .alert("hold_success", `Instance ${inst} timeslot for ${dateLabel}: ${entries.length} allocation(s)`)
-    .catch(() => { });
+  const inst = getCurrentInstanceId() ?? 1;
+  if (entries.length > 0) {
+    void new TelegramService()
+      .alert("hold_success", `Instance ${inst} timeslot for ${dateLabel}: ${entries.length} allocation(s)`)
+      .catch(() => { });
+  } else {
+    // The caller already consumed this date from the shared list, so record why it vanished.
+    reporter.setDetail(`timeslot 0 — ${dateLabel} dropped`);
+  }
   return entries;
 }
 
 // ── Schedule ─────────────────────────────────────────────────────────────
 
+export interface ScheduleResult {
+  paymentUrl: string | null;
+  /** True when VFS confirmed the appointment. Free routes book without returning a payment URL. */
+  booked: boolean;
+}
+
 export async function postScheduleOnPage(
   page: Page,
   urn: string,
   allocationId: string
-): Promise<{ paymentUrl: string | null }> {
+): Promise<ScheduleResult> {
   const payload = buildScheduleBody(urn, allocationId);
   
   const res = await postLiftJsonFromPage(page, SCHEDULE_URL, payload);
@@ -456,6 +482,11 @@ export async function postScheduleOnPage(
   saveBookingConfirmationFile(payload, j, getCurrentInstanceId());
 
   const schedulePaymentUrl = buildScheduleRedirectUrl(j);
+  // Free routes confirm the appointment without a payment URL, so the URL alone cannot decide this.
+  const booked =
+    schedulePaymentUrl != null ||
+    j.IsAppointmentBooked === true ||
+    String(j.appointmentDate ?? "").trim() !== "";
   if (schedulePaymentUrl) {
     setScheduleUrl(schedulePaymentUrl);
         void new TelegramService()
@@ -481,7 +512,7 @@ export async function postScheduleOnPage(
 
   await callScheduleRedirectGetIfPresent(page, j);
 
-    return { paymentUrl: schedulePaymentUrl };
+  return { paymentUrl: schedulePaymentUrl, booked };
 }
 
 async function callScheduleRedirectGetIfPresent(

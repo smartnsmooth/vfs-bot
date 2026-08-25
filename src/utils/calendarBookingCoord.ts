@@ -1,19 +1,35 @@
 /**
  * Fleet coordination for the Calendar-polling booking system.
  *
+ * There is no privileged instance: every URN holder is an equal candidate for both
+ * the Fees and the Calendar round-robin.
+ *
  * Shared state (JSON file) tracks:
  * - urnHolders: instances that got a URN from applicants
- * - feeCalculatorId: first URN holder → calls Calendar + Fees
- *   (a prior 1037/1101 retire does not block this — URN wins)
+ * - fees / totalAmount: one caller at a time, one call each. A miss (504, empty body,
+ *   any error) passes the turn to the next instance immediately.
  * - availableDateList: deduped dates from Calendar (consumed by instances for Timeslot)
  * - availableDatetimeList: date+time entries from Timeslot (consumed for Schedule)
- * - fees / totalAmount: published by FeeCalculator, used by all for Schedule
- * - calendarPollers: URN holders doing round-robin Calendar polling (case III)
+ * - calendar round-robin: when both lists are empty, URN holders take turns
+ *
+ * Whoever gets a successful fees or calendar response publishes it. All writes
+ * go through an exclusive lock file and a temp+rename, so a concurrent writer
+ * cannot produce a torn read or silently drop a peer's update.
  */
 
-import { existsSync, readFileSync, writeFileSync, unlinkSync, watch } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  statSync,
+  unlinkSync,
+  watch,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
-import { getApplicantsJoinStaggerMs } from "./fleetPollSchedule";
+import { isAmountGetter } from "./amountGetter";
 
 export type CalendarBookingPhase = "poll" | "active" | "calendar_repoll";
 
@@ -36,28 +52,32 @@ export interface CalendarBookingCoordState {
   /** Instance ids that finished save-applicants with a URN. */
   urnHolders: number[];
 
-  /** First URN holder = FeeCalculator. Prior already-booked does not override a later URN. */
-  feeCalculatorId: number | null;
-  firstApplicantsSuccessId: number | null;
-
-  /** FeeCalculator already called Calendar this wave. */
+  /** Calendar has been called this wave. */
   calendarCalled: boolean;
 
   /** Deduplicated dates from Calendar — instances pick randomly. */
   availableDateList: string[];
+  /** Dates already handed out by `pickRandomDate`, so a late publish cannot resurrect them. */
+  consumedDates: string[];
   /** Date+time entries from Timeslot — instances pick randomly. */
   availableDatetimeList: AvailableDatetime[];
 
   fees: SharedFees | null;
+  /** True once a fleet member published a usable totalAmount. */
   feesDone: boolean;
+  /** Round-robin pointer among URN holders while `feesDone` is false. */
+  feesAttemptIndex: number;
+  /** Instance whose one-shot fees call is in flight; null means the seat is free. */
+  feesAttemptOwnerId: number | null;
+  lastFeesAttemptAt: number;
+  lastFeesCallerId: number | null;
 
   /** Calendar round-robin polling state (case III). */
   calendarAttemptIndex: number;
+  /** Instance whose Calendar call is in flight; null means the seat is free. */
+  calendarAttemptOwnerId: number | null;
   lastCalendarAttemptAt: number;
   lastCalendarCallerId: number | null;
-
-  /** Extra join-stagger ms added fleet-wide after each Lift API 504. */
-  joinStaggerExtraMs: number;
 
   /** Successfully scheduled — leave the fleet. */
   scheduled: number[];
@@ -67,6 +87,34 @@ export interface CalendarBookingCoordState {
 }
 
 const COORD_FILE = join(process.cwd(), "calendar-booking-coord.json");
+const LOCK_FILE = join(process.cwd(), "calendar-booking-coord.lock");
+const TMP_FILE = `${COORD_FILE}.${process.pid}.tmp`;
+
+/**
+ * An attempt seat is held only for as long as one call can plausibly run. If the owner
+ * never comes back (killed, or thrown out of the booking loop by a 401) the seat frees
+ * itself and the round-robin continues. Calendar gets the longer budget because that
+ * call retries 504s and rides out repeated-delay backoff internally.
+ */
+const FEES_ATTEMPT_STALE_MS = 20_000;
+const CALENDAR_ATTEMPT_STALE_MS = 90_000;
+
+/**
+ * Head start the instance at the front of the round-robin gets before any other URN
+ * holder may take the turn. Long enough for a healthy instance to wake up and claim,
+ * short enough that one stuck in relogin barely costs the fleet anything.
+ */
+const FEES_TURN_GRACE_MS = 750;
+const CALENDAR_TURN_GRACE_MS = 2_500;
+
+/**
+ * Minimum gap before the *same* instance may call fees again. Only bites once the
+ * round-robin has come all the way back around, so it never delays a peer.
+ */
+const FEES_SELF_RETRY_GAP_MS = 1_500;
+
+/** Bound on `consumedDates` so a long run cannot grow the file without limit. */
+const MAX_CONSUMED_DATES = 200;
 
 function emptyState(): CalendarBookingCoordState {
   return {
@@ -74,17 +122,20 @@ function emptyState(): CalendarBookingCoordState {
     phase: "poll",
     waiters: [],
     urnHolders: [],
-    feeCalculatorId: null,
-    firstApplicantsSuccessId: null,
     calendarCalled: false,
     availableDateList: [],
+    consumedDates: [],
     availableDatetimeList: [],
     fees: null,
     feesDone: false,
+    feesAttemptIndex: 0,
+    feesAttemptOwnerId: null,
+    lastFeesAttemptAt: 0,
+    lastFeesCallerId: null,
     calendarAttemptIndex: 0,
+    calendarAttemptOwnerId: null,
     lastCalendarAttemptAt: 0,
     lastCalendarCallerId: null,
-    joinStaggerExtraMs: 0,
     scheduled: [],
     retired: [],
   };
@@ -97,6 +148,15 @@ function normalizeState(raw: Partial<CalendarBookingCoordState> | null | undefin
   const safeIntArray = (arr: unknown): number[] =>
     Array.isArray(arr) ? arr.map((n) => Math.floor(Number(n))).filter((n) => n >= 1) : [];
 
+  const safeCount = (v: unknown): number =>
+    typeof v === "number" && Number.isFinite(v) ? Math.max(0, Math.floor(v)) : 0;
+
+  const safeId = (v: unknown): number | null =>
+    typeof v === "number" && Number.isFinite(v) && v >= 1 ? Math.floor(v) : null;
+
+  const safeStringArray = (arr: unknown): string[] =>
+    Array.isArray(arr) ? arr.map((d) => String(d).trim()).filter(Boolean) : [];
+
   const safeDatetimeArray = (arr: unknown): AvailableDatetime[] => {
     if (!Array.isArray(arr)) return [];
     return arr
@@ -108,41 +168,26 @@ function normalizeState(raw: Partial<CalendarBookingCoordState> | null | undefin
   };
 
   return {
-    ...base,
-    ...raw,
-    revision: typeof raw.revision === "number" && Number.isFinite(raw.revision) ? raw.revision : 0,
+    revision: safeCount(raw.revision),
     phase: raw.phase === "active" || raw.phase === "calendar_repoll" ? raw.phase : "poll",
     waiters: safeIntArray(raw.waiters),
     urnHolders: safeIntArray(raw.urnHolders),
-    feeCalculatorId:
-      typeof raw.feeCalculatorId === "number" && Number.isFinite(raw.feeCalculatorId) ? raw.feeCalculatorId : null,
-    firstApplicantsSuccessId:
-      typeof raw.firstApplicantsSuccessId === "number" && Number.isFinite(raw.firstApplicantsSuccessId)
-        ? raw.firstApplicantsSuccessId
-        : null,
     calendarCalled: raw.calendarCalled === true,
-    availableDateList: Array.isArray(raw.availableDateList) ? raw.availableDateList.map(String).filter(Boolean) : [],
+    availableDateList: safeStringArray(raw.availableDateList),
+    consumedDates: safeStringArray(raw.consumedDates).slice(-MAX_CONSUMED_DATES),
     availableDatetimeList: safeDatetimeArray(raw.availableDatetimeList),
     fees: raw.fees && typeof raw.fees === "object" && typeof (raw.fees as SharedFees).totalAmount === "string"
       ? raw.fees as SharedFees
       : null,
     feesDone: raw.feesDone === true,
-    calendarAttemptIndex:
-      typeof raw.calendarAttemptIndex === "number" && Number.isFinite(raw.calendarAttemptIndex)
-        ? Math.max(0, Math.floor(raw.calendarAttemptIndex))
-        : 0,
-    lastCalendarAttemptAt:
-      typeof raw.lastCalendarAttemptAt === "number" && Number.isFinite(raw.lastCalendarAttemptAt)
-        ? Math.max(0, Math.floor(raw.lastCalendarAttemptAt))
-        : 0,
-    lastCalendarCallerId:
-      typeof raw.lastCalendarCallerId === "number" && Number.isFinite(raw.lastCalendarCallerId)
-        ? raw.lastCalendarCallerId
-        : null,
-    joinStaggerExtraMs:
-      typeof raw.joinStaggerExtraMs === "number" && Number.isFinite(raw.joinStaggerExtraMs)
-        ? Math.max(0, Math.floor(raw.joinStaggerExtraMs))
-        : 0,
+    feesAttemptIndex: safeCount(raw.feesAttemptIndex),
+    feesAttemptOwnerId: safeId(raw.feesAttemptOwnerId),
+    lastFeesAttemptAt: safeCount(raw.lastFeesAttemptAt),
+    lastFeesCallerId: safeId(raw.lastFeesCallerId),
+    calendarAttemptIndex: safeCount(raw.calendarAttemptIndex),
+    calendarAttemptOwnerId: safeId(raw.calendarAttemptOwnerId),
+    lastCalendarAttemptAt: safeCount(raw.lastCalendarAttemptAt),
+    lastCalendarCallerId: safeId(raw.lastCalendarCallerId),
     scheduled: safeIntArray(raw.scheduled),
     retired: safeIntArray(raw.retired),
   };
@@ -157,68 +202,124 @@ export function readCalendarBookingState(): CalendarBookingCoordState {
   }
 }
 
-function writeState(state: CalendarBookingCoordState): void {
+/** Temp+rename so a reader never observes a half-written file. */
+function writeStateAtomic(state: CalendarBookingCoordState): boolean {
   try {
-    writeFileSync(COORD_FILE, JSON.stringify(state, null, 2), "utf8");
+    writeFileSync(TMP_FILE, JSON.stringify(state, null, 2), "utf8");
   } catch {
-    /* swallow — another process may be writing */
+    return false;
   }
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      renameSync(TMP_FILE, COORD_FILE);
+      return true;
+    } catch {
+      spinWait(2);
+    }
+  }
+  try {
+    if (existsSync(TMP_FILE)) unlinkSync(TMP_FILE);
+  } catch {
+    /* ignore */
+  }
+  return false;
 }
 
-function sleepMs(ms: number): void {
+function spinWait(ms: number): void {
   const end = Date.now() + Math.max(0, ms);
   while (Date.now() < end) {
-    /* spin briefly for tight CAS retries */
+    /* no sync sleep primitive in node — spin briefly while contending for the lock */
   }
 }
 
-export function updateCalendarBookingState(
-  mutator: (state: CalendarBookingCoordState) => boolean
-): CalendarBookingCoordState {
-  for (let attempt = 0; attempt < 40; attempt++) {
-    const cur = readCalendarBookingState();
-    const rev = cur.revision;
-    const next = structuredClone(cur) as CalendarBookingCoordState;
-    if (!mutator(next)) return cur;
-    next.revision = rev + 1;
-    const again = readCalendarBookingState();
-    if (again.revision !== rev) {
-      sleepMs(5 + attempt);
-      continue;
-    }
-    writeState(next);
-    return next;
-  }
-  const cur = readCalendarBookingState();
-  const next = structuredClone(cur) as CalendarBookingCoordState;
-  mutator(next);
-  next.revision = cur.revision + 1;
-  writeState(next);
-  return next;
-}
-
-export function clearCalendarBookingCoord(): void {
+function maybeClearStaleLock(maxAgeMs = 2_000): void {
   try {
-    if (existsSync(COORD_FILE)) unlinkSync(COORD_FILE);
+    if (!existsSync(LOCK_FILE)) return;
+    if (Date.now() - statSync(LOCK_FILE).mtimeMs > maxAgeMs) unlinkSync(LOCK_FILE);
   } catch {
     /* ignore */
   }
 }
 
-// ── Join stagger ────────────────────────────────────────────────────────
+/** Lock is held only for one sync read+write, so a short total budget suffices. */
+const LOCK_WAIT_BUDGET_MS = 400;
 
-/** Base applicantsJoinStaggerSec + fleet-wide 504 bump (ms). */
-export function getEffectiveJoinStaggerMs(): number {
-  const extra = readCalendarBookingState().joinStaggerExtraMs ?? 0;
-  return getApplicantsJoinStaggerMs() + Math.max(0, extra);
+function withCoordLock<T>(fn: () => T): { ok: true; value: T } | { ok: false } {
+  const deadline = Date.now() + LOCK_WAIT_BUDGET_MS;
+  let attempt = 0;
+  do {
+    maybeClearStaleLock();
+    let fd: number | null = null;
+    try {
+      fd = openSync(LOCK_FILE, "wx");
+    } catch {
+      fd = null;
+    }
+    if (fd != null) {
+      try {
+        return { ok: true, value: fn() };
+      } finally {
+        try {
+          closeSync(fd);
+        } catch {
+          /* ignore */
+        }
+        try {
+          unlinkSync(LOCK_FILE);
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    spinWait(1 + (attempt++ % 5));
+  } while (Date.now() < deadline);
+  return { ok: false };
 }
 
-/** After a Lift API 504: bump stagger by 0.5s fleet-wide. */
-export function bumpJoinStaggerOn504(): CalendarBookingCoordState {
-  return updateCalendarBookingState((s) => {
-    s.joinStaggerExtraMs = (s.joinStaggerExtraMs ?? 0) + 500;
-    return true;
+export type MutateOutcome = "applied" | "declined" | "failed";
+
+export interface MutateResult {
+  state: CalendarBookingCoordState;
+  outcome: MutateOutcome;
+}
+
+/**
+ * Read-modify-write the shared state under the lock.
+ *
+ * `declined` means the mutator chose not to change anything; `failed` means the
+ * write could not be made (lock contention or rename failure) and the caller
+ * should retry. Nothing is ever written outside the lock, so a failed attempt
+ * leaves peer updates intact rather than overwriting them.
+ */
+export function mutateCalendarBookingState(
+  mutator: (state: CalendarBookingCoordState) => boolean
+): MutateResult {
+  const res = withCoordLock<MutateResult>(() => {
+    const cur = readCalendarBookingState();
+    const next = structuredClone(cur) as CalendarBookingCoordState;
+    if (!mutator(next)) return { state: cur, outcome: "declined" };
+    next.revision = cur.revision + 1;
+    if (!writeStateAtomic(next)) return { state: cur, outcome: "failed" };
+    return { state: next, outcome: "applied" };
   });
+  if (res.ok) return res.value;
+  return { state: readCalendarBookingState(), outcome: "failed" };
+}
+
+export function updateCalendarBookingState(
+  mutator: (state: CalendarBookingCoordState) => boolean
+): CalendarBookingCoordState {
+  return mutateCalendarBookingState(mutator).state;
+}
+
+export function clearCalendarBookingCoord(): void {
+  for (const f of [COORD_FILE, LOCK_FILE, TMP_FILE]) {
+    try {
+      if (existsSync(f)) unlinkSync(f);
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 // ── Calendar dates helpers ──────────────────────────────────────────────
@@ -239,18 +340,22 @@ export function dedupeCalendarDates(dates: string[]): string[] {
 
 export function registerFleetUrn(instanceId: number): CalendarBookingCoordState {
   const id = Math.max(1, Math.floor(instanceId));
+  // The amountGetter holds a URN but never books — keeping it out of the holder
+  // list stops the fees round-robin handing turns to an instance that is not there.
+  if (isAmountGetter(id)) return readCalendarBookingState();
   return updateCalendarBookingState((s) => {
-    // URN is the source of truth: un-retire so a prior 1037/1101 cannot
-    // block this instance from being FeeCalculator (first URN holder).
+    // URN is the source of truth: un-retire so a prior 1037/1101 cannot keep this
+    // instance out of the fees and calendar round-robins.
+    const wasRetired = s.retired.includes(id);
+    const wasHolder = s.urnHolders.includes(id);
+    const wasWaiter = s.waiters.includes(id);
+    if (!wasRetired && wasHolder && wasWaiter) return false;
+
     s.retired = s.retired.filter((n) => n !== id);
-    if (!s.urnHolders.includes(id)) s.urnHolders.push(id);
+    if (!wasHolder) s.urnHolders.push(id);
     s.urnHolders = [...new Set(s.urnHolders)].filter((n) => n >= 1).sort((a, b) => a - b);
-    if (!s.waiters.includes(id)) s.waiters.push(id);
+    if (!wasWaiter) s.waiters.push(id);
     s.waiters = [...new Set(s.waiters)].filter((n) => n >= 1).sort((a, b) => a - b);
-    if (s.feeCalculatorId == null) {
-      s.feeCalculatorId = id;
-      s.firstApplicantsSuccessId = id;
-    }
     return true;
   });
 }
@@ -270,10 +375,12 @@ export function activeWaiters(state: CalendarBookingCoordState): number[] {
 
 export function registerCalendarWaiter(instanceId: number): CalendarBookingCoordState {
   const id = Math.max(1, Math.floor(instanceId));
+  if (isAmountGetter(id)) return readCalendarBookingState();
   return updateCalendarBookingState((s) => {
     if (s.retired.includes(id)) return false;
-    if (!s.waiters.includes(id)) s.waiters.push(id);
-    s.waiters = [...new Set(s.waiters)].filter((n) => n >= 1).sort((a, b) => a - b);
+    // Called on every loop iteration by every instance — only write when it changes something.
+    if (s.waiters.includes(id)) return false;
+    s.waiters = [...new Set([...s.waiters, id])].filter((n) => n >= 1).sort((a, b) => a - b);
     return true;
   });
 }
@@ -285,47 +392,179 @@ export function retireFromFleet(instanceId: number): CalendarBookingCoordState {
     if (!s.retired.includes(id)) s.retired.push(id);
     s.waiters = s.waiters.filter((w) => w !== id);
     s.urnHolders = s.urnHolders.filter((w) => w !== id);
-    if (s.feeCalculatorId === id) s.feeCalculatorId = null;
-    return true;
-  });
-}
-
-// ── FeeCalculator: Calendar + Fees ──────────────────────────────────────
-
-/**
- * FeeCalculator calls Calendar: store deduped dates in availableDateList,
- * set phase to "active" so instances can start picking dates.
- */
-export function publishCalendarDates(
-  feeCalculatorId: number,
-  dates: string[]
-): CalendarBookingCoordState {
-  const fc = Math.max(1, Math.floor(feeCalculatorId));
-  const cleanDates = dedupeCalendarDates(dates);
-  return updateCalendarBookingState((s) => {
-    if (s.feeCalculatorId !== fc) return false;
-    s.calendarCalled = true;
-    s.availableDateList = cleanDates;
-    s.lastCalendarCallerId = fc;
-    s.lastCalendarAttemptAt = Date.now();
-    if (cleanDates.length > 0) {
-      s.phase = "active";
+    if (s.feesAttemptOwnerId === id) {
+      s.feesAttemptOwnerId = null;
+      s.feesAttemptIndex = Math.max(0, s.feesAttemptIndex) + 1;
+    }
+    if (s.calendarAttemptOwnerId === id) {
+      s.calendarAttemptOwnerId = null;
+      s.lastCalendarAttemptAt = 0;
+      s.calendarAttemptIndex = Math.max(0, s.calendarAttemptIndex) + 1;
     }
     return true;
   });
 }
 
-export function publishSharedFees(instanceId: number, fees: SharedFees): CalendarBookingCoordState {
+// ── Fees: one call at a time, one shot each ─────────────────────────────
+
+function roundRobinCallers(s: CalendarBookingCoordState): number[] {
+  return activeWaiters(s).filter((id) => s.urnHolders.includes(id));
+}
+
+/**
+ * A turn is a preference, not a right. The instance at the front of the round-robin
+ * gets a head start; after that any URN holder may take the turn, so a peer that is
+ * mid-relogin or gone for good cannot stall the whole fleet.
+ */
+function turnIsOpenTo(opts: {
+  id: number;
+  preferred: number | null;
+  openedAt: number;
+  graceMs: number;
+  now: number;
+}): boolean {
+  if (opts.preferred === opts.id) return true;
+  if (opts.openedAt <= 0) return true;
+  return opts.now - opts.openedAt >= opts.graceMs;
+}
+
+/**
+ * Instance whose turn it is to call Fees — the in-flight owner while a call is
+ * running, otherwise the next URN holder in the round-robin. Null once the fleet
+ * has a totalAmount or while nobody holds a URN.
+ */
+export function getFeesCallerId(
+  state: CalendarBookingCoordState,
+  now: number = Date.now()
+): number | null {
+  if (state.feesDone) return null;
+  const callers = roundRobinCallers(state);
+  if (callers.length === 0) return null;
+  const owner = state.feesAttemptOwnerId;
+  if (owner != null && now - state.lastFeesAttemptAt < FEES_ATTEMPT_STALE_MS) return owner;
+  const idx = Math.max(0, Math.floor(state.feesAttemptIndex));
+  return callers[idx % callers.length] ?? null;
+}
+
+/**
+ * Take the fees seat for exactly one call.
+ *
+ * The seat is held only while that call is in flight; `releaseFeesAttempt` hands it
+ * to the next instance the moment the call comes back without a totalAmount, so a
+ * miss costs the fleet one request rather than a retry loop.
+ */
+export function claimFeesAttempt(instanceId: number): boolean {
+  const id = Math.max(1, Math.floor(instanceId));
+  let claimed = false;
+  const r = mutateCalendarBookingState((s) => {
+    if (s.feesDone) return false;
+    const now = Date.now();
+    if (!roundRobinCallers(s).includes(id)) return false;
+    const owner = s.feesAttemptOwnerId;
+    if (owner != null && owner !== id && now - s.lastFeesAttemptAt < FEES_ATTEMPT_STALE_MS) return false;
+    if (s.lastFeesCallerId === id && now - s.lastFeesAttemptAt < FEES_SELF_RETRY_GAP_MS) return false;
+    if (
+      !turnIsOpenTo({
+        id,
+        preferred: getFeesCallerId(s, now),
+        openedAt: s.lastFeesAttemptAt,
+        graceMs: FEES_TURN_GRACE_MS,
+        now,
+      })
+    ) {
+      return false;
+    }
+    s.feesAttemptOwnerId = id;
+    s.lastFeesCallerId = id;
+    s.lastFeesAttemptAt = now;
+    claimed = true;
+    return true;
+  });
+  return claimed && r.outcome === "applied";
+}
+
+/**
+ * The call came back without a totalAmount — 504, empty body, error, it makes no
+ * difference. Advance the round-robin so the next instance can call right away; this
+ * instance is free to try again later without anyone waiting on it.
+ */
+export function releaseFeesAttempt(instanceId: number): CalendarBookingCoordState {
   const id = Math.max(1, Math.floor(instanceId));
   return updateCalendarBookingState((s) => {
-    if (s.feeCalculatorId !== id) return false;
+    if (s.feesAttemptOwnerId !== id) return false;
+    s.feesAttemptOwnerId = null;
+    s.feesAttemptIndex = Math.max(0, s.feesAttemptIndex) + 1;
+    return true;
+  });
+}
+
+// ── Publishing Calendar + Fees results ──────────────────────────────────
+
+/** Any URN holder that is still in the fleet may publish a successful response. */
+function publisherIsEligible(s: CalendarBookingCoordState, id: number): boolean {
+  return s.urnHolders.includes(id) && !s.retired.includes(id);
+}
+
+/**
+ * Publish Calendar dates. Merges into `availableDateList` rather than replacing
+ * it, and skips dates already handed out, so a publish that lands after peers
+ * started consuming cannot resurrect a taken date or drop a fresh one.
+ *
+ * A response that brings nothing usable rotates the round-robin, so the next poll
+ * comes from a different instance.
+ *
+ * Returns true when the state now reflects this call.
+ */
+export function publishCalendarDates(publisherId: number, dates: string[]): boolean {
+  const id = Math.max(1, Math.floor(publisherId));
+  const cleanDates = dedupeCalendarDates(dates);
+  const r = mutateCalendarBookingState((s) => {
+    if (!publisherIsEligible(s, id)) return false;
+    s.calendarCalled = true;
+    s.lastCalendarCallerId = id;
+    s.lastCalendarAttemptAt = Date.now();
+    if (s.calendarAttemptOwnerId === id) s.calendarAttemptOwnerId = null;
+    const consumed = new Set(s.consumedDates);
+    for (const d of cleanDates) {
+      if (consumed.has(d) || s.availableDateList.includes(d)) continue;
+      s.availableDateList.push(d);
+    }
+    if (s.availableDateList.length > 0) {
+      s.phase = "active";
+    } else {
+      s.calendarAttemptIndex = Math.max(0, s.calendarAttemptIndex) + 1;
+    }
+    return true;
+  });
+  return r.outcome === "applied";
+}
+
+/**
+ * Publish shared fees. First successful caller wins, whoever it is — an instance
+ * that missed its turn but still came back with an amount latches it for the fleet.
+ *
+ * Returns true when shared fees are present (published now or already there).
+ */
+export function publishSharedFees(publisherId: number, fees: SharedFees): boolean {
+  const id = Math.max(1, Math.floor(publisherId));
+  const totalAmount = String(fees.totalAmount).trim();
+  if (!totalAmount) return false;
+  let alreadyPublished = false;
+  const r = mutateCalendarBookingState((s) => {
+    if (s.feesDone && s.fees?.totalAmount?.trim()) {
+      alreadyPublished = true;
+      return false;
+    }
+    if (!publisherIsEligible(s, id)) return false;
     s.fees = {
-      totalAmount: String(fees.totalAmount).trim(),
+      totalAmount,
       currency: fees.currency != null && String(fees.currency).trim() !== "" ? String(fees.currency).trim() : null,
     };
     s.feesDone = true;
+    s.feesAttemptOwnerId = null;
     return true;
   });
+  return alreadyPublished || r.outcome === "applied";
 }
 
 // ── Available date list: atomic pick + remove ───────────────────────────
@@ -336,14 +575,20 @@ export function publishSharedFees(instanceId: number, fees: SharedFees): Calenda
  */
 export function pickRandomDate(): string | null {
   let picked: string | null = null;
-  updateCalendarBookingState((s) => {
+  const r = mutateCalendarBookingState((s) => {
     if (s.availableDateList.length === 0) return false;
     const idx = Math.floor(Math.random() * s.availableDateList.length);
     picked = s.availableDateList[idx]!;
     s.availableDateList.splice(idx, 1);
+    if (!s.consumedDates.includes(picked)) s.consumedDates.push(picked);
+    if (s.consumedDates.length > MAX_CONSUMED_DATES) {
+      s.consumedDates = s.consumedDates.slice(-MAX_CONSUMED_DATES);
+    }
     return true;
   });
-  return picked;
+  // A failed write means the removal was not recorded, so another instance still
+  // owns this date — do not act on it.
+  return r.outcome === "applied" ? picked : null;
 }
 
 // ── Available datetime list: atomic add / pick + remove ─────────────────
@@ -354,12 +599,16 @@ export function pickRandomDate(): string | null {
  */
 export function addToAvailableDatetimeList(entries: AvailableDatetime[]): CalendarBookingCoordState {
   return updateCalendarBookingState((s) => {
+    let changed = false;
     for (const e of entries) {
       const dt = { date: e.date.trim(), time: e.time.trim() };
       if (!dt.date || !dt.time) continue;
+      // Several instances hand back the same date's slots, so keep one entry per date+time.
+      if (s.availableDatetimeList.some((x) => x.date === dt.date && x.time === dt.time)) continue;
       s.availableDatetimeList.push(dt);
+      changed = true;
     }
-    return true;
+    return changed;
   });
 }
 
@@ -369,58 +618,73 @@ export function addToAvailableDatetimeList(entries: AvailableDatetime[]): Calend
  */
 export function pickRandomDatetime(): AvailableDatetime | null {
   let picked: AvailableDatetime | null = null;
-  updateCalendarBookingState((s) => {
+  const r = mutateCalendarBookingState((s) => {
     if (s.availableDatetimeList.length === 0) return false;
     const idx = Math.floor(Math.random() * s.availableDatetimeList.length);
     picked = { ...s.availableDatetimeList[idx]! };
     s.availableDatetimeList.splice(idx, 1);
     return true;
   });
-  return picked;
+  return r.outcome === "applied" ? picked : null;
 }
 
 // ── Calendar round-robin polling (case III) ─────────────────────────────
 
 /** Get the next Calendar polling caller among URN holders (round-robin). */
 export function getCalendarPollingCallerId(state: CalendarBookingCoordState): number | null {
-  const pollers = activeWaiters(state).filter((id) => state.urnHolders.includes(id));
+  const pollers = roundRobinCallers(state);
   if (pollers.length === 0) return null;
   const attempt = Math.max(0, Math.floor(state.calendarAttemptIndex));
   return pollers[attempt % pollers.length] ?? null;
 }
 
-export function recordCalendarPollFailure(instanceId: number): CalendarBookingCoordState {
+/**
+ * Take the Calendar seat for one call. `intervalMs` is the configured re-poll gap:
+ * a fresh call is only allowed once that long has passed since the last attempt.
+ */
+export function claimCalendarAttempt(instanceId: number, intervalMs: number): boolean {
   const id = Math.max(1, Math.floor(instanceId));
-  return updateCalendarBookingState((s) => {
-    if (s.phase !== "poll" && s.phase !== "calendar_repoll") return false;
-    if (getCalendarPollingCallerId(s) !== id) return false;
+  let claimed = false;
+  const r = mutateCalendarBookingState((s) => {
+    const now = Date.now();
+    if (!roundRobinCallers(s).includes(id)) return false;
+    const owner = s.calendarAttemptOwnerId;
+    if (owner != null && owner !== id && now - s.lastCalendarAttemptAt < CALENDAR_ATTEMPT_STALE_MS) return false;
+    const gap = Math.max(0, intervalMs);
+    if (s.lastCalendarAttemptAt > 0 && now - s.lastCalendarAttemptAt < gap) return false;
+    if (
+      !turnIsOpenTo({
+        id,
+        preferred: getCalendarPollingCallerId(s),
+        // The turn opens when the re-poll interval expires, not when the last call started.
+        openedAt: s.lastCalendarAttemptAt > 0 ? s.lastCalendarAttemptAt + gap : 0,
+        graceMs: CALENDAR_TURN_GRACE_MS,
+        now,
+      })
+    ) {
+      return false;
+    }
+    s.calendarAttemptOwnerId = id;
     s.lastCalendarCallerId = id;
-    s.lastCalendarAttemptAt = Date.now();
-    s.calendarAttemptIndex = Math.max(0, s.calendarAttemptIndex) + 1;
+    s.lastCalendarAttemptAt = now;
+    claimed = true;
     return true;
   });
+  return claimed && r.outcome === "applied";
 }
 
 /**
- * Calendar round-robin success: store new dates and re-enter active phase.
+ * Calendar call came back with nothing to publish. Rotate to the next poller and
+ * clear the interval gate: the polling interval exists to space out "no slots"
+ * answers, not to punish a request that never landed.
  */
-export function publishCalendarRepollDates(
-  callerId: number,
-  dates: string[]
-): CalendarBookingCoordState {
-  const id = Math.max(1, Math.floor(callerId));
-  const cleanDates = dedupeCalendarDates(dates);
+export function releaseCalendarAttempt(instanceId: number): CalendarBookingCoordState {
+  const id = Math.max(1, Math.floor(instanceId));
   return updateCalendarBookingState((s) => {
-    if (s.phase !== "calendar_repoll") return false;
-    s.lastCalendarCallerId = id;
-    s.lastCalendarAttemptAt = Date.now();
-    s.calendarCalled = true;
-    for (const d of cleanDates) {
-      if (!s.availableDateList.includes(d)) s.availableDateList.push(d);
-    }
-    if (s.availableDateList.length > 0) {
-      s.phase = "active";
-    }
+    if (s.calendarAttemptOwnerId !== id) return false;
+    s.calendarAttemptOwnerId = null;
+    s.lastCalendarAttemptAt = 0;
+    s.calendarAttemptIndex = Math.max(0, s.calendarAttemptIndex) + 1;
     return true;
   });
 }
@@ -431,13 +695,17 @@ export function publishCalendarRepollDates(
  */
 export function enterCalendarRepoll(): boolean {
   let entered = false;
-  updateCalendarBookingState((s) => {
+  mutateCalendarBookingState((s) => {
     if (s.phase === "calendar_repoll") { entered = true; return false; }
     if (s.availableDateList.length > 0 || s.availableDatetimeList.length > 0) return false;
     s.phase = "calendar_repoll";
     s.calendarAttemptIndex = 0;
-    s.lastCalendarAttemptAt = Date.now();
+    s.calendarAttemptOwnerId = null;
+    // No attempt yet in this round, so the first caller goes without waiting out the interval.
+    s.lastCalendarAttemptAt = 0;
     s.lastCalendarCallerId = null;
+    // Fresh round: a date that went nowhere last round may have opened up again.
+    s.consumedDates = [];
     entered = true;
     return true;
   });
@@ -503,22 +771,4 @@ export function createCalendarBookingWatcher(): {
   };
 
   return { wait, dispose };
-}
-
-// ── Backward compat re-exports (used by other modules) ──────────────────
-
-/** @deprecated Use publishCalendarDates. */
-export function beginCalendarSuccessPendingUrnWait(
-  feeCalculatorId: number,
-  dates: string[]
-): CalendarBookingCoordState {
-  return publishCalendarDates(feeCalculatorId, dates);
-}
-
-/** @deprecated No longer used — kept for import compat. */
-export function beginDistributeAfterCalendarSuccess(
-  feeCalculatorId: number,
-  dates: string[]
-): CalendarBookingCoordState {
-  return publishCalendarDates(feeCalculatorId, dates);
 }

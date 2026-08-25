@@ -1,12 +1,12 @@
 import type { Page } from "playwright";
 import { config } from "../config/config";
 import { classifyVfs429, classifyVfs429FromHttp, classifyVfs429FromPageText, } from "../utils/vfsRateLimit";
-import { classifyVfsFirstTabUrl } from "../flows/vfsTabUrl";
+import { classifyVfsFirstTabUrl, isVfsDashboardUrl } from "../flows/vfsTabUrl";
 import { fetchMailTmToken, isMailTmVerbose, listMailTmMessages, maskEmailForLog, waitForOtpFromMailTm, } from "./mailTm.service";
 import { TelegramService } from "./telegram.service";
 import { flattenVfsLoginResponseForProfile, parseVfsUserLoginResponseBody, stripPasswordStepApplicantFieldsForProfileMerge, } from "../types/vfsUserLogin.type.js";
 import { clearVfsLoginProfile, mergeVfsLoginProfile, replaceVfsLoginProfile } from "../utils/vfsLoginProfile.store.js";
-import { VfsForbiddenError, VfsGatewayTimeoutError, VfsRateLimitedError, PageNotFoundRestartError, IndDeuAccountRecreateError, isTargetClosedError, throwVfsRateLimited, responseIsLiftUserLoginPost, injectTurnstileTokenInPage, } from "./browser.errors";
+import { VfsForbiddenError, VfsGatewayTimeoutError, VfsRateLimitedError, VfsAlreadyLoggedInError, PageNotFoundRestartError, IndDeuAccountRecreateError, isTargetClosedError, throwVfsRateLimited, responseIsLiftUserLoginPost, injectTurnstileTokenInPage, } from "./browser.errors";
 import { isPageNotFoundUrl } from "../flows/pageNotFound";
 import type { BrowserServiceCore } from "./browser.core";
 import { clickTurnstile, waitForManualTurnstile } from "./turnstile.click";
@@ -29,6 +29,25 @@ function throwIfBlockPage(page: Page): void {
         throw new PageNotFoundRestartError(`redirected to ${url}`);
     }
 }
+function pageUrlSafe(page: Page): string {
+    try {
+        return page.url();
+    }
+    catch {
+        return "";
+    }
+}
+/**
+ * Every login stage calls this: when the VFS session is still valid, `/login`
+ * redirects to the dashboard and the login form / OTP field / Turnstile widget
+ * never appear, so waiting for them only burns timeouts and ends in a bogus
+ * login failure. `performLoginOnFirstTab` catches this and returns success.
+ */
+function throwIfAlreadyLoggedIn(page: Page, stage: string): void {
+    const url = pageUrlSafe(page);
+    if (!isVfsDashboardUrl(url)) return;
+    throw new VfsAlreadyLoggedInError(stage, url);
+}
 /**
  * Throttled block-page checker for use during the Turnstile wait. Throws (so the
  * login flow bails out to its 403/429 recovery instead of spinning on a captcha
@@ -39,6 +58,8 @@ function throwIfBlockPage(page: Page): void {
 function makeBlockCheck(page: Page): () => Promise<void> {
     let lastBody = 0;
     return async () => {
+        // Session still valid → VFS navigated away to the dashboard: stop waiting.
+        throwIfAlreadyLoggedIn(page, "block-check");
         // URL redirect — instant.
         try {
             throwIfBlockPage(page);
@@ -94,6 +115,7 @@ async function waitForLoginFormOrThrowBlock(page: Page, usernameSelectors: strin
         if (isPageNotFoundUrl(nowUrl)) {
             throw new PageNotFoundRestartError(`login page redirected to ${nowUrl}`);
         }
+        throwIfAlreadyLoggedIn(page, "login-form-wait");
         try {
             const bodyText = await page.locator("body").innerText({ timeout: 3000 });
             const trimmed = bodyText.trim();
@@ -190,6 +212,8 @@ async function fillLoginCredentials(page: Page, username: string, password: stri
     const emailLocator = page.locator(opts.usernameSelectors).first();
     const passwordLocator = page.locator(opts.passwordSelectors).first();
     while (Date.now() < deadline) {
+        // The form is gone because VFS moved us to the dashboard — not a fill failure.
+        throwIfAlreadyLoggedIn(page, "fill-credentials");
         try {
             await emailLocator.waitFor({ state: "visible", timeout: 5000 });
             await emailLocator.fill(username, { timeout: 5000 });
@@ -481,7 +505,7 @@ async function submitLoginImmediately(page: Page, submitBtn: import("playwright"
             token = await clickTurnstile(page, { check: blockCheck });
         }
         catch (e) {
-            if (e instanceof VfsForbiddenError || e instanceof VfsRateLimitedError)
+            if (e instanceof VfsForbiddenError || e instanceof VfsRateLimitedError || e instanceof VfsAlreadyLoggedInError)
                 throw e;
         }
         if (token) {
@@ -494,6 +518,9 @@ async function submitLoginImmediately(page: Page, submitBtn: import("playwright"
             }
         }
     }
+    // A captcha solve can take minutes; VFS may have finished the login in the
+    // meantime (valid session) — never try to re-submit a form that is gone.
+    throwIfAlreadyLoggedIn(page, "pre-submit");
     try {
         await submitBtn.waitFor({ state: "visible", timeout: 10000 });
         const deadline = Date.now() + 8000;
@@ -552,6 +579,7 @@ async function submitLoginImmediately(page: Page, submitBtn: import("playwright"
     ]);
     let [preSubmitEmail, preSubmitPw] = await readLoginFields();
     if ((!preSubmitEmail || !preSubmitPw) && opts.loginRefill) {
+        throwIfAlreadyLoggedIn(page, "pre-submit-refill");
         for (let guardRetry = 0; guardRetry < 3; guardRetry++) {
             await fillLoginCredentials(page, opts.loginRefill.username, opts.loginRefill.password, {
                 usernameSelectors: opts.loginRefill.usernameSelectors,
@@ -762,6 +790,8 @@ async function resubmitLoginAfterOtp(page: Page): Promise<void> {
     const deadline = Date.now() + 60000;
     let turnstileSolveAttempted = false;
     while (Date.now() < deadline) {
+        // OTP already accepted (or session revived) → the form is gone; stop here.
+        throwIfAlreadyLoggedIn(page, "otp-resubmit");
         const otpFilled = await page
             .evaluate(() => {
             const visible = (el: Element | null): boolean => {
@@ -822,7 +852,7 @@ async function resubmitLoginAfterOtp(page: Page): Promise<void> {
                     tsToken = await clickTurnstile(page, { check: blockCheck });
                 }
                 catch (e) {
-                    if (e instanceof VfsForbiddenError || e instanceof VfsRateLimitedError)
+                    if (e instanceof VfsForbiddenError || e instanceof VfsRateLimitedError || e instanceof VfsAlreadyLoggedInError)
                         throw e;
                 }
                 if (tsToken) {
@@ -847,15 +877,36 @@ async function resubmitLoginAfterOtp(page: Page): Promise<void> {
     await forceClickSignInButton(page, submitBtn);
 }
 // ── Main login flow (top-level) ─────────────────────────────────────────
+/**
+ * Log in on the first VFS tab. Landing on the dashboard at any point counts as
+ * success: the session was already valid, so the caller can go straight to the
+ * dashboard settle + polling instead of retrying a login that cannot happen.
+ */
 export async function performLoginOnFirstTab(core: BrowserServiceCore, username: string, password: string): Promise<void> {
-    core.setLastPostOtpLoginResponse(null);
-    clearVfsLoginProfile();
+    try {
+        await runLoginOnFirstTab(core, username, password);
+    }
+    catch (err) {
+        if (err instanceof VfsAlreadyLoggedInError) {
+            reporter.setAttention(null);
+            reporter.setPhase("login", "already logged in — skipping login");
+            return;
+        }
+        throw err;
+    }
+}
+async function runLoginOnFirstTab(core: BrowserServiceCore, username: string, password: string): Promise<void> {
     const page = await core.getVfsPageOrAnyNonSetup();
     if (!page)
         throw new Error("No tab. Open Chrome with at least one tab, or open the VFS login page.");
     await page.bringToFront().catch(() => { });
     reporter.setPage(page.url());
     throwIfBlockPage(page);
+    // Checked before the profile reset so a still-valid session keeps the login
+    // JSON captured by the previous cycle.
+    throwIfAlreadyLoggedIn(page, "login-start");
+    core.setLastPostOtpLoginResponse(null);
+    clearVfsLoginProfile();
     const visibleOnly = ':not(.d-none):not([aria-hidden="true"])';
     const usernameSelectors = `#email${visibleOnly}, input[formcontrolname="username"]${visibleOnly}, input[formControlName="username"]${visibleOnly}, input[formcontrolname="email"]${visibleOnly}, input[formControlName="email"]${visibleOnly}, input[name="username"]${visibleOnly}, input[name="email"]${visibleOnly}, input[type="email"]${visibleOnly}`;
     await waitForLoginFormOrThrowBlock(page, usernameSelectors, 300000);
@@ -1056,9 +1107,26 @@ export async function openLoginInFirstTab(core: BrowserServiceCore): Promise<voi
         throw new VfsForbiddenError("Login page returned 403 Forbidden — IP/session blocked by Cloudflare or VFS.");
     }
     throwIfBlockPage(page);
+    // A still-valid session redirects /login → /dashboard: the caller re-classifies
+    // the tab and skips login, so don't sit on the 5-minute form wait.
+    if (isVfsDashboardUrl(pageUrlSafe(page))) {
+        reporter.setPage(pageUrlSafe(page));
+        reporter.setPhase("login", "already logged in — skipping login");
+        return;
+    }
     const visibleOnly = ':not(.d-none):not([aria-hidden="true"])';
     const usernameSelectors = `#email${visibleOnly}, input[formcontrolname="username"]${visibleOnly}, input[formControlName="username"]${visibleOnly}, input[formcontrolname="email"]${visibleOnly}, input[formControlName="email"]${visibleOnly}, input[name="username"]${visibleOnly}, input[name="email"]${visibleOnly}, input[type="email"]${visibleOnly}`;
-    await waitForLoginFormOrThrowBlock(page, usernameSelectors, 300000);
+    try {
+        await waitForLoginFormOrThrowBlock(page, usernameSelectors, 300000);
+    }
+    catch (err) {
+        if (err instanceof VfsAlreadyLoggedInError) {
+            reporter.setPage(pageUrlSafe(page));
+            reporter.setPhase("login", "already logged in — skipping login");
+            return;
+        }
+        throw err;
+    }
 }
 export async function openRegisterInFirstTab(core: BrowserServiceCore): Promise<void> {
     const page = await core.getOrCreateNonSetupPage();

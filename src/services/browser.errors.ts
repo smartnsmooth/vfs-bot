@@ -28,6 +28,34 @@ export class IndDeuAccountRecreateError extends Error {
         this.code = code;
     }
 }
+/**
+ * Chrome is already past login (dashboard / applications / home) while the login
+ * automation is still running — the VFS session was still valid, so `/login`
+ * redirected away and neither the login form nor the Turnstile widget can appear.
+ *
+ * Every login stage throws this instead of spinning on elements that no longer
+ * exist; `performLoginOnFirstTab` swallows it and returns as a successful login
+ * so the caller continues to the dashboard settle → polling.
+ */
+export class VfsAlreadyLoggedInError extends Error {
+    /** Login stage that detected the dashboard (for status/detail text). */
+    readonly stage: string;
+    constructor(stage: string, url: string) {
+        super(`Already on dashboard during login (${stage}): ${url}`);
+        this.name = "VfsAlreadyLoggedInError";
+        this.stage = stage;
+    }
+}
+/**
+ * Thrown when a VFS page or API returns HTTP 401 Unauthorized — the session/JWT is dead.
+ * Caller should hard relogin (IP rotation alone does not help).
+ */
+export class VfsUnauthorizedError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "VfsUnauthorizedError";
+    }
+}
 /** Thrown when a VFS API returns HTTP 504 Gateway Timeout — caller should restart browser + rotate IP + re-login. */
 export class VfsGatewayTimeoutError extends Error {
     constructor(message: string) {
@@ -54,6 +82,16 @@ export class VfsRateLimitedError extends Error {
     }
     get isIpBlock(): boolean {
         return this.kind === "ip";
+    }
+}
+/**
+ * A booking API needs a URN but none is cached — a relogin or account swap dropped it.
+ * The booking chain re-runs save applicants instead of spinning on the missing URN.
+ */
+export class MissingUrnError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "MissingUrnError";
     }
 }
 /** Thrown when lift-api /appointment/schedule indicates the applicant is already booked. */

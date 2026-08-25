@@ -1,5 +1,29 @@
 import type { Frame, Page } from "playwright";
+import { isVfsDashboardUrl } from "../flows/vfsTabUrl";
 import { reporter } from "../monitoring/statusReporter";
+import { VfsAlreadyLoggedInError } from "./browser.errors";
+
+function pageUrlSafe(page: Page): string {
+  try {
+    return page.url();
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * Chrome reached the dashboard — no Turnstile widget will ever appear here, so
+ * abort the captcha wait instead of burning the frame-search + manual-assist
+ * timeouts. The login flow treats this as "login already succeeded".
+ */
+function throwIfOnDashboard(page: Page, stage: string): void {
+  const url = pageUrlSafe(page);
+  if (!isVfsDashboardUrl(url)) return;
+  // `login` clears the captcha-waiting state and the attention blink without
+  // counting a captcha attempt that VFS never asked for.
+  reporter.setPhase("login", "on dashboard — skipping captcha");
+  throw new VfsAlreadyLoggedInError(stage, url);
+}
 
 /**
  * Manual-assist fallback: after the auto-solve fails, bring the operator's
@@ -19,6 +43,7 @@ export async function waitForManualTurnstile(
   // If the page is actually a block/error page (403201, page-not-found, …) this
   // throws before we claim "captcha attention", so the caller can recover instead.
   if (opts?.check) await opts.check();
+  throwIfOnDashboard(page, "manual-captcha-start");
 
   const totalMs = opts?.waitMs ?? Math.max(10_000, parseInt(process.env.CAPTCHA_MANUAL_WAIT_MS ?? "120000", 10) || 120_000);
   const deadline = Date.now() + totalMs;
@@ -30,6 +55,7 @@ export async function waitForManualTurnstile(
   let lastLog = 0;
   while (Date.now() < deadline) {
     if (opts?.check) await opts.check();
+    throwIfOnDashboard(page, "manual-captcha-wait");
     const token = await page
       .evaluate(() => {
         const el =
@@ -75,6 +101,7 @@ async function findTurnstileFrame(
       lastCheck = Date.now();
       await check();
     }
+    throwIfOnDashboard(page, "turnstile-frame-wait");
     const f = page
       .frames()
       .find((fr) => /challenges\.cloudflare\.com/.test(fr.url()) && /turnstile/.test(fr.url()));
@@ -112,6 +139,7 @@ export async function clickTurnstile(
 
   // Abort immediately if the page is already a block/error page.
   if (opts?.check) await opts.check();
+  throwIfOnDashboard(page, "turnstile-click-start");
 
   // Bring the widget into view. The host element is in the light DOM even when
   // the iframe itself is inside the closed shadow root.

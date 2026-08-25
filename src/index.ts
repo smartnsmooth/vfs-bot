@@ -8,9 +8,9 @@ import { get as httpGet } from "node:http";
 import { get as httpsGet } from "node:https";
 import path from "node:path";
 import { config, setCurrentInstanceId, getCurrentInstanceId } from "./config/config";
-import { classifyVfsFirstTabUrl } from "./flows/vfsTabUrl";
+import { classifyVfsFirstTabUrl, isVfsDashboardUrl } from "./flows/vfsTabUrl";
 import { PollingService } from "./services/polling.service";
-import { BrowserService, VfsForbiddenError, VfsGatewayTimeoutError, VfsRateLimitedError, IndDeuAccountRecreateError, AlreadyBookedError, isFailedToFetchError } from "./services/browser.service";
+import { BrowserService, VfsForbiddenError, VfsGatewayTimeoutError, VfsRateLimitedError, VfsUnauthorizedError, VfsAlreadyLoggedInError, IndDeuAccountRecreateError, AlreadyBookedError, MissingUrnError, isFailedToFetchError } from "./services/browser.service";
 import { TelegramService } from "./services/telegram.service";
 import {
   runApplicantFormWithSubmitHandler,
@@ -50,7 +50,7 @@ import {
 } from "./utils/slotState";
 import { setSlotCenterOverride, clearSlotCenterOverride } from "./utils/slotCenterOverride.store";
 import { clearSlotDate } from "./utils/slotDate.store";
-import { getApplicationUrn } from "./utils/applicationUrn.store";
+import { getApplicationUrn, clearApplicationUrn } from "./utils/applicationUrn.store";
 import { clearApplicantIpCache, getApplicantIpForPayload } from "./utils/applicantIp";
 import { logInstanceIp, type InstanceIpLogReason } from "./utils/apiCallLog";
 import { clearChromeSessionDataBeforeLaunch, resolveChromeProfileFolderName } from "./utils/chromeProfileSessionClean";
@@ -69,6 +69,7 @@ import {
   getFleetPollCycleMs,
   getFleetPollIntervalSec,
   getFleetPollStepMs,
+  getFleetWorkerIds,
   isPreparedForFleetPolling,
   normalizeFleetInstanceId,
   resolveApologiesIntervalSec,
@@ -86,7 +87,15 @@ import {
   resetApplicantsWave,
 } from "./utils/applicantsCoord";
 import { allClusterParticipantIds, waitForJoinStagger } from "./utils/joinStagger";
-import { getEffectiveJoinStaggerMs, registerFleetUrn, retireFromFleet } from "./utils/calendarBookingCoord";
+import {
+  publishSharedFees,
+  readCalendarBookingState,
+  registerFleetUrn,
+  retireFromFleet,
+} from "./utils/calendarBookingCoord";
+import { isAmountGetter } from "./utils/amountGetter";
+import { getCurrency, getTotalAmount } from "./utils/totalAmount.store";
+import { getEffectiveJoinStaggerMs } from "./utils/joinStaggerCoord";
 import { runFleetCalendarBooking } from "./flows/fleetCalendarBooking";
 import { saveAlreadyBookedAccountFile } from "./utils/alreadyBookedAccountFile";
 import { reporter } from "./monitoring/statusReporter";
@@ -106,7 +115,12 @@ const browser = new BrowserService();
 const telegram = new TelegramService();
 const PROCESS_SLOT_RESULTS_UNTIL_MS = new Date(2026, 8, 1).getTime();
 
-const MAX_PAGE_NOT_FOUND_RESTARTS = 12;
+/**
+ * page-not-found is retried forever (the instance must land a slot), but once this many
+ * restarts have not helped, each further attempt waits so the bot stops hammering VFS.
+ */
+const PAGE_NOT_FOUND_BACKOFF_AFTER = 12;
+const PAGE_NOT_FOUND_BACKOFF_MS = 30_000;
 let pageNotFoundRestartRequested = false;
 
 /** Passive URL sampler — defined after page-not-found helpers (see below). */
@@ -280,10 +294,54 @@ function clearSoftIpRotateFlag(): void {
 }
 
 /**
+ * Swap the exit IP without touching Chrome.
+ *
+ * Chrome is pointed at a fixed local proxy-chain port (`--proxy-server=http://127.0.0.1:<port>`),
+ * never at the vendor directly, so rebinding that port to a new upstream is enough: the browser,
+ * the VFS session, the cookies and the URN all keep running untouched.
+ *
+ * Returns false when the setup cannot support it — no local tunnel, an unauthenticated proxy
+ * (Chrome talks to the vendor directly), the rebind landed on another port, or the egress IP did
+ * not actually change. The caller then falls back to relaunching Chrome.
+ */
+async function rotateIpInPlace(): Promise<boolean> {
+  const portBefore = localTunnelPort;
+  if (portBefore == null) return false;
+
+  const profileId = getBotInstanceId(resolveChromeUserDataDir());
+  const selected = resolveProxyForInstance(profileId, { takeNew: true });
+  if (!selected) return false;
+  const parsed = parseProxy(selected);
+  if (!parsed || !(parsed.username || parsed.password)) return false;
+
+  const ipBefore = getApplicantIpForPayload();
+  try {
+    await recreateAuthProxyTunnel(selected);
+  } catch {
+    return false;
+  }
+  // The sticky port was busy and proxy-chain fell back to another one — Chrome still points at
+  // the old port, so this instance now has no working proxy until Chrome restarts.
+  if (localTunnelPort !== portBefore) return false;
+  bumpProxyRotationForProfile(profileId);
+
+  // Re-resolve through the page so the lookup travels the new tunnel.
+  clearApplicantIpCache();
+  await resolveAndReportEgressIp({ logAs: "rotate-ip" });
+  return getApplicantIpForPayload() !== ipBefore;
+}
+
+/**
  * Rotate proxy / Chrome without VFS logout or session wipe.
  * Used for first 4292XX. Returns false if session could not be restored (caller should escalate).
  */
 async function rotateIpWithoutRelogin(context: string): Promise<boolean> {
+  // Cheapest path: rebind the tunnel and keep the browser alive. Costs ~1s instead of a relaunch.
+  if (await rotateIpInPlace()) {
+    softIpRotateAwaitingSecond429 = true;
+    return true;
+  }
+
     let snap: { pageUrl: string; authorize: string | null; clientsource: string | null } | null = null;
   try {
     snap = await browser.snapshotVfsAuthForIpRotate();
@@ -323,10 +381,30 @@ async function handleIpRateLimitRecovery(
   instanceId: number | undefined,
   context: string,
   code?: string
-): Promise<"full_relogin"> {
+): Promise<"soft_rotate" | "full_relogin"> {
   const label = code ?? "4292xx";
-  reporter.setPhase("recovering", `IP rate-limit ${label} — hard relogin`);
   reporter.setPoll({ code: label });
+
+  // 4292xx restricts the exit IP, not the account. Swap the IP while keeping the logged-in
+  // session (and the URN) first; only escalate when that already failed once.
+  if (!softIpRotateAwaitingSecond429) {
+    reporter.setPhase("recovering", `IP rate-limit ${label} — rotating IP`);
+    await telegram
+      .alert(
+        "error",
+        `Bot ${instanceId ?? "?"} got IP rate-limit ${label} (${context}). Rotating IP, keeping session...`
+      )
+      .catch(() => { });
+    if (await rotateIpWithoutRelogin(`${context}-ip-rate-limit`)) {
+      await telegram
+        .alert("info", `Bot ${instanceId ?? "?"} rotated IP after ${label} — session kept, resuming.`)
+        .catch(() => { });
+      return "soft_rotate";
+    }
+  }
+
+  clearSoftIpRotateFlag();
+  reporter.setPhase("recovering", `IP rate-limit ${label} — hard relogin`);
   await telegram
     .alert(
       "error",
@@ -346,6 +424,8 @@ async function stopForAccountRateLimit(
   code?: string
 ): Promise<void> {
   clearSoftIpRotateFlag();
+  // The only failure the bot never retries: the User ID itself is restricted.
+  instanceStopped = true;
   const label = code ?? "4290xx";
   reporter.setAttention("blocked", `account rate-limit ${label} — stopped`);
   reporter.setPhase("stopped", `account rate-limit ${label}`);
@@ -1840,6 +1920,7 @@ async function recreateIndDeuAccountAndRelogin(
   await telegram
     .alert("error", `Bot ${instanceId ?? "?"} got ${label} — creating a new ind-deu account...`)
     .catch(() => {});
+  clearApplicationUrn();
   clearApplicantIpCache();
   await relaunchChromeAfterCredentialSwapLogout();
   await resolveAndReportEgressIp({ logAs: "rotate-ip", instanceId });
@@ -1875,6 +1956,7 @@ async function performHardRelogin(instanceId?: number, context?: string): Promis
   } else {
     reporter.setPhase("recovering", `hard relogin — kill Chrome + clear session + rotate IP (${ctx})`);
   }
+  clearApplicationUrn();
   clearApplicantIpCache();
   await relaunchChromeAfterCredentialSwapLogout();
   await performVfsLoginFromStore(instanceId);
@@ -1909,6 +1991,31 @@ async function recoverFromSaveApplicantsFailure(
   return runPollLoop(instanceId, pollLoopReloginOpts(instanceId));
 }
 
+/** Pause before the next booking attempt so a fast-failing poll loop cannot hot-spin. */
+const BOOKING_SETBACK_RETRY_MS = 5_000;
+
+function sleepMsAsync(ms: number): Promise<void> {
+  return new Promise<void>((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * A booking attempt fell through without a confirmed appointment. Drop this instance's local
+ * slot overrides and poll again; the caller keeps looping until a schedule succeeds.
+ */
+async function repollAfterBookingSetback(
+  instanceId: number | undefined,
+  context: string
+): Promise<void> {
+  clearSlotCenterOverride();
+  clearSlotDate();
+  await browser.preparePollingAfterLogin({ skipDashboardNavigate: true }).catch(() => { });
+  if (!(await runPollLoop(instanceId, pollLoopReloginOpts(instanceId)))) {
+    // Poll loop bailed out immediately (abort / no centers configured) — wait it out.
+    reporter.setPhase("polling", `retrying after ${context}`);
+    await sleepMsAsync(BOOKING_SETBACK_RETRY_MS);
+  }
+}
+
 /** 504 / Cloudflare / forbidden on booking APIs: hard relogin, poll, restart booking chain. */
 async function recoverBookingChainFromGatewayTimeout(
   instanceId: number | undefined,
@@ -1929,7 +2036,11 @@ async function recoverBookingChainFromIpRateLimit(
   err: VfsRateLimitedError,
   slotStateCache?: SlotFoundState
 ): Promise<boolean> {
-  await handleIpRateLimitRecovery(instanceId, context, err.code);
+  const mode = await handleIpRateLimitRecovery(instanceId, context, err.code);
+  if (mode === "soft_rotate") {
+    // Session and URN survived the IP swap — resume booking without re-polling.
+    return runBookingChainWithRetry(instanceId, slotStateCache);
+  }
   clearSlotCenterOverride();
   clearSlotDate();
   if (!(await runPollLoop(instanceId, pollLoopReloginOpts(instanceId)))) {
@@ -1938,7 +2049,43 @@ async function recoverBookingChainFromIpRateLimit(
   return runBookingChainWithRetry(instanceId, slotStateCache);
 }
 
-const MAX_FORBIDDEN_RETRIES = 3;
+/**
+ * Proxy / network drop on a booking API. The VFS session is usually fine, so swap the exit IP
+ * and keep going; a repeat (soft rotate already pending) escalates to a full relogin.
+ */
+async function recoverBookingChainFromFetchFailure(
+  instanceId: number | undefined,
+  context: string,
+  err: unknown,
+  slotStateCache?: SlotFoundState
+): Promise<boolean> {
+  if (!softIpRotateAwaitingSecond429 && (await rotateIpWithoutRelogin(context))) {
+    return runBookingChainWithRetry(instanceId, slotStateCache);
+  }
+  clearSoftIpRotateFlag();
+  return recoverBookingChainFromGatewayTimeout(instanceId, context, err, slotStateCache);
+}
+
+/** ind-deu 4030xx on booking APIs: new account + IP rotate, poll for a fresh slot, then restart the chain. */
+async function recoverBookingChainFromAccountRecreate(
+  instanceId: number | undefined,
+  err: IndDeuAccountRecreateError,
+  slotStateCache?: SlotFoundState
+): Promise<boolean> {
+  await recreateIndDeuAccountAndRelogin(instanceId, err.code);
+  clearSlotCenterOverride();
+  clearSlotDate();
+  if (!(await runPollLoop(instanceId, pollLoopReloginOpts(instanceId)))) {
+    return false;
+  }
+  return runBookingChainWithRetry(instanceId, slotStateCache);
+}
+
+/**
+ * 403 / 504 / 429 on the login page are IP-level blocks that clear on a fresh exit IP, so the
+ * bot keeps restarting Chrome and rotating instead of giving up after a few tries.
+ */
+const MAX_FORBIDDEN_RETRIES = 50;
 
 function isOtpRelatedLoginFailure(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
@@ -1966,6 +2113,10 @@ async function openLoginWithForbiddenRecovery(instanceId?: number): Promise<void
       await browser.openLoginInFirstTab();
       return;
     } catch (err) {
+      // Session still valid — the tab is on the dashboard, which the caller handles.
+      if (err instanceof VfsAlreadyLoggedInError) {
+        return;
+      }
       if (err instanceof IndDeuAccountRecreateError) {
         await recreateIndDeuAccountAndRelogin(instanceId, err.code);
         return;
@@ -2038,6 +2189,11 @@ async function loginWithForbiddenRecovery(instanceId?: number): Promise<void> {
       await performVfsLoginFromStore(instanceId);
       return;
     } catch (err) {
+      // Chrome is already past login (valid session) — nothing left to retry.
+      if (err instanceof VfsAlreadyLoggedInError) {
+        reporter.setPhase("login", "already logged in — skipping login");
+        return;
+      }
       if (err instanceof PageNotFoundRestartError) {
         throw err;
       }
@@ -2114,6 +2270,9 @@ async function loginWithForbiddenRecovery(instanceId?: number): Promise<void> {
       if (isOtpRelatedLoginFailure(err)) {
         otpAttempts++;
         const reason = err instanceof Error ? err.message : String(err);
+        // This branch retries forever — keep the Monitor phase moving so a card
+        // can never freeze on the stale captcha/turnstile status of attempt 1.
+        reporter.setPhase("recovering", `login retry ${otpAttempts} — rotating IP + relogin`);
                 await telegram.alert(
           "error",
           `Bot ${instanceId ?? "?"} OTP/login failed (attempt ${otpAttempts}): ${reason}\nRestarting browser + rotating IP...`
@@ -2171,10 +2330,17 @@ async function waitForApplicantsStaggerGate(opts: {
     typeof opts.instanceId === "number" && Number.isFinite(opts.instanceId) && opts.instanceId >= 1
       ? Math.floor(opts.instanceId)
       : 1;
-  const numInstancesRaw = parseInt(process.env.BOT_TOTAL_INSTANCES ?? "1", 10);
-  const numInstances = Number.isFinite(numInstancesRaw) && numInstancesRaw > 0 ? numInstancesRaw : 1;
+  // Rotate by position among booking instances, not raw instance id: the amountGetter
+  // never calls applicants, so its id must not leave a dead slot in the rotation.
+  const workers = getFleetWorkerIds();
+  const rank = workers.indexOf(id);
   const stepMs = getApologiesIntervalMs();
-  const targetAt = applicantsAttemptTargetMs(id, opts.attemptIndex, stepMs, numInstances);
+  const targetAt = applicantsAttemptTargetMs(
+    rank >= 0 ? rank + 1 : id,
+    opts.attemptIndex,
+    stepMs,
+    workers.length
+  );
   const remainingMs = Math.max(0, targetAt - Date.now());
 
   if (remainingMs <= 0) return "ready";
@@ -2207,8 +2373,175 @@ async function waitForApplicantsStaggerGate(opts: {
  * - **10673**: up to `pollReloginInterval` staggered tries, then hard relogin + slot poll, forever.
  * - **Other errors**: up to MAX_SAVE_APPLICANTS_RETRIES (8), then hard relogin + poll.
  */
-async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: SlotFoundState): Promise<boolean> {
+/**
+ * Result of the save-applicants stage: either a URN is cached now, or a recovery path
+ * already ran the rest of the booking chain and produced its final answer.
+ */
+type SaveApplicantsOutcome = { kind: "urn" } | { kind: "chain_done"; result: boolean };
+
+async function runSaveApplicantsUntilUrn(opts: {
+  instanceId?: number;
+  slotStateCache?: SlotFoundState;
+  chainAbortSeq: number;
+  useApologiesInterval: boolean;
+}): Promise<SaveApplicantsOutcome> {
+  const { instanceId, slotStateCache, chainAbortSeq, useApologiesInterval } = opts;
   const phase1Attempts = Math.max(1, config.pollReloginInterval);
+  const done = (result: boolean): SaveApplicantsOutcome => ({ kind: "chain_done", result });
+
+  let nonRecoverableAttempts = 0;
+  let attemptIndex = 0; // round-robin slot index for this bot
+  let consecutive10673 = 0;
+
+  applicants10673Recovery: while (true) {
+    if (pollingAbortSeq !== chainAbortSeq) {
+      await throwIfAbortedForPageNotFound(chainAbortSeq, "booking-save-abort");
+      return done(false);
+    }
+
+    const gate = await waitForApplicantsStaggerGate({
+      instanceId,
+      attemptIndex,
+      abortSeq: chainAbortSeq,
+      useApologiesInterval,
+    });
+    if (gate === "abort" || pollingAbortSeq !== chainAbortSeq) {
+      await throwIfAbortedForPageNotFound(chainAbortSeq, "booking-applicants-gate-abort");
+      return done(false);
+    }
+    if (gate === "urn_unlocked") {
+      // URN unlock during apologies round-robin: unlocker already called; peers join finder-first.
+      const myId =
+        typeof instanceId === "number" && Number.isFinite(instanceId) && instanceId >= 1
+          ? Math.floor(instanceId)
+          : 1;
+      const meta = getApplicantsUrnUnlockMeta();
+      const urnJoin = await waitForJoinStagger({
+        label: "applicants-urn",
+        myInstanceId: myId,
+        finderId: meta.unlockedBy || myId,
+        participantIds: allClusterParticipantIds(),
+        waveStartedAt: meta.unlockedAt || Date.now(),
+        stepMs: getEffectiveJoinStaggerMs(),
+        abortSeq: chainAbortSeq,
+        isAbort: (seq) => pollingAbortSeq !== seq,
+        waitForAbort: waitForPollingAbort,
+      });
+      if (urnJoin === "abort" || pollingAbortSeq !== chainAbortSeq) {
+        await throwIfAbortedForPageNotFound(chainAbortSeq, "booking-applicants-urn-join-abort");
+        return done(false);
+      }
+    }
+
+    try {
+      reporter.setBookingStep("applicants");
+      await browser.saveApplicantsViaLiftApi();
+
+      const urnAfterSave = getApplicationUrn();
+      if (!urnAfterSave?.trim()) {
+        throw new Error("Save applicants did not set URN");
+      }
+
+      markApplicantsUrnUnlocked(
+        typeof instanceId === "number" && instanceId >= 1 ? Math.floor(instanceId) : 1
+      );
+      registerFleetUrn(
+        typeof instanceId === "number" && instanceId >= 1 ? Math.floor(instanceId) : 1
+      );
+      return { kind: "urn" };
+    } catch (err) {
+      attemptIndex += 1;
+
+      if (err instanceof AlreadyBookedError) {
+        await retireInstanceForAlreadyBooked(instanceId, err.message);
+      }
+      if (err instanceof VfsRateLimitedError) {
+        if (err.isAccountBlock) {
+          await stopForAccountRateLimit(instanceId, "save-applicants", err.code);
+          return done(false);
+        }
+        return done(
+          await recoverBookingChainFromIpRateLimit(instanceId, "429-ip-save-applicants", err, slotStateCache)
+        );
+      }
+      if (err instanceof IndDeuAccountRecreateError) {
+        return done(await recoverBookingChainFromAccountRecreate(instanceId, err, slotStateCache));
+      }
+      if (err instanceof VfsUnauthorizedError) {
+        return done(
+          await recoverBookingChainFromGatewayTimeout(
+            instanceId,
+            "401-unauthorized-save-applicants",
+            err,
+            slotStateCache
+          )
+        );
+      }
+      if (err instanceof VfsGatewayTimeoutError) {
+        continue applicants10673Recovery;
+      }
+      if (isFailedToFetchError(err)) {
+        return done(
+          await recoverBookingChainFromFetchFailure(
+            instanceId,
+            "failed-to-fetch-save-applicants",
+            err,
+            slotStateCache
+          )
+        );
+      }
+      if (isSaveApplicants401(err)) {
+        return done(
+          await recoverBookingChainFromGatewayTimeout(
+            instanceId,
+            "401-unauthorized-save-applicants",
+            err,
+            slotStateCache
+          )
+        );
+      }
+      if (err instanceof VfsForbiddenError) {
+        return done(
+          await recoverBookingChainFromGatewayTimeout(
+            instanceId,
+            "cloudflare-or-forbidden-save-applicants",
+            err,
+            slotStateCache
+          )
+        );
+      }
+      if (isSaveApplicants10673(err)) {
+        consecutive10673 += 1;
+        if (consecutive10673 >= phase1Attempts) {
+          consecutive10673 = 0;
+          await performHardRelogin(instanceId, "save-applicants-10673");
+          await runPollLoop(instanceId, pollLoopReloginOpts(instanceId));
+          // New wave after re-hit so fleet re-syncs applicants stagger.
+          const again = isSlotFoundByAnyInstance();
+          resetApplicantsWave(again.timestamp ?? Date.now());
+          attemptIndex = 0;
+          continue applicants10673Recovery;
+        }
+      } else {
+        consecutive10673 = 0;
+        nonRecoverableAttempts += 1;
+
+        if (nonRecoverableAttempts >= MAX_SAVE_APPLICANTS_RETRIES) {
+          nonRecoverableAttempts = 0;
+          if (!(await recoverFromSaveApplicantsFailure(instanceId, "save-applicants-max-retries", err))) {
+            return done(false);
+          }
+          const again = isSlotFoundByAnyInstance();
+          resetApplicantsWave(again.timestamp ?? Date.now());
+          attemptIndex = 0;
+          continue applicants10673Recovery;
+        }
+      }
+    }
+  }
+}
+
+async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: SlotFoundState): Promise<boolean> {
   const chainAbortSeq = pollingAbortSeq;
 
   // If a newer force-book arrived before this chain even started, exit immediately.
@@ -2256,94 +2589,58 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
     }
   }
 
-  let nonRecoverableAttempts = 0;
-  let attemptIndex = 0; // round-robin slot index for this bot
-  let consecutive10673 = 0;
-
-  applicants10673Recovery: while (true) {
-    if (pollingAbortSeq !== chainAbortSeq) {
-      await throwIfAbortedForPageNotFound(chainAbortSeq, "booking-save-abort");
-            return false;
-    }
-
-    const gate = await waitForApplicantsStaggerGate({
+  for (;;) {
+    const saved = await runSaveApplicantsUntilUrn({
       instanceId,
-      attemptIndex,
-      abortSeq: chainAbortSeq,
+      slotStateCache,
+      chainAbortSeq,
       useApologiesInterval,
     });
-    if (gate === "abort" || pollingAbortSeq !== chainAbortSeq) {
-      await throwIfAbortedForPageNotFound(chainAbortSeq, "booking-applicants-gate-abort");
-            return false;
-    }
-    if (gate === "urn_unlocked") {
-      // URN unlock during apologies round-robin: unlocker already called; peers join finder-first.
-      const myId =
+    if (saved.kind === "chain_done") return saved.result;
+
+    try {
+      const fleetId =
         typeof instanceId === "number" && Number.isFinite(instanceId) && instanceId >= 1
           ? Math.floor(instanceId)
           : 1;
-      const meta = getApplicantsUrnUnlockMeta();
-      const urnJoin = await waitForJoinStagger({
-        label: "applicants-urn",
-        myInstanceId: myId,
-        finderId: meta.unlockedBy || myId,
-        participantIds: allClusterParticipantIds(),
-        waveStartedAt: meta.unlockedAt || Date.now(),
-        stepMs: getEffectiveJoinStaggerMs(),
+      return await runFleetCalendarBooking({
+        browser,
+        instanceId: fleetId,
         abortSeq: chainAbortSeq,
         isAbort: (seq) => pollingAbortSeq !== seq,
         waitForAbort: waitForPollingAbort,
       });
-      if (urnJoin === "abort" || pollingAbortSeq !== chainAbortSeq) {
-        await throwIfAbortedForPageNotFound(chainAbortSeq, "booking-applicants-urn-join-abort");
-                return false;
-      }
-          }
-
-    try {
-      reporter.setBookingStep("applicants");
-      await browser.saveApplicantsViaLiftApi();
-
-      const urnAfterSave = getApplicationUrn();
-      if (!urnAfterSave?.trim()) {
-        throw new Error("Save applicants did not set URN");
-      }
-
-      markApplicantsUrnUnlocked(
-        typeof instanceId === "number" && instanceId >= 1 ? Math.floor(instanceId) : 1
-      );
-      registerFleetUrn(
-        typeof instanceId === "number" && instanceId >= 1 ? Math.floor(instanceId) : 1
-      );
-      break applicants10673Recovery;
     } catch (err) {
-      attemptIndex += 1;
-
+      if (err instanceof MissingUrnError) {
+        // A relogin / account swap dropped the URN mid-booking — get a fresh one and re-enter.
+        reporter.setBookingStep("applicants · urn lost");
+        continue;
+      }
       if (err instanceof AlreadyBookedError) {
         await retireInstanceForAlreadyBooked(instanceId, err.message);
       }
       if (err instanceof VfsRateLimitedError) {
         if (err.isAccountBlock) {
-          await stopForAccountRateLimit(instanceId, "save-applicants", err.code);
+          await stopForAccountRateLimit(instanceId, "booking-chain", err.code);
           return false;
         }
-        return recoverBookingChainFromIpRateLimit(instanceId, "429-ip-save-applicants", err, slotStateCache);
+        return recoverBookingChainFromIpRateLimit(instanceId, "429-ip-booking", err, slotStateCache);
       }
-      if (err instanceof VfsGatewayTimeoutError) {
-        continue applicants10673Recovery;
+      if (err instanceof IndDeuAccountRecreateError) {
+        return recoverBookingChainFromAccountRecreate(instanceId, err, slotStateCache);
       }
-      if (isFailedToFetchError(err)) {
+      if (err instanceof VfsUnauthorizedError) {
         return recoverBookingChainFromGatewayTimeout(
           instanceId,
-          "failed-to-fetch-save-applicants",
+          "401-unauthorized-booking",
           err,
           slotStateCache
         );
       }
-      if (isSaveApplicants401(err)) {
-        return recoverBookingChainFromGatewayTimeout(
+      if (isFailedToFetchError(err)) {
+        return recoverBookingChainFromFetchFailure(
           instanceId,
-          "401-unauthorized-save-applicants",
+          "failed-to-fetch-booking",
           err,
           slotStateCache
         );
@@ -2351,82 +2648,13 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
       if (err instanceof VfsForbiddenError) {
         return recoverBookingChainFromGatewayTimeout(
           instanceId,
-          "cloudflare-or-forbidden-save-applicants",
+          "cloudflare-or-forbidden-booking",
           err,
           slotStateCache
         );
       }
-      if (isSaveApplicants10673(err)) {
-        consecutive10673 += 1;
-                if (consecutive10673 >= phase1Attempts) {
-          consecutive10673 = 0;
-                    await performHardRelogin(instanceId, "save-applicants-10673");
-          await runPollLoop(instanceId, pollLoopReloginOpts(instanceId));
-          // New wave after re-hit so fleet re-syncs applicants stagger.
-          const again = isSlotFoundByAnyInstance();
-          resetApplicantsWave(again.timestamp ?? Date.now());
-          attemptIndex = 0;
-          continue applicants10673Recovery;
-        }
-      } else {
-        consecutive10673 = 0;
-        nonRecoverableAttempts += 1;
-        const errMsg = err instanceof Error ? err.message : String(err);
-
-        if (nonRecoverableAttempts >= MAX_SAVE_APPLICANTS_RETRIES) {
-                    nonRecoverableAttempts = 0;
-          if (!(await recoverFromSaveApplicantsFailure(instanceId, "save-applicants-max-retries", err))) {
-            return false;
-          }
-          const again = isSlotFoundByAnyInstance();
-          resetApplicantsWave(again.timestamp ?? Date.now());
-          attemptIndex = 0;
-          continue applicants10673Recovery;
-        }
-              }
+      throw err;
     }
-  }
-
-  try {
-    const fleetId =
-      typeof instanceId === "number" && Number.isFinite(instanceId) && instanceId >= 1
-        ? Math.floor(instanceId)
-        : 1;
-    return await runFleetCalendarBooking({
-      browser,
-      instanceId: fleetId,
-      abortSeq: chainAbortSeq,
-      isAbort: (seq) => pollingAbortSeq !== seq,
-      waitForAbort: waitForPollingAbort,
-    });
-  } catch (err) {
-    if (err instanceof AlreadyBookedError) {
-      await retireInstanceForAlreadyBooked(instanceId, err.message);
-    }
-    if (err instanceof VfsRateLimitedError) {
-      if (err.isAccountBlock) {
-        await stopForAccountRateLimit(instanceId, "booking-chain", err.code);
-        return false;
-      }
-      return recoverBookingChainFromIpRateLimit(instanceId, "429-ip-booking", err, slotStateCache);
-    }
-    if (isFailedToFetchError(err)) {
-      return recoverBookingChainFromGatewayTimeout(
-        instanceId,
-        "failed-to-fetch-booking",
-        err,
-        slotStateCache
-      );
-    }
-    if (err instanceof VfsForbiddenError) {
-      return recoverBookingChainFromGatewayTimeout(
-        instanceId,
-        "cloudflare-or-forbidden-booking",
-        err,
-        slotStateCache
-      );
-    }
-    throw err;
   }
 }
 
@@ -2434,7 +2662,7 @@ type SubmitMeta = { firstSubmit: boolean; instanceId?: number; pollStartAt?: num
 
 async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
   let m = meta;
-  for (let attempt = 0; attempt < MAX_PAGE_NOT_FOUND_RESTARTS; attempt++) {
+  for (let attempt = 1; ; attempt++) {
     try {
       await runOneBotCycleCore(m);
       return;
@@ -2443,12 +2671,15 @@ async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
         pageNotFoundRestartRequested = false;
         await rotateIpForPageNotFound(m.instanceId, err.message);
         m = { ...m, firstSubmit: false, skipPollGate: true };
+        if (attempt >= PAGE_NOT_FOUND_BACKOFF_AFTER) {
+          reporter.setPhase("recovering", `page-not-found ×${attempt} — backing off`);
+          await sleepMsAsync(PAGE_NOT_FOUND_BACKOFF_MS);
+        }
         continue;
       }
       throw err;
     }
   }
-  throw new Error(`page-not-found persisted after ${MAX_PAGE_NOT_FOUND_RESTARTS} restarts`);
 }
 
 async function performVfsLoginFromStore(instanceId?: number): Promise<void> {
@@ -2461,6 +2692,114 @@ async function performVfsLoginFromStore(instanceId?: number): Promise<void> {
   }
   await browser.loginOnFirstTab(u, p);
   advanceCredentialSlotAfterSuccessfulLogin(instanceId);
+}
+
+// ── amountGetter (Bot #1): fetch the fleet's totalAmount, nothing else ──
+
+/** Pause before the next amountGetter attempt when the failure did not relogin. */
+const AMOUNT_GETTER_RETRY_MS = 5_000;
+/** How often the finished amountGetter re-checks that the fleet still has its amount. */
+const AMOUNT_GETTER_REPUBLISH_CHECK_MS = 1_000;
+
+/**
+ * The amountGetter's entire job in one pass: applicants for a URN, fees for the
+ * totalAmount, then publish the amount to the fleet. Throws on any failure so the
+ * caller can run the matching recovery and go again.
+ */
+async function runAmountGetterAttempt(instanceId: number): Promise<void> {
+  reporter.setBookingStep("applicants");
+  await browser.saveApplicantsViaLiftApi();
+  if (!getApplicationUrn()?.trim()) {
+    throw new Error("Amount getter: save applicants did not set URN");
+  }
+
+  reporter.setBookingStep("fees");
+  await browser.postFeesLiftApi();
+  const totalAmount = getTotalAmount();
+  if (!totalAmount?.trim()) {
+    throw new Error("Amount getter: fees returned no totalAmount");
+  }
+  publishSharedFees(instanceId, { totalAmount, currency: getCurrency() });
+}
+
+/** Same recovery the booking chain uses, minus everything that re-enters polling. */
+async function recoverAmountGetter(instanceId: number, err: unknown): Promise<void> {
+  if (err instanceof AlreadyBookedError) {
+    await retireInstanceForAlreadyBooked(instanceId, err.message);
+  }
+  if (err instanceof VfsRateLimitedError) {
+    if (err.isAccountBlock) {
+      await stopForAccountRateLimit(instanceId, "amount-getter", err.code);
+      return;
+    }
+    await handleIpRateLimitRecovery(instanceId, "429-ip-amount-getter", err.code);
+    return;
+  }
+  if (err instanceof IndDeuAccountRecreateError) {
+    await recreateIndDeuAccountAndRelogin(instanceId, err.code);
+    return;
+  }
+  if (
+    err instanceof VfsUnauthorizedError ||
+    err instanceof VfsForbiddenError ||
+    err instanceof VfsGatewayTimeoutError ||
+    err instanceof MissingUrnError ||
+    isFailedToFetchError(err) ||
+    isSaveApplicants401(err) ||
+    isSaveApplicants10673(err)
+  ) {
+    await performHardRelogin(instanceId, "amount-getter");
+    return;
+  }
+  await sleepMsAsync(AMOUNT_GETTER_RETRY_MS);
+}
+
+/**
+ * Bot #1 with the amountGetter role: get the totalAmount to the fleet as early as
+ * possible and then stop working. It never polls and never books, so this call
+ * does not return — after the amount is shared it only stays up to put the amount
+ * back whenever a new wave clears the booking coordination file.
+ */
+async function runAmountGetterLoop(instanceId?: number): Promise<void> {
+  const id = normalizeFleetInstanceId(instanceId);
+  const soft10673Attempts = Math.max(1, config.pollReloginInterval);
+  let consecutive10673 = 0;
+
+  reporter.setPhase("booking", "amount getter — fetching totalAmount");
+
+  while (!instanceStopped) {
+    try {
+      await runAmountGetterAttempt(id);
+      break;
+    } catch (err) {
+      // 10673 is usually transient: retry in place before paying for a relogin.
+      if (isSaveApplicants10673(err) && ++consecutive10673 < soft10673Attempts) {
+        reporter.setBookingStep(`applicants · retry ${consecutive10673}`);
+        await sleepMsAsync(AMOUNT_GETTER_RETRY_MS);
+        continue;
+      }
+      consecutive10673 = 0;
+      await recoverAmountGetter(id, err);
+    }
+  }
+
+  if (instanceStopped) return;
+
+  const totalAmount = getTotalAmount() ?? "";
+  const currency = getCurrency();
+  await telegram
+    .notify(`Bot ${id} (amount getter): totalAmount ${totalAmount}${currency ? ` ${currency}` : ""} shared with the fleet.`)
+    .catch(() => { });
+  reporter.setBookingStep(null);
+  reporter.setPhase("idle", `amount getter — totalAmount ${totalAmount} shared`);
+
+  for (;;) {
+    await sleepMsAsync(AMOUNT_GETTER_REPUBLISH_CHECK_MS);
+    if (instanceStopped) return;
+    if (!readCalendarBookingState().feesDone) {
+      publishSharedFees(id, { totalAmount, currency });
+    }
+  }
 }
 
 /**
@@ -2586,15 +2925,28 @@ async function runOneBotCycleCore(meta: SubmitMeta): Promise<void> {
       if (loginErr instanceof PageNotFoundRestartError) {
         throw loginErr;
       }
-      const reason = loginErr instanceof Error ? loginErr.message : String(loginErr);
-            instanceStopped = true;
-      reporter.setError(reason);
-      reporter.setAttention("login_failed", "login failed — handle in Chrome");
-      reporter.setPhase("stopped", "login failed");
-      await telegram
-        .alert("error", `Bot ${instanceId ?? "?"} login failed — stopped.\nReason: ${reason}`)
-        .catch(() => { });
-      return;
+      // Last-resort guard: a login stage can fail on a form/captcha that vanished
+      // only because VFS already let us in. A dashboard tab means the session is
+      // live — continue to polling instead of stopping a perfectly good bot.
+      const urlAfterLoginErr = await browser.getFirstTabUrl().catch(() => "");
+      if (isVfsDashboardUrl(urlAfterLoginErr)) {
+        firstUrl = urlAfterLoginErr;
+        reporter.setPage(firstUrl);
+        reporter.setAttention(null);
+        reporter.setPhase("login", "already logged in — skipping login");
+        kind = classifyVfsFirstTabUrl(firstUrl);
+        didLoginThisCycle = true;
+      } else {
+        const reason = loginErr instanceof Error ? loginErr.message : String(loginErr);
+        instanceStopped = true;
+        reporter.setError(reason);
+        reporter.setAttention("login_failed", "login failed — handle in Chrome");
+        reporter.setPhase("stopped", "login failed");
+        await telegram
+          .alert("error", `Bot ${instanceId ?? "?"} login failed — stopped.\nReason: ${reason}`)
+          .catch(() => { });
+        return;
+      }
     }
   } else if (kind === "dashboard") {
       } else if (kind === "vfs_other") {
@@ -2657,6 +3009,13 @@ async function runOneBotCycleCore(meta: SubmitMeta): Promise<void> {
         return;
   }
 
+  // The amountGetter skips the fleet poll gate entirely — the sooner it publishes
+  // the totalAmount, the less work is left for the instances that find a slot.
+  if (isAmountGetter(instanceId)) {
+    await runAmountGetterLoop(instanceId);
+    return;
+  }
+
   // --- Coordinated poll-start gate (first submit only, cluster mode) ---
   // Wait until the shared fleet pollStartAt. After that, bots claim the next
   // poll slot every userPollInterval (gap-filling when peers are absent).
@@ -2707,20 +3066,24 @@ async function runOneBotCycleCore(meta: SubmitMeta): Promise<void> {
   }
 
   if (slotFoundDuringPoll) {
-    let pollHits: boolean = slotFoundDuringPoll;
-    while (true) {
+    // Every instance must land one slot. Only an account/ID block or an already-booked
+    // account ends this loop — every other failure goes back to polling and tries again.
+    while (!instanceStopped) {
       // Snapshot slot state before booking starts so sibling failures that delete
       // slot-state.json do not break this instance's calendar / timeslot lookup.
       const slotStateSnapshot = isSlotFoundByAnyInstance();
       instanceBookingActive = true;
       reporter.setBookingStep("applicants");
-            try {
+      try {
         const bookingCompleted = await runBookingChainWithRetry(instanceId, slotStateSnapshot);
         instanceBookingActive = false;
-        if (!bookingCompleted) break; // Aborted/superseded — do not mark payment page
-        // Booking chain completed (schedule API called) — payment page is now open.
-        await enterPaymentPageMode(instanceId);
-        return; // Leave Chrome on the payment page; do not fall through to cycle end.
+        if (bookingCompleted) {
+          // Booking chain completed (schedule API called) — payment page is now open.
+          await enterPaymentPageMode(instanceId);
+          return; // Leave Chrome on the payment page; do not fall through to cycle end.
+        }
+        // Aborted / superseded / recovery gave up — poll again rather than end the cycle.
+        await repollAfterBookingSetback(instanceId, "booking-chain-incomplete");
       } catch (err) {
         instanceBookingActive = false;
         if (err instanceof AlreadyBookedError) {
@@ -2728,27 +3091,18 @@ async function runOneBotCycleCore(meta: SubmitMeta): Promise<void> {
         }
         if (isSaveApplicantsFailure(err)) {
           if (!(await recoverFromSaveApplicantsFailure(instanceId, "save-applicants-failure", err))) {
-                        break;
+            await sleepMsAsync(BOOKING_SETBACK_RETRY_MS);
           }
           continue;
         }
 
-        // Any other booking error: log, notify, clear local state, restart polling instead of stopping.
-                await telegram
+        await telegram
           .alert("error", `Booking error (instance ${instanceId ?? 1}), restarting poll: ${err instanceof Error ? err.message : String(err)}`)
           .catch(() => { });
-        clearSlotCenterOverride();
-        clearSlotDate();
-        await browser.preparePollingAfterLogin({ skipDashboardNavigate: true });
-        pollHits = await runPollLoop(instanceId, pollLoopReloginOpts(instanceId));
-        if (!pollHits) {
-                    break;
-        }
-        // Found a new slot — loop back; instanceBookingActive will be set to true at the top.
+        await repollAfterBookingSetback(instanceId, "booking-error");
       }
     }
-  } else {
-      }
+  }
 }
 
 function syncInstanceStoresFromDisk(): void {
@@ -2781,6 +3135,10 @@ async function start(): Promise<void> {
                         return;
           }
           if (instanceOnPaymentPage) {
+                        return;
+          }
+          // The amountGetter has no booking chain to force.
+          if (isAmountGetter(myInstanceId)) {
                         return;
           }
           // Abort any in-progress polling so the new poll cycle can start.
@@ -2856,12 +3214,24 @@ async function start(): Promise<void> {
             syncInstanceStoresFromDisk();
             try {
               await runOneBotCycle({ firstSubmit: true, instanceId: myInstanceId, pollStartAt: msg.pollStartAt });
-              process.send?.({ type: "bot-cycle-complete", instanceId: myInstanceId });
+              // `settled` tells the parent whether this instance is finished for good; anything
+              // else means the cycle fell through without a booking and must be restarted.
+              process.send?.({
+                type: "bot-cycle-complete",
+                instanceId: myInstanceId,
+                settled: instanceOnPaymentPage || instanceStopped,
+              });
             } catch (err) {
               const reason = err instanceof Error ? err.message : String(err);
                             await telegram
-                .alert("error", `Bot ${myInstanceId} is stopped.\nReason: ${reason}`)
+                .alert("error", `Bot ${myInstanceId} cycle failed.\nReason: ${reason}`)
                 .catch(() => { });
+              process.send?.({
+                type: "bot-cycle-complete",
+                instanceId: myInstanceId,
+                settled: instanceOnPaymentPage || instanceStopped,
+                reason,
+              });
             }
           }
         });

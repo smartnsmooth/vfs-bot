@@ -178,6 +178,13 @@ export function buildMonitorTabHtml(): string {
   .mon-proxy-btn:disabled { opacity: 0.45; cursor: not-allowed; }
   .mon-toast { position: fixed; right: 1rem; bottom: 1rem; background: #1c2732; border: 1px solid #38444d; color: #e7e9ea; padding: 0.6rem 0.85rem; border-radius: 8px; font-size: 0.85rem; opacity: 0; transition: opacity 0.2s; pointer-events: none; z-index: 50; max-width: 22rem; }
   .mon-toast.show { opacity: 1; }
+  .mon-fleet { background: #15202b; border: 1px solid #38444d; border-radius: 6px; padding: 0.3rem 0.45rem; margin-bottom: 0.5rem; font-size: 0.66rem; color: #c4cdd4; display: flex; flex-wrap: wrap; gap: 0.2rem 0.9rem; align-items: baseline; }
+  .mon-fleet .k { color: #8b98a5; }
+  .mon-fleet .v { color: #e7e9ea; font-weight: 600; }
+  .mon-fleet .v.yes { color: #69f0ae; }
+  .mon-fleet .v.no { color: #f5a623; }
+  .mon-fleet .list { color: #7fd1ff; font-weight: 400; }
+  .mon-fleet .empty { color: #6b7686; font-weight: 400; }
 </style>
 <div class="mon-wrap">
   <div class="mon-toolbar" style="margin-bottom:0.5rem;display:flex;gap:0.4rem;align-items:center;justify-content:center;font-size:0.72rem;">
@@ -211,6 +218,7 @@ export function buildMonitorTabHtml(): string {
     <button type="button" class="mon-proxy-btn" id="monProxyList" data-provider="iplist" title="IP List (proxies.txt) — all bots switch on the next API request">IP List</button>
     <span id="monProxyHint" style="color:#8b98a5;font-size:0.62rem;"></span>
   </div>
+  <div class="mon-fleet" id="monFleet"></div>
   <div class="mon-grid" id="monGrid"></div>
 </div>
 <div class="mon-toast" id="monToast"></div>
@@ -543,6 +551,51 @@ export function buildMonitorTabHtml(): string {
 
   function scheduleRender(){ if (rafPending) return; rafPending = true; requestAnimationFrame(render); }
 
+  // ── Fleet strip: the shared state every instance books from ────────────
+  var FLEET_LIST_MAX = 12;
+
+  function fleetField(key, value, cls){
+    return '<span><span class="k">' + esc(key) + '</span> <span class="' + (cls || 'v') + '">' + value + '</span></span>';
+  }
+
+  function fleetList(items){
+    if (!items || items.length === 0) return '<span class="empty">none</span>';
+    var shown = items.slice(0, FLEET_LIST_MAX).map(esc).join(', ');
+    var rest = items.length - FLEET_LIST_MAX;
+    return '<span class="list">' + shown + (rest > 0 ? ' +' + rest + ' more' : '') + '</span>';
+  }
+
+  function renderFleet(f){
+    var box = el('monFleet');
+    if (!box) return;
+    if (!f) { box.innerHTML = '<span class="empty">fleet state unavailable</span>'; return; }
+    var dates = Array.isArray(f.availableDateList) ? f.availableDateList : [];
+    var slots = (Array.isArray(f.availableDatetimeList) ? f.availableDatetimeList : [])
+      .map(function(e){ return e.date + ' ' + e.time; });
+    var amount = f.totalAmount
+      ? esc(f.totalAmount) + (f.currency ? ' ' + esc(f.currency) : '')
+      : '<span class="empty">—</span>';
+    var turn = f.isTotalAmountRetrieved
+      ? (f.calendarCallerId ? 'calendar #' + f.calendarCallerId : '<span class="empty">—</span>')
+      : (f.feesCallerId ? 'fees #' + f.feesCallerId : '<span class="empty">nobody</span>');
+    box.innerHTML = [
+      fleetField('totalAmount retrieved', f.isTotalAmountRetrieved ? 'yes' : 'no',
+        f.isTotalAmountRetrieved ? 'v yes' : 'v no'),
+      fleetField('totalAmount', amount),
+      fleetField('URN', String((f.urnHolders || []).length)),
+      fleetField('turn', turn),
+      fleetField('dates (' + dates.length + ')', fleetList(dates)),
+      fleetField('timeslots (' + slots.length + ')', fleetList(slots))
+    ].join('');
+  }
+
+  function pollFleet(){
+    fetch('/api/monitor/fleet')
+      .then(function(r){ return r.json(); })
+      .then(function(d){ renderFleet(d && d.ok ? d.fleet : null); })
+      .catch(function(){});
+  }
+
   function onStatus(s){
     var wasAttn = prevAttn[s.instanceId];
     var isAttn = needsManual(s);
@@ -728,6 +781,8 @@ export function buildMonitorTabHtml(): string {
         render();
       }
     }).catch(function(){});
+    pollFleet();
+    setInterval(pollFleet, 1000);
     connect();
   };
 

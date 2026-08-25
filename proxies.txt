@@ -3,9 +3,9 @@
 # Blank lines and lines starting with # are ignored.
 #
 # Bare IP — uses PROXY_LIST_PORT:
-203.0.113.10
-203.0.113.11
-203.0.113.12
+65.20.90.24
+#203.0.113.11
+#203.0.113.12
 #
 # IP with its own port — overrides PROXY_LIST_PORT for that line:
-203.0.113.13:8000
+# 203.0.113.13:8000

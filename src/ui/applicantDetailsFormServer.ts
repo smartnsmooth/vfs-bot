@@ -20,6 +20,12 @@ import {
   persistProxyProvider,
 } from "../utils/proxyProvider";
 import { isProxyListConfigured } from "../utils/proxyList";
+import {
+  getCalendarPollingCallerId,
+  getFeesCallerId,
+  getFleetUrnHolders,
+  readCalendarBookingState,
+} from "../utils/calendarBookingCoord";
 
 const APPLICANT_UI_PORT = 3847;
 
@@ -39,6 +45,29 @@ export function closeApplicantFormServer(): Promise<void> {
     applicantFormHttpServer = null;
     s.close(() => resolve());
   });
+}
+
+/**
+ * Fleet-wide booking state for the Monitor tab: the one shared totalAmount, the date
+ * and timeslot pools every instance draws from, and whose turn each round-robin is on.
+ * Read from the coordination file, so it is the same view the bots act on.
+ */
+function buildFleetSummary(): Record<string, unknown> {
+  const s = readCalendarBookingState();
+  return {
+    phase: s.phase,
+    urnHolders: getFleetUrnHolders(s),
+    isTotalAmountRetrieved: s.feesDone,
+    totalAmount: s.fees?.totalAmount ?? null,
+    currency: s.fees?.currency ?? null,
+    feesCallerId: getFeesCallerId(s),
+    lastFeesCallerId: s.lastFeesCallerId,
+    calendarCallerId: s.phase === "calendar_repoll" ? getCalendarPollingCallerId(s) : null,
+    lastCalendarCallerId: s.lastCalendarCallerId,
+    availableDateList: s.availableDateList,
+    availableDatetimeList: s.availableDatetimeList,
+    scheduled: s.scheduled,
+  };
 }
 
 /** Base URL for the local setup form (same host the browser uses for Submit → `/api/submit`). */
@@ -266,6 +295,11 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
     const v = parseInt(j.postLoginPollDelay, 10);
     if (Number.isFinite(v) && v >= 0) out.postLoginPollDelay = v;
   }
+  if (typeof j.amountGetterEnabled === "boolean") {
+    out.amountGetterEnabled = j.amountGetterEnabled;
+  } else if (typeof j.amountGetterEnabled === "string" && j.amountGetterEnabled.trim() !== "") {
+    out.amountGetterEnabled = /^(true|1|yes|on)$/i.test(j.amountGetterEnabled.trim());
+  }
   if (typeof j.staggerIntervalSec === "number" && Number.isFinite(j.staggerIntervalSec) && j.staggerIntervalSec >= 0) {
     out.staggerIntervalSec = Math.floor(j.staggerIntervalSec);
   } else if (typeof j.staggerIntervalSec === "string" && j.staggerIntervalSec.trim() !== "") {
@@ -398,7 +432,14 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
           <option value="1">Instance 1</option>
         </select>
       </div>
-    </div> 
+    </div>
+    <label style="display:flex;gap:0.5rem;align-items:center;margin-top:0.9rem;cursor:pointer">
+      <input type="checkbox" id="amountGetterEnabled" name="amountGetterEnabled" checked style="width:auto;margin:0" />
+      <span>Bot #1 is the amount getter</span>
+    </label>
+    <p style="color:#8b98a5;font-size:0.78rem;margin:0.35rem 0 0.5rem 1.55rem">
+      Bot #1 skips slot polling and booking. It logs in, gets a URN and the totalAmount, and shares the amount with the rest of the fleet.
+    </p>
   </fieldset>`;
 
   const loginBlock = collectLogin
@@ -1040,6 +1081,10 @@ export function runApplicantFormWithSubmitHandler(
           }
           if (req.method === "GET" && path === "/api/monitor/snapshot") {
             json(res, 200, { ok: true, instances: monitor.snapshot() });
+            return;
+          }
+          if (req.method === "GET" && path === "/api/monitor/fleet") {
+            json(res, 200, { ok: true, fleet: buildFleetSummary() });
             return;
           }
           if (req.method === "GET" && path === "/api/monitor/events") {

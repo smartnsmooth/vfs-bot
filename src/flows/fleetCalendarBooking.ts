@@ -1,40 +1,48 @@
 /**
  * Fleet Calendar booking flow (sole booking system).
  *
- * 1. First URN = FeeCalculator → Calendar (dedup) → Fees → then joins instance loop
- * 2. Every URN holder (including FeeCalculator after fees) runs:
+ * Every URN holder runs the same loop — no privileged instance.
+ *
+ * 1. Fees first: while the fleet has no totalAmount, one instance at a time makes a
+ *    single Fees call. Anything other than a totalAmount passes the turn on at once.
+ * 2. Then, with the shared totalAmount in hand:
  *    I.  availableDateList not empty → pick random date → timeslot → add rest to
  *        availableDatetimeList → pick one slot → schedule
  *    II. availableDateList empty, availableDatetimeList not empty → pick random datetime →
  *        timeslot for that date → find allocationId for that time → schedule
- *    III. Both empty → join Calendar round-robin (all URN holders, no FeeCalculator priority)
+ *    III. Both empty → join the Calendar round-robin (one caller at a time)
  * 3. Schedule fail → re-check lists → I/II/III again
  */
 
 import type { BrowserService } from "../services/browser.service";
-import { VfsRateLimitedError, AlreadyBookedError } from "../services/browser.service";
+import {
+  VfsRateLimitedError,
+  AlreadyBookedError,
+  VfsForbiddenError,
+  VfsUnauthorizedError,
+  IndDeuAccountRecreateError,
+  MissingUrnError,
+} from "../services/browser.service";
 import { getApplicantDetailsOverrides } from "../utils/applicantDetails.store";
 import { setAllocationId } from "../utils/allocationId.store";
 import { getTotalAmount, setTotalAmount, getCurrency, setCurrency } from "../utils/totalAmount.store";
 import {
   activeWaiters,
   addToAvailableDatetimeList,
+  claimCalendarAttempt,
+  claimFeesAttempt,
   createCalendarBookingWatcher,
-  dedupeCalendarDates,
   enterCalendarRepoll,
-  getCalendarPollingCallerId,
-  getEffectiveJoinStaggerMs,
   markScheduledSuccess,
   pickRandomDate,
   pickRandomDatetime,
   publishCalendarDates,
-  publishCalendarRepollDates,
   publishSharedFees,
   readCalendarBookingState,
-  recordCalendarPollFailure,
   registerCalendarWaiter,
   registerFleetUrn,
-  retireFromFleet,
+  releaseCalendarAttempt,
+  releaseFeesAttempt,
   type AvailableDatetime,
   type CalendarBookingCoordState,
 } from "../utils/calendarBookingCoord";
@@ -51,13 +59,36 @@ export function getCalendarPollingIntervalMs(): number {
   return Math.max(1000, Math.floor(sec) * 1000);
 }
 
+/**
+ * Session / IP / account blocks must reach the bot-cycle recovery in `index.ts`, and a
+ * missing URN must reach the save-applicants loop there. Everything else is a per-attempt
+ * failure the booking loop retries on its own.
+ */
+function isUnrecoverableHere(err: unknown): boolean {
+  return (
+    err instanceof AlreadyBookedError ||
+    err instanceof VfsRateLimitedError ||
+    err instanceof VfsUnauthorizedError ||
+    err instanceof VfsForbiddenError ||
+    err instanceof IndDeuAccountRecreateError ||
+    err instanceof MissingUrnError
+  );
+}
+
 function applySharedFeesLocally(state: CalendarBookingCoordState): void {
   const fees = state.fees;
   if (!fees?.totalAmount?.trim()) {
-    throw new Error("Fleet Schedule: FeeCalculator has not published totalAmount yet");
+    throw new Error("Fleet Schedule: no shared totalAmount yet");
   }
   setTotalAmount(fees.totalAmount);
   if (fees.currency) setCurrency(fees.currency);
+}
+
+/** Any instance that already got a fees response can latch it for the whole fleet. */
+function tryPublishLocalFees(instanceId: number): boolean {
+  const totalAmount = getTotalAmount();
+  if (!totalAmount?.trim()) return false;
+  return publishSharedFees(instanceId, { totalAmount, currency: getCurrency() });
 }
 
 async function waitForCoordOrTimeout(opts: {
@@ -86,49 +117,40 @@ async function runScheduleWithSharedFees(
   setAllocationId(allocationId);
   reporter.setBookingStep("schedule");
   try {
-    const { paymentUrl } = await browser.postScheduleLiftApi();
-    if (paymentUrl?.trim()) {
+    const { booked } = await browser.postScheduleLiftApi();
+    if (booked) {
       markScheduledSuccess(instanceId);
       return "booked";
     }
     return "rejoin";
   } catch (err) {
-    if (err instanceof AlreadyBookedError) throw err;
-    if (err instanceof VfsRateLimitedError) throw err;
+    if (isUnrecoverableHere(err)) throw err;
     return "rejoin";
   }
 }
 
-// ── FeeCalculator helpers ───────────────────────────────────────────────
+// ── Fees: one call, then hand the turn on ───────────────────────────────
 
-async function runFeeCalculatorCalendarAndFees(
-  browser: BrowserService,
-  instanceId: number
-): Promise<boolean> {
-  reporter.setBookingStep("calendar");
-  try {
-    const dates = await browser.fetchCalendarDatesForFleet();
-    const deduped = dedupeCalendarDates(dates);
-    publishCalendarDates(instanceId, deduped);
-  } catch (err) {
-    if (err instanceof VfsRateLimitedError) throw err;
-    recordCalendarPollFailure(instanceId);
-    return false;
-  }
-
+/**
+ * Make this instance's single Fees call and share the amount.
+ *
+ * Whatever comes back that is not a totalAmount — 504, empty body, error — releases
+ * the turn so the next instance can call immediately. This instance does not sit on
+ * the turn to retry.
+ */
+async function runFeesAttempt(browser: BrowserService, instanceId: number): Promise<void> {
   reporter.setBookingStep("fees");
+  let published = false;
   try {
     await browser.postFeesLiftApi();
-    const totalAmount = getTotalAmount();
-    if (!totalAmount?.trim()) {
-      throw new Error("FeeCalculator: fees response had no totalAmount");
-    }
-    publishSharedFees(instanceId, { totalAmount, currency: getCurrency() });
+    published = tryPublishLocalFees(instanceId);
   } catch (err) {
-    if (err instanceof VfsRateLimitedError) throw err;
-    return false;
+    if (isUnrecoverableHere(err)) {
+      releaseFeesAttempt(instanceId);
+      throw err;
+    }
   }
-  return true;
+  if (!published) releaseFeesAttempt(instanceId);
 }
 
 // ── Case I: pick date → timeslot → pick slot → schedule ────────────────
@@ -158,8 +180,7 @@ async function runCaseI(
     const outcome = await runScheduleWithSharedFees(browser, instanceId, picked.allocationId);
     return outcome === "booked" ? "booked" : "continue";
   } catch (err) {
-    if (err instanceof AlreadyBookedError) throw err;
-    if (err instanceof VfsRateLimitedError) throw err;
+    if (isUnrecoverableHere(err)) throw err;
     return "continue";
   }
 }
@@ -175,6 +196,15 @@ async function runCaseII(
   try {
     const entries = await browser.fetchTimeslotAllocationsForFleet(dt.date);
     const match = entries.find((e) => e.time === dt.time);
+
+    // This call fetched every slot for the date — hand the ones we do not take back to the fleet.
+    const remaining = entries.filter((e) => e !== match);
+    if (remaining.length > 0) {
+      addToAvailableDatetimeList(
+        remaining.map((e) => ({ date: e.date, time: e.time }))
+      );
+    }
+
     if (!match) {
       return "continue";
     }
@@ -182,8 +212,7 @@ async function runCaseII(
     const outcome = await runScheduleWithSharedFees(browser, instanceId, match.allocationId);
     return outcome === "booked" ? "booked" : "continue";
   } catch (err) {
-    if (err instanceof AlreadyBookedError) throw err;
-    if (err instanceof VfsRateLimitedError) throw err;
+    if (isUnrecoverableHere(err)) throw err;
     return "continue";
   }
 }
@@ -215,44 +244,16 @@ export async function runFleetCalendarBooking(opts: {
       if (state.scheduled.includes(instanceId)) return true;
       if (state.retired.includes(instanceId)) return false;
 
-      // ── FeeCalculator: Calendar + Fees (once) ──────────────────────
-      if (
-        state.feeCalculatorId === instanceId &&
-        !state.calendarCalled
-      ) {
-        const ok = await runFeeCalculatorCalendarAndFees(browser, instanceId);
-        if (!ok) {
-          const woke = await waitForCoordOrTimeout({
-            abortSeq, waitForAbort,
-            timeoutMs: 2000,
-            watcherWait: watcher.wait,
-          });
-          if (woke === "abort") return false;
-        }
-        continue;
-      }
-
-      // ── FeeCalculator: if Calendar done but fees not published yet ─
-      if (
-        state.feeCalculatorId === instanceId &&
-        state.calendarCalled &&
-        !state.feesDone
-      ) {
-        reporter.setBookingStep("fees · retry");
-        try {
-          await browser.postFeesLiftApi();
-          const totalAmount = getTotalAmount();
-          if (totalAmount?.trim()) {
-            publishSharedFees(instanceId, { totalAmount, currency: getCurrency() });
-          }
-        } catch (err) {
-          if (err instanceof VfsRateLimitedError) throw err;
-        }
-        continue;
-      }
-
-      // ── Wait for fees to be published before any instance proceeds ─
+      // ── Fees before anything else: no schedule without a totalAmount ─
       if (!state.feesDone) {
+        // An amount this instance already fetched is as good as a fresh call.
+        if (tryPublishLocalFees(instanceId)) continue;
+
+        if (claimFeesAttempt(instanceId)) {
+          await runFeesAttempt(browser, instanceId);
+          continue;
+        }
+
         reporter.setBookingStep("fees · waiting");
         const woke = await waitForCoordOrTimeout({
           abortSeq, waitForAbort,
@@ -264,7 +265,6 @@ export async function runFleetCalendarBooking(opts: {
       }
 
       // ── Instance action loop (I / II / III) ────────────────────────
-      state = readCalendarBookingState();
 
       // Case I: available date list not empty
       const pickedDate = pickRandomDate();
@@ -287,39 +287,28 @@ export async function runFleetCalendarBooking(opts: {
       state = readCalendarBookingState();
 
       if (state.phase === "calendar_repoll") {
-        const caller = getCalendarPollingCallerId(state);
+        const readyAt = state.lastCalendarAttemptAt > 0 ? state.lastCalendarAttemptAt + intervalMs : 0;
+        const waitMs = Math.max(0, readyAt - Date.now());
 
-        if (caller === instanceId) {
-          const readyAt = state.lastCalendarAttemptAt > 0 ? state.lastCalendarAttemptAt + intervalMs : 0;
-          const waitMs = Math.max(0, readyAt - Date.now());
-
-          if (waitMs > 0) {
-            reporter.setBookingStep(`calendar · re-poll in ${Math.round(waitMs / 1000)}s`);
-            const woke = await waitForCoordOrTimeout({
-              abortSeq, waitForAbort,
-              timeoutMs: Math.min(waitMs, 2000),
-              watcherWait: watcher.wait,
-            });
-            if (woke === "abort") return false;
-            continue;
-          }
-
-          reporter.setBookingStep("calendar · re-poll");
+        if (waitMs === 0 && claimCalendarAttempt(instanceId, intervalMs)) {
+          reporter.setBookingStep("calendar");
           try {
             const dates = await browser.fetchCalendarDatesForFleet();
-            publishCalendarRepollDates(instanceId, dates);
+            publishCalendarDates(instanceId, dates);
           } catch (err) {
-            if (err instanceof VfsRateLimitedError) throw err;
-            recordCalendarPollFailure(instanceId);
+            releaseCalendarAttempt(instanceId);
+            if (isUnrecoverableHere(err)) throw err;
           }
           continue;
         }
 
-        // Not our turn — wait for coord change
-        reporter.setBookingStep("calendar · waiting turn");
+        // Either the interval has not expired or a peer holds the turn.
+        reporter.setBookingStep(
+          waitMs > 0 ? `calendar · re-poll in ${Math.round(waitMs / 1000)}s` : "calendar · waiting turn"
+        );
         const woke = await waitForCoordOrTimeout({
           abortSeq, waitForAbort,
-          timeoutMs: 2000,
+          timeoutMs: waitMs > 0 ? Math.min(waitMs, 2000) : 500,
           watcherWait: watcher.wait,
         });
         if (woke === "abort") return false;

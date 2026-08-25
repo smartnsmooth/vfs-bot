@@ -34,3 +34,14 @@ export function classifyVfsFirstTabUrl(raw: string): VfsTabKind {
 
   return "vfs_other";
 }
+
+/** Post-login VFS pages the bot treats as "login already succeeded". */
+export const VFS_DASHBOARD_URL_RE = /\/(applications|dashboard|home)/i;
+
+/** True when Chrome is already past login (dashboard / applications / home). */
+export function isVfsDashboardUrl(raw: string): boolean {
+  const u = (raw || "").trim();
+  if (!u) return false;
+  if (classifyVfsFirstTabUrl(u) === "dashboard") return true;
+  return VFS_DASHBOARD_URL_RE.test(u);
+}

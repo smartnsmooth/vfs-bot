@@ -4,7 +4,8 @@
  * Step defaults to setup-form `applicantsJoinStaggerSec` (0.5s).
  */
 
-import { getEffectiveJoinStaggerMs } from "./calendarBookingCoord";
+import { getFleetWorkerIds } from "./fleetPollSchedule";
+import { getEffectiveJoinStaggerMs } from "./joinStaggerCoord";
 
 /** @deprecated Use {@link getApplicantsJoinStaggerMs} — kept for callers that import the constant. */
 export const JOIN_STAGGER_MS = 500;
@@ -81,9 +82,7 @@ export async function waitForJoinStagger(opts: {
   return "ready";
 }
 
-/** All bot instance ids 1..N from BOT_TOTAL_INSTANCES. */
+/** Bot instance ids that join booking waves — 1..N minus the amountGetter. */
 export function allClusterParticipantIds(): number[] {
-  const raw = parseInt(process.env.BOT_TOTAL_INSTANCES ?? "1", 10);
-  const n = Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 1;
-  return Array.from({ length: n }, (_, i) => i + 1);
+  return getFleetWorkerIds();
 }

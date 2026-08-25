@@ -18,7 +18,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { getFleetInstanceCount, getFleetPollStepMs } from "./fleetPollSchedule";
+import { getFleetPollStepMs, getFleetWorkerIds } from "./fleetPollSchedule";
+import { isAmountGetter } from "./amountGetter";
 
 export interface FleetPollCoordState {
   revision: number;
@@ -36,13 +37,18 @@ export interface FleetPollCoordState {
 const COORD_FILE = join(process.cwd(), "fleet-poll-coord.json");
 const LOCK_FILE = join(process.cwd(), "fleet-poll-coord.lock");
 
+/** Lowest instance id allowed to poll (skips the amountGetter). */
+function defaultNextPollerId(): number {
+  return getFleetWorkerIds()[0] ?? 1;
+}
+
 function emptyState(): FleetPollCoordState {
   return {
     revision: 0,
     lastPollAt: 0,
     lastPollerId: null,
     earliestPollAt: 0,
-    nextPollerId: 1,
+    nextPollerId: defaultNextPollerId(),
     activePollers: [],
   };
 }
@@ -55,11 +61,11 @@ function safeIdArray(arr: unknown): number[] {
 function normalizeState(raw: Partial<FleetPollCoordState> | null | undefined): FleetPollCoordState {
   const base = emptyState();
   if (!raw || typeof raw !== "object") return base;
-  const active = safeIdArray(raw.activePollers);
+  const active = safeIdArray(raw.activePollers).filter((id) => !isAmountGetter(id));
   const nextRaw =
     typeof raw.nextPollerId === "number" && Number.isFinite(raw.nextPollerId) && raw.nextPollerId >= 1
       ? Math.floor(raw.nextPollerId)
-      : 1;
+      : defaultNextPollerId();
   return {
     revision: typeof raw.revision === "number" && Number.isFinite(raw.revision) ? Math.max(0, Math.floor(raw.revision)) : 0,
     lastPollAt: typeof raw.lastPollAt === "number" && Number.isFinite(raw.lastPollAt) ? Math.max(0, Math.floor(raw.lastPollAt)) : 0,
@@ -148,8 +154,7 @@ function turnGraceMs(stepMs: number): number {
 
 function pollerRing(state: FleetPollCoordState): number[] {
   if (state.activePollers.length > 0) return state.activePollers;
-  const n = getFleetInstanceCount();
-  return Array.from({ length: n }, (_, i) => i + 1);
+  return getFleetWorkerIds();
 }
 
 /** Advance round-robin past `currentNext` within the active ring. */
@@ -191,7 +196,7 @@ export function ensureFleetPollEarliest(earliestPollAtMs: number): void {
       const s = readState();
       if (s.earliestPollAt > 0) return false;
       s.earliestPollAt = t;
-      if (!s.nextPollerId || s.nextPollerId < 1) s.nextPollerId = 1;
+      if (!s.nextPollerId || s.nextPollerId < 1) s.nextPollerId = defaultNextPollerId();
       s.revision += 1;
       writeState(s);
       return true;
@@ -204,6 +209,7 @@ export function ensureFleetPollEarliest(earliestPollAtMs: number): void {
 /** Mark this instance as an active fleet poller (call when entering the poll loop). */
 export function registerFleetPoller(instanceId: number): void {
   const id = Math.max(1, Math.floor(instanceId));
+  if (isAmountGetter(id)) return;
   for (let attempt = 0; attempt < 80; attempt++) {
     const result = withExclusiveLock(() => {
       const s = readState();

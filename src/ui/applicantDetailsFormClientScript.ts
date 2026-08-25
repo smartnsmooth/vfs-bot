@@ -643,6 +643,11 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       const gsrc = (globalInst && globalInst.details) || {};
       sisEl.value = gsrc.staggerIntervalSec != null ? String(gsrc.staggerIntervalSec) : "6";
     }
+    const agEl = document.getElementById("amountGetterEnabled");
+    if (agEl) {
+      const gsrc = (globalInst && globalInst.details) || {};
+      agEl.checked = gsrc.amountGetterEnabled != null ? gsrc.amountGetterEnabled === true : true;
+    }
     const cpsdEl = document.getElementById("calendarPollingStartDate");
     if (cpsdEl) {
       const gsrc = (globalInst && globalInst.details) || {};
@@ -738,6 +743,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       repeatedDelaySec: parseInt(String(fd.get("repeatedDelaySec") || "35"), 10) || 35,
       postLoginPollDelay: parseInt(String(fd.get("postLoginPollDelay") || "30"), 10),
       staggerIntervalSec: parseInt(String(fd.get("staggerIntervalSec") || "6"), 10),
+      amountGetterEnabled: fd.get("amountGetterEnabled") != null,
       proxyProvider: String(fd.get("proxyProvider") || "brightdata"),
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
       helloVerifyNumber: String(fd.get("helloVerifyNumber") ?? "").trim() || undefined,
@@ -1027,6 +1033,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       repeatedDelaySec: parseInt(String(fd.get("repeatedDelaySec") || "35"), 10) || 35,
       postLoginPollDelay: parseInt(String(fd.get("postLoginPollDelay") || "30"), 10),
       staggerIntervalSec: parseInt(String(fd.get("staggerIntervalSec") || "6"), 10),
+      amountGetterEnabled: fd.get("amountGetterEnabled") != null,
       proxyProvider: String(fd.get("proxyProvider") || "brightdata"),
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
       helloVerifyNumber: String(fd.get("helloVerifyNumber") ?? "").trim() || undefined,

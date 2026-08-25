@@ -247,6 +247,7 @@ const APPLICANT_UI_ONLY_KEYS = [
   "userPollInterval",
   "apologiesIntervalSec",
   "applicantsJoinStaggerSec",
+  "amountGetterEnabled",
   "postLoginPollDelay",
   "staggerIntervalSec",
   "calendarPollingStartDate",
