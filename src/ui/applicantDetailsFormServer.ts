@@ -1217,6 +1217,9 @@ export function runApplicantFormWithSubmitHandler(
             if (globalDet && typeof globalDet.applicantsJoinStaggerSec === "number") {
               defaults.applicantsJoinStaggerSec = globalDet.applicantsJoinStaggerSec;
             }
+            if (globalDet && typeof globalDet.amountGetterEnabled === "boolean") {
+              defaults.amountGetterEnabled = globalDet.amountGetterEnabled;
+            }
             if (globalDet && typeof globalDet.postLoginPollDelay === "number") {
               defaults.postLoginPollDelay = globalDet.postLoginPollDelay;
             }
@@ -1319,6 +1322,7 @@ export function runApplicantFormWithSubmitHandler(
             userPollInterval: upi,
             apologiesIntervalSec: ais,
             applicantsJoinStaggerSec: ajs,
+            amountGetterEnabled: age,
             postLoginPollDelay: plpd,
             staggerIntervalSec: sis,
             calendarPollingStartDate: cpsd,
@@ -1344,6 +1348,7 @@ export function runApplicantFormWithSubmitHandler(
               changed = true;
             }
             if (typeof ajs === "number") { global0.applicantsJoinStaggerSec = ajs; changed = true; }
+            if (typeof age === "boolean") { global0.amountGetterEnabled = age; changed = true; }
             if (typeof plpd === "number") { global0.postLoginPollDelay = plpd; changed = true; }
             if (typeof sis === "number") { global0.staggerIntervalSec = sis; changed = true; }
             if (typeof cpsd === "string") { global0.calendarPollingStartDate = cpsd; changed = true; }
@@ -1468,6 +1473,7 @@ export function runApplicantFormWithSubmitHandler(
             submittedApplicantsJoinStaggerSec != null ||
             submittedStaggerSec != null ||
             typeof j.userPollInterval === "number" ||
+            typeof j.amountGetterEnabled === "boolean" ||
             submittedCalendarPollingInterval != null ||
             submittedApiDelaySec != null ||
             submittedRepeatedDelaySec != null ||
@@ -1490,6 +1496,10 @@ export function runApplicantFormWithSubmitHandler(
             }
             if (typeof j.userPollInterval === "number" && j.userPollInterval >= 1) {
               global0.userPollInterval = Math.floor(j.userPollInterval);
+              changed = true;
+            }
+            if (typeof j.amountGetterEnabled === "boolean") {
+              global0.amountGetterEnabled = j.amountGetterEnabled;
               changed = true;
             }
             if (submittedCalendarPollingInterval != null) {

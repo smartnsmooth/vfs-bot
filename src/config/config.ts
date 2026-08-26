@@ -43,11 +43,6 @@ function resolvedSlotPayloadLoginUser(): string {
   return envSlotLoginUser();
 }
 
-/** 0 = poll forever; N > 0 = run exactly N slot checks then stop the poll loop. Default 16. */
-const POLL_LIMIT_RAW = parseInt(process.env.POLL_LIMIT ?? "16", 10);
-const pollLimit =
-  Number.isFinite(POLL_LIMIT_RAW) && POLL_LIMIT_RAW > 0 ? Math.floor(POLL_LIMIT_RAW) : 0;
-
 const MAIL_TM_OTP_TIMEOUT_MS = parseInt(process.env.MAIL_TM_OTP_TIMEOUT_MS ?? "120000", 10);
 const MAIL_TM_POLL_MS = parseInt(process.env.MAIL_TM_POLL_MS ?? "4000", 10);
 const MAIL_TM_POST_SIGNIN_DELAY_MS = parseInt(process.env.MAIL_TM_POST_SIGNIN_DELAY_MS ?? "2500", 10);
@@ -88,9 +83,6 @@ export const config = {
     payCode: "",
     roleName: process.env.VFS_SLOT_ROLE_NAME ?? "Individual",
   },
-  /** `POLL_LIMIT`: 0 = infinite; else stop after this many `checkSlotsInBrowser` calls. */
-  pollLimit,
-
   telegramEnabled: process.env.ENABLE_TELEGRAM !== "false",
   telegramToken: process.env.TELEGRAM_TOKEN ?? "",
   telegramChatId: process.env.TELEGRAM_CHAT_ID ?? "",

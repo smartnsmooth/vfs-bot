@@ -2,7 +2,8 @@
  * The amountGetter role.
  *
  * One instance — always Bot #1 — never polls CheckIsSlotAvailable and never books.
- * It logs in, calls applicants for a URN and fees for the totalAmount, and publishes
+ * It logs in, calls applicants (own center) for a URN and fees (instance 2's center,
+ * see {@link AMOUNT_GETTER_FEES_INSTANCE_ID}) for the totalAmount, and publishes
  * that amount to `calendar-booking-coord.json` so the instances that do find a slot
  * can go straight to schedule instead of spending fees round-robin turns on it.
  *
@@ -16,6 +17,12 @@
 import { getApplicantDetailsOverrides } from "./applicantDetails.store";
 
 export const AMOUNT_GETTER_INSTANCE_ID = 1;
+/**
+ * The amountGetter splits its two calls across two centers: applicants uses its own
+ * (instance 1) centerCode/visaCategoryCode to get a URN, and fees prices that URN with
+ * this instance's centerCode instead. Fees throws if that instance has no `vacCode`.
+ */
+export const AMOUNT_GETTER_FEES_INSTANCE_ID = 2;
 export const DEFAULT_AMOUNT_GETTER_ENABLED = true;
 
 /** Setup-form "Amount getter (Bot #1)" toggle. */

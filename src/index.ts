@@ -93,7 +93,7 @@ import {
   registerFleetUrn,
   retireFromFleet,
 } from "./utils/calendarBookingCoord";
-import { isAmountGetter } from "./utils/amountGetter";
+import { isAmountGetter, AMOUNT_GETTER_FEES_INSTANCE_ID } from "./utils/amountGetter";
 import { getCurrency, getTotalAmount } from "./utils/totalAmount.store";
 import { getEffectiveJoinStaggerMs } from "./utils/joinStaggerCoord";
 import { runFleetCalendarBooking } from "./flows/fleetCalendarBooking";
@@ -291,6 +291,18 @@ let softIpRotateAwaitingSecond429 = false;
 
 function clearSoftIpRotateFlag(): void {
   softIpRotateAwaitingSecond429 = false;
+}
+
+/**
+ * CheckIsSlotAvailable rounds completed on the current VFS session. Drives the Monitor
+ * `poll #` value and the `VFS_POLL_RELOGIN_INTERVAL` trigger; every login resets it to 0,
+ * so the interval always counts from a fresh session.
+ */
+let pollRoundsOnSession = 0;
+
+function resetPollRoundsOnSession(): void {
+  pollRoundsOnSession = 0;
+  reporter.setPoll({ pollCount: 0 });
 }
 
 /**
@@ -1567,8 +1579,6 @@ async function runPollLoop(
     onRelogin?: () => Promise<void>;
   }
 ): Promise<boolean> {
-  const limit = config.pollLimit;
-  let completed = 0;
   let slotFound = false;
   const slotWatcher = createSlotFoundWatcher(instanceId);
   const myAbortSeq = pollingAbortSeq;
@@ -1578,7 +1588,7 @@ async function runPollLoop(
   registerFleetPoller(id);
 
   try {
-    while (limit === 0 || completed < limit) {
+    while (true) {
       if (pollingAbortSeq !== myAbortSeq) {
         await throwIfAbortedForPageNotFound(myAbortSeq, "polling-loop-abort");
         return false;
@@ -1682,7 +1692,7 @@ async function runPollLoop(
         }
 
                 reporter.setPhase("polling", `checking center ${center.centerNumber} (${center.vacCode})`);
-        reporter.setPoll({ center: `${center.centerNumber}:${center.vacCode}`, pollCount: completed + 1 });
+        reporter.setPoll({ center: `${center.centerNumber}:${center.vacCode}`, pollCount: pollRoundsOnSession + 1 });
 
         const { slot, response, centerNumber, centerCode, visaCategoryCode, unauthorized, accountBlocked, rateLimitedIp, rateLimitCode, forbidden, accountRecreate, forbiddenCode, gatewayTimeout, cloudflareChallenge, fetchFailed } = await polling.checkSlotsInBrowser(browser, {
           centerCode: center.vacCode,
@@ -1811,14 +1821,11 @@ async function runPollLoop(
           await telegram.alert("error", err instanceof Error ? err.message : "Poll error").catch(() => { });
         }
       }
-      completed += 1;
-      if (limit > 0 && completed >= limit) {
-                break;
-      }
+      pollRoundsOnSession += 1;
 
       // Every N CheckIsSlotAvailable calls: hard relogin so the 429 counter resets.
       const reloginAfter = opts?.reloginAfter;
-      if (reloginAfter && reloginAfter > 0 && completed % reloginAfter === 0 && opts?.onRelogin) {
+      if (reloginAfter && reloginAfter > 0 && pollRoundsOnSession >= reloginAfter && opts?.onRelogin) {
         try {
           unregisterFleetPoller(id);
           await opts.onRelogin();
@@ -1826,6 +1833,9 @@ async function runPollLoop(
         } catch (err) {
           await telegram.alert("error", "Re-login failed — polling stopped. Please check the browser and re-login manually.").catch(() => { });
           return false;
+        } finally {
+          // Without this the threshold stays met and every later poll would relogin.
+          resetPollRoundsOnSession();
         }
       }
     }
@@ -1916,6 +1926,7 @@ async function recreateIndDeuAccountAndRelogin(
   code?: string,
 ): Promise<void> {
   const label = code ?? "4030xx";
+  resetPollRoundsOnSession();
   reporter.setPhase("recovering", `${label} — new account + IP rotate`);
   await telegram
     .alert("error", `Bot ${instanceId ?? "?"} got ${label} — creating a new ind-deu account...`)
@@ -1949,6 +1960,7 @@ async function performHardRelogin(instanceId?: number, context?: string): Promis
   }
   const ctx = context ?? "hard-relogin";
   clearSoftIpRotateFlag();
+  resetPollRoundsOnSession();
   if (/failed-to-fetch|fetch/i.test(ctx)) {
     reporter.setRecoveringError("fetch fail", `hard relogin — ${ctx}`);
   } else if (/401|unauthorized/i.test(ctx)) {
@@ -2692,6 +2704,8 @@ async function performVfsLoginFromStore(instanceId?: number): Promise<void> {
   }
   await browser.loginOnFirstTab(u, p);
   advanceCredentialSlotAfterSuccessfulLogin(instanceId);
+  // Fresh session — the relogin interval must count from zero again.
+  resetPollRoundsOnSession();
 }
 
 // ── amountGetter (Bot #1): fetch the fleet's totalAmount, nothing else ──
@@ -2705,6 +2719,10 @@ const AMOUNT_GETTER_REPUBLISH_CHECK_MS = 1_000;
  * The amountGetter's entire job in one pass: applicants for a URN, fees for the
  * totalAmount, then publish the amount to the fleet. Throws on any failure so the
  * caller can run the matching recovery and go again.
+ *
+ * The two calls deliberately use different centers: applicants runs on this instance's
+ * own center/category, fees prices the resulting URN against instance
+ * {@link AMOUNT_GETTER_FEES_INSTANCE_ID}'s center.
  */
 async function runAmountGetterAttempt(instanceId: number): Promise<void> {
   reporter.setBookingStep("applicants");
@@ -2714,7 +2732,7 @@ async function runAmountGetterAttempt(instanceId: number): Promise<void> {
   }
 
   reporter.setBookingStep("fees");
-  await browser.postFeesLiftApi();
+  await browser.postFeesLiftApi({ centerCodeInstanceId: AMOUNT_GETTER_FEES_INSTANCE_ID });
   const totalAmount = getTotalAmount();
   if (!totalAmount?.trim()) {
     throw new Error("Amount getter: fees returned no totalAmount");
