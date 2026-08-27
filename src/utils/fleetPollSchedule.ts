@@ -1,5 +1,4 @@
 import { getApplicantDetailsOverrides } from "./applicantDetails.store";
-import { isAmountGetter } from "./amountGetter";
 
 export const DEFAULT_POLL_INTERVAL_SEC = 60;
 export const DEFAULT_APOLOGIES_INTERVAL_SEC = 2;
@@ -89,17 +88,9 @@ export function getFleetInstanceCount(): number {
   return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 1;
 }
 
-/**
- * Instances that poll and book — every instance except the amountGetter, which
- * does neither and must not hold a seat in any fleet round-robin.
- *
- * Falls back to the full list when that would leave nobody (single-instance fleet
- * with the amountGetter toggle on), so round-robin math never divides by zero.
- */
+/** Instances that poll and book — every instance in the fleet. */
 export function getFleetWorkerIds(): number[] {
-  const ids = Array.from({ length: getFleetInstanceCount() }, (_, i) => i + 1);
-  const workers = ids.filter((id) => !isAmountGetter(id));
-  return workers.length > 0 ? workers : ids;
+  return Array.from({ length: getFleetInstanceCount() }, (_, i) => i + 1);
 }
 
 export function getFleetWorkerCount(): number {

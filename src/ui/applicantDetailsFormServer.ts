@@ -295,11 +295,6 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
     const v = parseInt(j.postLoginPollDelay, 10);
     if (Number.isFinite(v) && v >= 0) out.postLoginPollDelay = v;
   }
-  if (typeof j.amountGetterEnabled === "boolean") {
-    out.amountGetterEnabled = j.amountGetterEnabled;
-  } else if (typeof j.amountGetterEnabled === "string" && j.amountGetterEnabled.trim() !== "") {
-    out.amountGetterEnabled = /^(true|1|yes|on)$/i.test(j.amountGetterEnabled.trim());
-  }
   if (typeof j.staggerIntervalSec === "number" && Number.isFinite(j.staggerIntervalSec) && j.staggerIntervalSec >= 0) {
     out.staggerIntervalSec = Math.floor(j.staggerIntervalSec);
   } else if (typeof j.staggerIntervalSec === "string" && j.staggerIntervalSec.trim() !== "") {
@@ -433,13 +428,6 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
         </select>
       </div>
     </div>
-    <label style="display:flex;gap:0.5rem;align-items:center;margin-top:0.9rem;cursor:pointer">
-      <input type="checkbox" id="amountGetterEnabled" name="amountGetterEnabled" checked style="width:auto;margin:0" />
-      <span>Bot #1 is the amount getter</span>
-    </label>
-    <p style="color:#8b98a5;font-size:0.78rem;margin:0.35rem 0 0.5rem 1.55rem">
-      Bot #1 skips slot polling and booking. It logs in, gets a URN and the totalAmount, and shares the amount with the rest of the fleet.
-    </p>
   </fieldset>`;
 
   const loginBlock = collectLogin
@@ -1217,9 +1205,6 @@ export function runApplicantFormWithSubmitHandler(
             if (globalDet && typeof globalDet.applicantsJoinStaggerSec === "number") {
               defaults.applicantsJoinStaggerSec = globalDet.applicantsJoinStaggerSec;
             }
-            if (globalDet && typeof globalDet.amountGetterEnabled === "boolean") {
-              defaults.amountGetterEnabled = globalDet.amountGetterEnabled;
-            }
             if (globalDet && typeof globalDet.postLoginPollDelay === "number") {
               defaults.postLoginPollDelay = globalDet.postLoginPollDelay;
             }
@@ -1322,7 +1307,6 @@ export function runApplicantFormWithSubmitHandler(
             userPollInterval: upi,
             apologiesIntervalSec: ais,
             applicantsJoinStaggerSec: ajs,
-            amountGetterEnabled: age,
             postLoginPollDelay: plpd,
             staggerIntervalSec: sis,
             calendarPollingStartDate: cpsd,
@@ -1348,7 +1332,6 @@ export function runApplicantFormWithSubmitHandler(
               changed = true;
             }
             if (typeof ajs === "number") { global0.applicantsJoinStaggerSec = ajs; changed = true; }
-            if (typeof age === "boolean") { global0.amountGetterEnabled = age; changed = true; }
             if (typeof plpd === "number") { global0.postLoginPollDelay = plpd; changed = true; }
             if (typeof sis === "number") { global0.staggerIntervalSec = sis; changed = true; }
             if (typeof cpsd === "string") { global0.calendarPollingStartDate = cpsd; changed = true; }
@@ -1473,7 +1456,6 @@ export function runApplicantFormWithSubmitHandler(
             submittedApplicantsJoinStaggerSec != null ||
             submittedStaggerSec != null ||
             typeof j.userPollInterval === "number" ||
-            typeof j.amountGetterEnabled === "boolean" ||
             submittedCalendarPollingInterval != null ||
             submittedApiDelaySec != null ||
             submittedRepeatedDelaySec != null ||
@@ -1496,10 +1478,6 @@ export function runApplicantFormWithSubmitHandler(
             }
             if (typeof j.userPollInterval === "number" && j.userPollInterval >= 1) {
               global0.userPollInterval = Math.floor(j.userPollInterval);
-              changed = true;
-            }
-            if (typeof j.amountGetterEnabled === "boolean") {
-              global0.amountGetterEnabled = j.amountGetterEnabled;
               changed = true;
             }
             if (submittedCalendarPollingInterval != null) {

@@ -3,7 +3,7 @@ import { config, getCurrentInstanceId } from "../config/config";
 import { buildCalendarBody, CALENDAR_URL, firstDayOfNextMonthFromDdMmYyyy } from "../config/calendar";
 import { buildScheduleBody, SCHEDULE_URL } from "../config/schedule";
 import { buildTimeslotBody, TIMESLOT_URL } from "../config/timeslot";
-import { buildFeesBody, FEES_URL, type BuildFeesBodyOptions } from "../config/fees";
+import { buildFeesBody, FEES_URL } from "../config/fees";
 import { buildMapVasBody, MAPVAS_URL } from "../config/mapvas";
 import { buildSaveApplicantsBody, SAVE_APPLICANTS_URL } from "../config/saveApplicants";
 import { ensureApplicantIpResolved } from "../utils/applicantIp";
@@ -299,8 +299,8 @@ export async function saveApplicantsOnPage(page: Page): Promise<void> {
 
 // ── Fees ─────────────────────────────────────────────────────────────────
 
-export async function postFeesOnPage(page: Page, urn: string, opts?: BuildFeesBodyOptions): Promise<void> {
-  const feesPayload = buildFeesBody(urn, opts);
+export async function postFeesOnPage(page: Page, urn: string): Promise<void> {
+  const feesPayload = buildFeesBody(urn);
     const res = await postLiftJsonFromPage(page, FEES_URL, feesPayload);
   try {
     const j = JSON.parse(res.body) as {

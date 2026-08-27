@@ -59,7 +59,6 @@ import {
   type FleetTimeslotEntry,
   type ScheduleResult,
 } from "./browser.booking";
-import type { BuildFeesBodyOptions } from "../config/fees";
 
 // ── Login module ────────────────────────────────────────────────────────
 import {
@@ -509,13 +508,13 @@ export class BrowserService implements BrowserServiceCore {
     await saveApplicantsOnPage(page);
   }
 
-  async postFeesLiftApi(opts?: BuildFeesBodyOptions): Promise<void> {
+  async postFeesLiftApi(): Promise<void> {
     const urn = getApplicationUrn();
     if (!urn?.trim()) {
       throw new MissingUrnError("Fees: no urn; save applicants must run again");
     }
     const page = await this.getVfsPage();
-    await postFeesOnPage(page, urn, opts);
+    await postFeesOnPage(page, urn);
   }
 
   /** Calendar → dates list (throws on empty/error). */

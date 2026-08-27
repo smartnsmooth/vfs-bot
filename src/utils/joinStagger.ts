@@ -82,7 +82,7 @@ export async function waitForJoinStagger(opts: {
   return "ready";
 }
 
-/** Bot instance ids that join booking waves — 1..N minus the amountGetter. */
+/** Bot instance ids that join booking waves — 1..N. */
 export function allClusterParticipantIds(): number[] {
   return getFleetWorkerIds();
 }

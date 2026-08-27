@@ -29,7 +29,6 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { isAmountGetter } from "./amountGetter";
 
 export type CalendarBookingPhase = "poll" | "active" | "calendar_repoll";
 
@@ -340,9 +339,6 @@ export function dedupeCalendarDates(dates: string[]): string[] {
 
 export function registerFleetUrn(instanceId: number): CalendarBookingCoordState {
   const id = Math.max(1, Math.floor(instanceId));
-  // The amountGetter holds a URN but never books — keeping it out of the holder
-  // list stops the fees round-robin handing turns to an instance that is not there.
-  if (isAmountGetter(id)) return readCalendarBookingState();
   return updateCalendarBookingState((s) => {
     // URN is the source of truth: un-retire so a prior 1037/1101 cannot keep this
     // instance out of the fees and calendar round-robins.
@@ -375,7 +371,6 @@ export function activeWaiters(state: CalendarBookingCoordState): number[] {
 
 export function registerCalendarWaiter(instanceId: number): CalendarBookingCoordState {
   const id = Math.max(1, Math.floor(instanceId));
-  if (isAmountGetter(id)) return readCalendarBookingState();
   return updateCalendarBookingState((s) => {
     if (s.retired.includes(id)) return false;
     // Called on every loop iteration by every instance — only write when it changes something.

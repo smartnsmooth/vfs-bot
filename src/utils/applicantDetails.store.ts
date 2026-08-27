@@ -8,11 +8,16 @@ import { loadInstancesFromDisk, saveInstancesToDisk } from "./instanceStorage";
 
 const instanceApplicantDetails = new Map<number, Record<string, unknown>>();
 
+function stripRetiredFields(details: Record<string, unknown>): void {
+  delete details.amountGetterEnabled;
+}
+
 // Load from disk on module import
 const diskData = loadInstancesFromDisk();
 for (const [idStr, data] of Object.entries(diskData.instances)) {
   const id = parseInt(idStr, 10);
   if (data.details) {
+    stripRetiredFields(data.details);
     instanceApplicantDetails.set(id, data.details);
   }
 }
@@ -24,6 +29,7 @@ export function reloadApplicantDetailsFromDisk(): void {
   for (const [idStr, row] of Object.entries(data.instances)) {
     const id = parseInt(idStr, 10);
     if (row.details) {
+      stripRetiredFields(row.details);
       instanceApplicantDetails.set(id, row.details);
     }
   }
@@ -34,6 +40,7 @@ function persistToDisk(): void {
   
   // Get details
   for (const [id, details] of instanceApplicantDetails.entries()) {
+    stripRetiredFields(details);
     if (!instances[String(id)]) instances[String(id)] = {};
     instances[String(id)].details = details;
   }

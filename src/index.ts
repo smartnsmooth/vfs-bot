@@ -88,13 +88,9 @@ import {
 } from "./utils/applicantsCoord";
 import { allClusterParticipantIds, waitForJoinStagger } from "./utils/joinStagger";
 import {
-  publishSharedFees,
-  readCalendarBookingState,
   registerFleetUrn,
   retireFromFleet,
 } from "./utils/calendarBookingCoord";
-import { isAmountGetter, AMOUNT_GETTER_FEES_INSTANCE_ID } from "./utils/amountGetter";
-import { getCurrency, getTotalAmount } from "./utils/totalAmount.store";
 import { getEffectiveJoinStaggerMs } from "./utils/joinStaggerCoord";
 import { runFleetCalendarBooking } from "./flows/fleetCalendarBooking";
 import { saveAlreadyBookedAccountFile } from "./utils/alreadyBookedAccountFile";
@@ -2342,8 +2338,6 @@ async function waitForApplicantsStaggerGate(opts: {
     typeof opts.instanceId === "number" && Number.isFinite(opts.instanceId) && opts.instanceId >= 1
       ? Math.floor(opts.instanceId)
       : 1;
-  // Rotate by position among booking instances, not raw instance id: the amountGetter
-  // never calls applicants, so its id must not leave a dead slot in the rotation.
   const workers = getFleetWorkerIds();
   const rank = workers.indexOf(id);
   const stepMs = getApologiesIntervalMs();
@@ -2708,118 +2702,6 @@ async function performVfsLoginFromStore(instanceId?: number): Promise<void> {
   resetPollRoundsOnSession();
 }
 
-// ── amountGetter (Bot #1): fetch the fleet's totalAmount, nothing else ──
-
-/** Pause before the next amountGetter attempt when the failure did not relogin. */
-const AMOUNT_GETTER_RETRY_MS = 5_000;
-/** How often the finished amountGetter re-checks that the fleet still has its amount. */
-const AMOUNT_GETTER_REPUBLISH_CHECK_MS = 1_000;
-
-/**
- * The amountGetter's entire job in one pass: applicants for a URN, fees for the
- * totalAmount, then publish the amount to the fleet. Throws on any failure so the
- * caller can run the matching recovery and go again.
- *
- * The two calls deliberately use different centers: applicants runs on this instance's
- * own center/category, fees prices the resulting URN against instance
- * {@link AMOUNT_GETTER_FEES_INSTANCE_ID}'s center.
- */
-async function runAmountGetterAttempt(instanceId: number): Promise<void> {
-  reporter.setBookingStep("applicants");
-  await browser.saveApplicantsViaLiftApi();
-  if (!getApplicationUrn()?.trim()) {
-    throw new Error("Amount getter: save applicants did not set URN");
-  }
-
-  reporter.setBookingStep("fees");
-  await browser.postFeesLiftApi({ centerCodeInstanceId: AMOUNT_GETTER_FEES_INSTANCE_ID });
-  const totalAmount = getTotalAmount();
-  if (!totalAmount?.trim()) {
-    throw new Error("Amount getter: fees returned no totalAmount");
-  }
-  publishSharedFees(instanceId, { totalAmount, currency: getCurrency() });
-}
-
-/** Same recovery the booking chain uses, minus everything that re-enters polling. */
-async function recoverAmountGetter(instanceId: number, err: unknown): Promise<void> {
-  if (err instanceof AlreadyBookedError) {
-    await retireInstanceForAlreadyBooked(instanceId, err.message);
-  }
-  if (err instanceof VfsRateLimitedError) {
-    if (err.isAccountBlock) {
-      await stopForAccountRateLimit(instanceId, "amount-getter", err.code);
-      return;
-    }
-    await handleIpRateLimitRecovery(instanceId, "429-ip-amount-getter", err.code);
-    return;
-  }
-  if (err instanceof IndDeuAccountRecreateError) {
-    await recreateIndDeuAccountAndRelogin(instanceId, err.code);
-    return;
-  }
-  if (
-    err instanceof VfsUnauthorizedError ||
-    err instanceof VfsForbiddenError ||
-    err instanceof VfsGatewayTimeoutError ||
-    err instanceof MissingUrnError ||
-    isFailedToFetchError(err) ||
-    isSaveApplicants401(err) ||
-    isSaveApplicants10673(err)
-  ) {
-    await performHardRelogin(instanceId, "amount-getter");
-    return;
-  }
-  await sleepMsAsync(AMOUNT_GETTER_RETRY_MS);
-}
-
-/**
- * Bot #1 with the amountGetter role: get the totalAmount to the fleet as early as
- * possible and then stop working. It never polls and never books, so this call
- * does not return — after the amount is shared it only stays up to put the amount
- * back whenever a new wave clears the booking coordination file.
- */
-async function runAmountGetterLoop(instanceId?: number): Promise<void> {
-  const id = normalizeFleetInstanceId(instanceId);
-  const soft10673Attempts = Math.max(1, config.pollReloginInterval);
-  let consecutive10673 = 0;
-
-  reporter.setPhase("booking", "amount getter — fetching totalAmount");
-
-  while (!instanceStopped) {
-    try {
-      await runAmountGetterAttempt(id);
-      break;
-    } catch (err) {
-      // 10673 is usually transient: retry in place before paying for a relogin.
-      if (isSaveApplicants10673(err) && ++consecutive10673 < soft10673Attempts) {
-        reporter.setBookingStep(`applicants · retry ${consecutive10673}`);
-        await sleepMsAsync(AMOUNT_GETTER_RETRY_MS);
-        continue;
-      }
-      consecutive10673 = 0;
-      await recoverAmountGetter(id, err);
-    }
-  }
-
-  if (instanceStopped) return;
-
-  const totalAmount = getTotalAmount() ?? "";
-  const currency = getCurrency();
-  await telegram
-    .notify(`Bot ${id} (amount getter): totalAmount ${totalAmount}${currency ? ` ${currency}` : ""} shared with the fleet.`)
-    .catch(() => { });
-  reporter.setBookingStep(null);
-  reporter.setPhase("idle", `amount getter — totalAmount ${totalAmount} shared`);
-
-  for (;;) {
-    await sleepMsAsync(AMOUNT_GETTER_REPUBLISH_CHECK_MS);
-    if (instanceStopped) return;
-    if (!readCalendarBookingState().feesDone) {
-      publishSharedFees(id, { totalAmount, currency });
-    }
-  }
-}
-
 /**
  * One full run after setup form Submit (or headless single run): CDP refresh → tab URL branch → poll → optional booking.
  *
@@ -3027,13 +2909,6 @@ async function runOneBotCycleCore(meta: SubmitMeta): Promise<void> {
         return;
   }
 
-  // The amountGetter skips the fleet poll gate entirely — the sooner it publishes
-  // the totalAmount, the less work is left for the instances that find a slot.
-  if (isAmountGetter(instanceId)) {
-    await runAmountGetterLoop(instanceId);
-    return;
-  }
-
   // --- Coordinated poll-start gate (first submit only, cluster mode) ---
   // Wait until the shared fleet pollStartAt. After that, bots claim the next
   // poll slot every userPollInterval (gap-filling when peers are absent).
@@ -3153,10 +3028,6 @@ async function start(): Promise<void> {
                         return;
           }
           if (instanceOnPaymentPage) {
-                        return;
-          }
-          // The amountGetter has no booking chain to force.
-          if (isAmountGetter(myInstanceId)) {
                         return;
           }
           // Abort any in-progress polling so the new poll cycle can start.

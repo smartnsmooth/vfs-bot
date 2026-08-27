@@ -19,7 +19,6 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { getFleetPollStepMs, getFleetWorkerIds } from "./fleetPollSchedule";
-import { isAmountGetter } from "./amountGetter";
 
 export interface FleetPollCoordState {
   revision: number;
@@ -37,7 +36,6 @@ export interface FleetPollCoordState {
 const COORD_FILE = join(process.cwd(), "fleet-poll-coord.json");
 const LOCK_FILE = join(process.cwd(), "fleet-poll-coord.lock");
 
-/** Lowest instance id allowed to poll (skips the amountGetter). */
 function defaultNextPollerId(): number {
   return getFleetWorkerIds()[0] ?? 1;
 }
@@ -61,7 +59,7 @@ function safeIdArray(arr: unknown): number[] {
 function normalizeState(raw: Partial<FleetPollCoordState> | null | undefined): FleetPollCoordState {
   const base = emptyState();
   if (!raw || typeof raw !== "object") return base;
-  const active = safeIdArray(raw.activePollers).filter((id) => !isAmountGetter(id));
+  const active = safeIdArray(raw.activePollers);
   const nextRaw =
     typeof raw.nextPollerId === "number" && Number.isFinite(raw.nextPollerId) && raw.nextPollerId >= 1
       ? Math.floor(raw.nextPollerId)
@@ -209,7 +207,6 @@ export function ensureFleetPollEarliest(earliestPollAtMs: number): void {
 /** Mark this instance as an active fleet poller (call when entering the poll loop). */
 export function registerFleetPoller(instanceId: number): void {
   const id = Math.max(1, Math.floor(instanceId));
-  if (isAmountGetter(id)) return;
   for (let attempt = 0; attempt < 80; attempt++) {
     const result = withExclusiveLock(() => {
       const s = readState();
