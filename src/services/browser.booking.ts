@@ -73,12 +73,17 @@ export async function postLiftJsonFromPage(
     assertVfsPageLoggedInForLiftApi(page);
   } catch (err) {
     if (logKind) {
+      const now = new Date();
       logApiCall(
         logKind,
         "",
         instanceId ?? undefined,
         payloadJson,
-        { error: err instanceof Error ? err.message : String(err) }
+        {
+          error: err instanceof Error ? err.message : String(err),
+          requestAt: now,
+          responseAt: now,
+        }
       );
     }
     throw err;
@@ -108,6 +113,7 @@ export async function postLiftJsonFromPage(
     }
 
     let result: { status: number; body: string };
+    const requestAt = new Date();
     try {
       result = await page.evaluate(
     async (args: {
@@ -196,7 +202,11 @@ export async function postLiftJsonFromPage(
           "",
           instanceId ?? undefined,
           payloadJson,
-          { error: err instanceof Error ? err.message : String(err) }
+          {
+            error: err instanceof Error ? err.message : String(err),
+            requestAt,
+            responseAt: new Date(),
+          }
         );
       }
       throw err;
@@ -207,7 +217,8 @@ export async function postLiftJsonFromPage(
         logKind,
         result.body ?? "",
         instanceId ?? undefined,
-        payloadJson
+        payloadJson,
+        { requestAt, responseAt: new Date(), httpStatus: result.status }
       );
     }
 
@@ -218,7 +229,10 @@ export async function postLiftJsonFromPage(
     }
 
     if (result.status === 504) {
-      await new Promise<void>((r) => setTimeout(r, 1000));
+      // Cloudflare suggests ~120s; wait 20s then retry. A following 409 uses the normal 409 delay path.
+      const sleepSec = 20;
+      reporter.setDetail(`504 — retry ${logKind ?? "api"} in ${sleepSec}s`);
+      await new Promise<void>((r) => setTimeout(r, sleepSec * 1000));
       bumpJoinStaggerOn504();
       continue;
     }
