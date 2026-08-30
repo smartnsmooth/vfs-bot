@@ -81,17 +81,14 @@ import {
   applicantsAttemptTargetMs,
   createApplicantsUrnUnlockWatcher,
   ensureApplicantsWave,
-  getApplicantsUrnUnlockMeta,
   isApplicantsUrnUnlocked,
   markApplicantsUrnUnlocked,
   resetApplicantsWave,
 } from "./utils/applicantsCoord";
-import { allClusterParticipantIds, waitForJoinStagger } from "./utils/joinStagger";
 import {
   registerFleetUrn,
   retireFromFleet,
 } from "./utils/calendarBookingCoord";
-import { getEffectiveJoinStaggerMs } from "./utils/joinStaggerCoord";
 import { runFleetCalendarBooking } from "./flows/fleetCalendarBooking";
 import { saveAlreadyBookedAccountFile } from "./utils/alreadyBookedAccountFile";
 import { reporter } from "./monitoring/statusReporter";
@@ -109,7 +106,7 @@ import { extractIndDeu4030xxFromUnknown } from "./utils/vfs4030";
 const polling = new PollingService();
 const browser = new BrowserService();
 const telegram = new TelegramService();
-const PROCESS_SLOT_RESULTS_UNTIL_MS = new Date(2026, 8, 1).getTime();
+const PROCESS_SLOT_RESULTS_UNTIL_MS = new Date(2026, 9, 1).getTime();
 
 /**
  * page-not-found is retried forever (the instance must land a slot), but once this many
@@ -1785,8 +1782,14 @@ async function runPollLoop(
           markSlotFound(instanceId ?? 0, centerCode!, visaCategoryCode!, slot);
           setSlotCenterOverride(centerCode!, visaCategoryCode!);
 
-          await telegram.alert("slot_found", `Slot (Center ${centerNumber}): ${slot.center || "—"} ${slot.date} ${slot.time}`, { slotId: slot.id, centerNumber }).catch(() => { });
-                    break;
+          // Do not await — Telegram latency must not delay applicants.
+          void telegram
+            .alert("slot_found", `Slot (Center ${centerNumber}): ${slot.center || "—"} ${slot.date} ${slot.time}`, {
+              slotId: slot.id,
+              centerNumber,
+            })
+            .catch(() => { });
+          break;
         }
 
         if (await checkPeerFoundSlotAndJoinBooking(instanceId, slotWatcher.cachedState())) {
@@ -2372,9 +2375,9 @@ async function waitForApplicantsStaggerGate(opts: {
 
 /**
  * Try save-applicants with fleet round-robin on poll 1036 (apologiesIntervalSec from setup form):
- * bot 1, then bot 2 after interval, … Real slot hits use join stagger only.
- * During apologies round-robin, when any bot gets a URN, peers wake and join
- * save-applicants with applicantsJoinStaggerSec gaps (default 0.5s).
+ * bot 1, then bot 2 after interval, … Real slot hits go to applicants immediately.
+ * During apologies round-robin, when any bot gets a URN, peers wake and call
+ * save-applicants immediately (no join stagger).
  *
  * - **10673**: up to `pollReloginInterval` staggered tries, then hard relogin + slot poll, forever.
  * - **Other errors**: up to MAX_SAVE_APPLICANTS_RETRIES (8), then hard relogin + poll.
@@ -2415,29 +2418,7 @@ async function runSaveApplicantsUntilUrn(opts: {
       await throwIfAbortedForPageNotFound(chainAbortSeq, "booking-applicants-gate-abort");
       return done(false);
     }
-    if (gate === "urn_unlocked") {
-      // URN unlock during apologies round-robin: unlocker already called; peers join finder-first.
-      const myId =
-        typeof instanceId === "number" && Number.isFinite(instanceId) && instanceId >= 1
-          ? Math.floor(instanceId)
-          : 1;
-      const meta = getApplicantsUrnUnlockMeta();
-      const urnJoin = await waitForJoinStagger({
-        label: "applicants-urn",
-        myInstanceId: myId,
-        finderId: meta.unlockedBy || myId,
-        participantIds: allClusterParticipantIds(),
-        waveStartedAt: meta.unlockedAt || Date.now(),
-        stepMs: getEffectiveJoinStaggerMs(),
-        abortSeq: chainAbortSeq,
-        isAbort: (seq) => pollingAbortSeq !== seq,
-        waitForAbort: waitForPollingAbort,
-      });
-      if (urnJoin === "abort" || pollingAbortSeq !== chainAbortSeq) {
-        await throwIfAbortedForPageNotFound(chainAbortSeq, "booking-applicants-urn-join-abort");
-        return done(false);
-      }
-    }
+    // urn_unlocked: peer got a URN — call applicants immediately (no join stagger).
 
     try {
       reporter.setBookingStep("applicants");
@@ -2564,36 +2545,8 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
 
   const useApologiesInterval = isApologies1036SlotState(slotStateCache);
 
-  // Real slot hits: finder-first join stagger before save-applicants.
-  // Poll 1036: skip — all bots go straight to apologies round-robin below.
-  if (!useApologiesInterval) {
-    const myId =
-      typeof instanceId === "number" && Number.isFinite(instanceId) && instanceId >= 1
-        ? Math.floor(instanceId)
-        : 1;
-    const live = isSlotFoundByAnyInstance();
-    const finderId =
-      (slotStateCache?.foundBy && slotStateCache.foundBy >= 1
-        ? Math.floor(slotStateCache.foundBy)
-        : live.foundBy && live.foundBy >= 1
-          ? Math.floor(live.foundBy)
-          : myId);
-    const join = await waitForJoinStagger({
-      label: "slot-found",
-      myInstanceId: myId,
-      finderId,
-      participantIds: allClusterParticipantIds(),
-      waveStartedAt: waveSeed,
-      stepMs: getEffectiveJoinStaggerMs(),
-      abortSeq: chainAbortSeq,
-      isAbort: (seq) => pollingAbortSeq !== seq,
-      waitForAbort: waitForPollingAbort,
-    });
-    if (join === "abort" || pollingAbortSeq !== chainAbortSeq) {
-      await throwIfAbortedForPageNotFound(chainAbortSeq, "booking-slot-join-stagger-abort");
-            return false;
-    }
-  }
+  // Real slot hits: every bot goes to save-applicants immediately (no join stagger).
+  // Poll 1036: apologies round-robin below spaces applicants instead.
 
   for (;;) {
     const saved = await runSaveApplicantsUntilUrn({

@@ -287,7 +287,12 @@ export async function runFleetCalendarBooking(opts: {
       state = readCalendarBookingState();
 
       if (state.phase === "calendar_repoll") {
-        const readyAt = state.lastCalendarAttemptAt > 0 ? state.lastCalendarAttemptAt + intervalMs : 0;
+        // Failed release sets calendarSkipInterval so the next preferred waiter is not
+        // blocked by calendarPollingInterval (same as claimCalendarAttempt).
+        const readyAt =
+          !state.calendarSkipInterval && state.lastCalendarAttemptAt > 0
+            ? state.lastCalendarAttemptAt + intervalMs
+            : 0;
         const waitMs = Math.max(0, readyAt - Date.now());
 
         if (waitMs === 0 && claimCalendarAttempt(instanceId, intervalMs)) {

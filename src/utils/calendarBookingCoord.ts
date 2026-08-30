@@ -77,6 +77,12 @@ export interface CalendarBookingCoordState {
   calendarAttemptOwnerId: number | null;
   lastCalendarAttemptAt: number;
   lastCalendarCallerId: number | null;
+  /**
+   * After a failed Calendar call, skip the re-poll interval so the next preferred
+   * instance can claim immediately — without opening the seat to everyone (which
+   * let the failing instance reclaim before peers woke up).
+   */
+  calendarSkipInterval: boolean;
 
   /** Successfully scheduled — leave the fleet. */
   scheduled: number[];
@@ -135,6 +141,7 @@ function emptyState(): CalendarBookingCoordState {
     calendarAttemptOwnerId: null,
     lastCalendarAttemptAt: 0,
     lastCalendarCallerId: null,
+    calendarSkipInterval: false,
     scheduled: [],
     retired: [],
   };
@@ -187,6 +194,7 @@ function normalizeState(raw: Partial<CalendarBookingCoordState> | null | undefin
     calendarAttemptOwnerId: safeId(raw.calendarAttemptOwnerId),
     lastCalendarAttemptAt: safeCount(raw.lastCalendarAttemptAt),
     lastCalendarCallerId: safeId(raw.lastCalendarCallerId),
+    calendarSkipInterval: raw.calendarSkipInterval === true,
     scheduled: safeIntArray(raw.scheduled),
     retired: safeIntArray(raw.retired),
   };
@@ -393,7 +401,8 @@ export function retireFromFleet(instanceId: number): CalendarBookingCoordState {
     }
     if (s.calendarAttemptOwnerId === id) {
       s.calendarAttemptOwnerId = null;
-      s.lastCalendarAttemptAt = 0;
+      s.lastCalendarAttemptAt = Date.now();
+      s.calendarSkipInterval = true;
       s.calendarAttemptIndex = Math.max(0, s.calendarAttemptIndex) + 1;
     }
     return true;
@@ -518,6 +527,7 @@ export function publishCalendarDates(publisherId: number, dates: string[]): bool
     s.calendarCalled = true;
     s.lastCalendarCallerId = id;
     s.lastCalendarAttemptAt = Date.now();
+    s.calendarSkipInterval = false;
     if (s.calendarAttemptOwnerId === id) s.calendarAttemptOwnerId = null;
     const consumed = new Set(s.consumedDates);
     for (const d of cleanDates) {
@@ -635,7 +645,8 @@ export function getCalendarPollingCallerId(state: CalendarBookingCoordState): nu
 
 /**
  * Take the Calendar seat for one call. `intervalMs` is the configured re-poll gap:
- * a fresh call is only allowed once that long has passed since the last attempt.
+ * a fresh call is only allowed once that long has passed since the last attempt
+ * (unless {@link CalendarBookingCoordState.calendarSkipInterval} after a failed call).
  */
 export function claimCalendarAttempt(instanceId: number, intervalMs: number): boolean {
   const id = Math.max(1, Math.floor(instanceId));
@@ -646,13 +657,20 @@ export function claimCalendarAttempt(instanceId: number, intervalMs: number): bo
     const owner = s.calendarAttemptOwnerId;
     if (owner != null && owner !== id && now - s.lastCalendarAttemptAt < CALENDAR_ATTEMPT_STALE_MS) return false;
     const gap = Math.max(0, intervalMs);
-    if (s.lastCalendarAttemptAt > 0 && now - s.lastCalendarAttemptAt < gap) return false;
+    const skipInterval = s.calendarSkipInterval === true;
+    if (!skipInterval && s.lastCalendarAttemptAt > 0 && now - s.lastCalendarAttemptAt < gap) return false;
     if (
       !turnIsOpenTo({
         id,
         preferred: getCalendarPollingCallerId(s),
-        // The turn opens when the re-poll interval expires, not when the last call started.
-        openedAt: s.lastCalendarAttemptAt > 0 ? s.lastCalendarAttemptAt + gap : 0,
+        // After a normal attempt, the turn opens when the re-poll interval expires.
+        // After a failed release (skipInterval), the turn opens immediately for the
+        // preferred instance, then grace lets others take over if preferred is gone.
+        openedAt: skipInterval
+          ? s.lastCalendarAttemptAt
+          : s.lastCalendarAttemptAt > 0
+            ? s.lastCalendarAttemptAt + gap
+            : 0,
         graceMs: CALENDAR_TURN_GRACE_MS,
         now,
       })
@@ -662,6 +680,7 @@ export function claimCalendarAttempt(instanceId: number, intervalMs: number): bo
     s.calendarAttemptOwnerId = id;
     s.lastCalendarCallerId = id;
     s.lastCalendarAttemptAt = now;
+    s.calendarSkipInterval = false;
     claimed = true;
     return true;
   });
@@ -670,15 +689,17 @@ export function claimCalendarAttempt(instanceId: number, intervalMs: number): bo
 
 /**
  * Calendar call came back with nothing to publish. Rotate to the next poller and
- * clear the interval gate: the polling interval exists to space out "no slots"
- * answers, not to punish a request that never landed.
+ * skip the re-poll interval for that next preferred instance — without zeroing the
+ * turn clock (zeroing opened the seat to every waiter and the failing instance
+ * reclaimed before peers could claim).
  */
 export function releaseCalendarAttempt(instanceId: number): CalendarBookingCoordState {
   const id = Math.max(1, Math.floor(instanceId));
   return updateCalendarBookingState((s) => {
     if (s.calendarAttemptOwnerId !== id) return false;
     s.calendarAttemptOwnerId = null;
-    s.lastCalendarAttemptAt = 0;
+    s.lastCalendarAttemptAt = Date.now();
+    s.calendarSkipInterval = true;
     s.calendarAttemptIndex = Math.max(0, s.calendarAttemptIndex) + 1;
     return true;
   });
@@ -699,6 +720,7 @@ export function enterCalendarRepoll(): boolean {
     // No attempt yet in this round, so the first caller goes without waiting out the interval.
     s.lastCalendarAttemptAt = 0;
     s.lastCalendarCallerId = null;
+    s.calendarSkipInterval = false;
     // Fresh round: a date that went nowhere last round may have opened up again.
     s.consumedDates = [];
     entered = true;

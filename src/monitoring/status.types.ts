@@ -188,7 +188,7 @@ export interface MonitorControlState {
   calendarPollingIntervalSec: number;
   /** Seconds to wait before each lift-api POST. */
   apiDelaySec: number;
-  /** First sleep after HTTP 409 (seconds); +5s each retry. */
+  /** Sleep after HTTP 409 when body has no usable `code` (seconds). */
   repeatedDelaySec: number;
   /** Active proxy source for all bots (Monitor switcher). */
   proxyProvider: "brightdata" | "iplist";

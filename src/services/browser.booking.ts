@@ -19,7 +19,7 @@ import { AlreadyBookedError, VfsForbiddenError, VfsGatewayTimeoutError, isFailed
 import { classifyVfs429FromHttp } from "../utils/vfsRateLimit";
 import { throwIfLiftAuthBlocked } from "../utils/vfsAuthBlock";
 import { bumpJoinStaggerOn504 } from "../utils/joinStaggerCoord";
-import { getApiDelayMs, getRepeatedDelayMs, REPEATED_DELAY_STEP_SEC } from "../utils/fleetPollSchedule";
+import { getApiDelayMs, getRepeatedDelayMs } from "../utils/fleetPollSchedule";
 import { isCloudflareChallengeBody, logApiCall, liftUrlToLogKind } from "../utils/apiCallLog";
 import { reporter } from "../monitoring/statusReporter";
 import { TelegramService } from "./telegram.service";
@@ -37,12 +37,41 @@ function getLiftApiPageContextFromSource(page: Page): { origin: string; referer:
 
 const REPEATED_DELAY_KINDS = new Set(["polling", "applicants", "calendar", "timeslot", "fees", "schedule"]);
 
+/** Extra cushion on top of VFS Repeated Delay `code` (seconds). */
+const REPEATED_DELAY_BODY_CODE_PADDING_SEC = 2;
+
 /** In-page retries for a dropped proxy connection before the caller rotates the IP. */
 const MAX_IN_PAGE_FETCH_RETRIES = 3;
 const IN_PAGE_FETCH_RETRY_STEP_MS = 1_000;
 
 function isHttp409(status: number): boolean {
   return status === 409;
+}
+
+/**
+ * VFS 409 body often looks like `{ "code": 31, "description": "Repeated Delay" }`
+ * where `code` is seconds to wait — not a business error id.
+ */
+function parseRepeatedDelaySecFromBody(body: string): number | null {
+  try {
+    const parsed = JSON.parse(body) as {
+      code?: unknown;
+      error?: { code?: unknown };
+    };
+    const raw = parsed?.code ?? parsed?.error?.code;
+    const n =
+      typeof raw === "number"
+        ? raw
+        : typeof raw === "string"
+          ? parseInt(raw.trim(), 10)
+          : NaN;
+    if (!Number.isFinite(n) || n < 1) return null;
+    // Guard against mistaking large business codes (1035, 429201, …) for seconds.
+    if (n > 300) return null;
+    return Math.floor(n);
+  } catch {
+    return null;
+  }
 }
 
 function assertVfsPageLoggedInForLiftApi(page: Page): void {
@@ -91,7 +120,6 @@ export async function postLiftJsonFromPage(
 
   const { origin, referer, route } = getLiftApiPageContextFromSource(page);
   const clientSourceOverride: string | null = getCapturedClientSource()?.trim() || null;
-  let repeatedDelayMs = getRepeatedDelayMs();
   let fetchFailures = 0;
 
   for (;;) {
@@ -237,10 +265,15 @@ export async function postLiftJsonFromPage(
       continue;
     }
     if (logKind && REPEATED_DELAY_KINDS.has(logKind) && isHttp409(result.status)) {
-      const sleepSec = Math.max(1, Math.round(repeatedDelayMs / 1000));
-      reporter.setDetail(`409 — retry ${logKind} in ${sleepSec}s`);
-      await new Promise<void>((r) => setTimeout(r, repeatedDelayMs));
-      repeatedDelayMs += REPEATED_DELAY_STEP_SEC * 1000;
+      const fromBody = parseRepeatedDelaySecFromBody(result.body);
+      const baseSec = fromBody ?? Math.max(1, Math.round(getRepeatedDelayMs() / 1000));
+      const sleepSec = baseSec + REPEATED_DELAY_BODY_CODE_PADDING_SEC;
+      reporter.setDetail(
+        fromBody != null
+          ? `409 — retry ${logKind} in ${sleepSec}s (body ${fromBody}+${REPEATED_DELAY_BODY_CODE_PADDING_SEC})`
+          : `409 — retry ${logKind} in ${sleepSec}s (fallback ${baseSec}+${REPEATED_DELAY_BODY_CODE_PADDING_SEC})`
+      );
+      await new Promise<void>((r) => setTimeout(r, sleepSec * 1000));
       continue;
     }
     const rate = classifyVfs429FromHttp(result.status, result.body);
@@ -289,7 +322,6 @@ function extractErrorCode(error: unknown): number | null {
 }
 
 export async function saveApplicantsOnPage(page: Page): Promise<void> {
-  await page.waitForTimeout(500);
   await ensureApplicantIpResolved(page);
   const body = buildSaveApplicantsBody();
   

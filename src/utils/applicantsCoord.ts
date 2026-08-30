@@ -3,9 +3,9 @@
  *
  * After a poll 1036 ("apologies") hit, bots call applicants one-by-one on a
  * round-robin schedule using `apologiesIntervalSec` from the setup form.
- * Real slot hits rely on join stagger only. When any bot receives a URN, peers
- * wake immediately and call applicants after a short finder-first join stagger
- * (`applicantsJoinStaggerSec` from the setup form).
+ * Real slot hits go to applicants immediately (no join stagger). When any bot
+ * receives a URN during apologies round-robin, peers wake and call save-applicants
+ * immediately (no join stagger).
  */
 
 import { existsSync, readFileSync, writeFileSync, unlinkSync, watch } from "node:fs";
