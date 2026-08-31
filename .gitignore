@@ -15,3 +15,5 @@ already-booked/
 log.txt
 register-bot/
 *.rar
+.env
+/release
