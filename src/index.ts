@@ -17,18 +17,21 @@ import {
   closeApplicantFormServer,
 } from "./ui/applicantDetailsFormServer";
 import { getSessionLoginCredentials, reloadSessionCredentialsFromDisk } from "./utils/sessionLogin.store";
-import { isIndDeuRoute } from "./utils/vfsRoute";
+import { isAreLvaRoute, isIndDeuRoute } from "./utils/vfsRoute";
 import { reloadApplicantDetailsFromDisk, getApplicantDetailsOverrides, setApplicantDetailsOverrides } from "./utils/applicantDetails.store";
 import {
+  assertProxyProviderReady,
   getActiveProxyProvider,
   listProxyUrlsForProvider,
   parseProxyProviderId,
   persistProxyProvider,
   pickProxyUrlFromList,
+  PROXY_PROVIDER_PARSE_ERROR,
   proxyProviderLabel,
   setMemoryProxyProvider,
   type ProxyProviderId,
 } from "./utils/proxyProvider";
+import { buildWebshareProxyUrl, isWebshareConfigured, webshareStickySessionId } from "./utils/webshareProxy";
 import {
   getProxyListFilePath,
   isProxyListConfigured,
@@ -90,6 +93,7 @@ import {
   retireFromFleet,
 } from "./utils/calendarBookingCoord";
 import { runFleetCalendarBooking } from "./flows/fleetCalendarBooking";
+import { runAreLvaBooking } from "./flows/areLvaBooking";
 import { saveAlreadyBookedAccountFile } from "./utils/alreadyBookedAccountFile";
 import { reporter } from "./monitoring/statusReporter";
 import { registry } from "./monitoring/statusRegistry";
@@ -106,7 +110,7 @@ import { extractIndDeu4030xxFromUnknown } from "./utils/vfs4030";
 const polling = new PollingService();
 const browser = new BrowserService();
 const telegram = new TelegramService();
-const PROCESS_SLOT_RESULTS_UNTIL_MS = new Date(2026, 9, 1).getTime();
+const PROCESS_SLOT_RESULTS_UNTIL_MS = new Date(2026, 10, 1).getTime();
 
 /**
  * page-not-found is retried forever (the instance must land a slot), but once this many
@@ -223,7 +227,7 @@ async function killChromeOnPort(port: number): Promise<void> {
         if (pid && /^\d+$/.test(pid) && pid !== "0") pids.add(pid);
       }
       for (const pid of pids) {
-                await execAsync(`taskkill /F /PID ${pid}`, { timeout: 6_000 }).catch(() => {
+        await execAsync(`taskkill /F /PID ${pid}`, { timeout: 6_000 }).catch(() => {
           /* already gone */
         });
       }
@@ -246,7 +250,7 @@ async function killChromeOnPort(port: number): Promise<void> {
     }
     await new Promise((r) => setTimeout(r, 1_500));
   } catch (err) {
-      }
+  }
 }
 
 /**
@@ -257,7 +261,7 @@ async function relaunchChromeAfterCredentialSwapLogout(): Promise<void> {
   const profileId = getBotInstanceId(resolveChromeUserDataDir());
   const rawList = (process.env.PROXY_URLS ?? "").trim();
   const slots = rawList.split(/[\r\n,]+/).map((s) => s.trim()).filter(Boolean).length;
-    await closeActiveAnonymizedProxyTunnel();
+  await closeActiveAnonymizedProxyTunnel();
   await browser.disconnectCdp();
   await killChromeOnPort(getRemoteDebuggingPort());
   await ensureChromeWithDevTools();
@@ -347,11 +351,11 @@ async function rotateIpWithoutRelogin(context: string): Promise<boolean> {
     return true;
   }
 
-    let snap: { pageUrl: string; authorize: string | null; clientsource: string | null } | null = null;
+  let snap: { pageUrl: string; authorize: string | null; clientsource: string | null } | null = null;
   try {
     snap = await browser.snapshotVfsAuthForIpRotate();
   } catch (err) {
-      }
+  }
 
   await closeActiveAnonymizedProxyTunnel();
   await browser.disconnectCdp();
@@ -373,7 +377,7 @@ async function rotateIpWithoutRelogin(context: string): Promise<boolean> {
     softIpRotateAwaitingSecond429 = true;
     return true;
   } catch (err) {
-        clearSoftIpRotateFlag();
+    clearSoftIpRotateFlag();
     return false;
   }
 }
@@ -435,7 +439,7 @@ async function stopForAccountRateLimit(
   reporter.setAttention("blocked", `account rate-limit ${label} — stopped`);
   reporter.setPhase("stopped", `account rate-limit ${label}`);
   reporter.setPoll({ code: label });
-    await telegram
+  await telegram
     .alert(
       "error",
       `Bot ${instanceId ?? "?"} account blocked (${label}) during ${context}. Stopping — User ID / account rate-limit.`
@@ -484,7 +488,7 @@ async function getProxyChainModule(): Promise<ProxyChainModule> {
 let submitChain: Promise<void> = Promise.resolve();
 function enqueueSubmitTask(task: () => Promise<void>): void {
   submitChain = submitChain.then(task).catch((err) => {
-      });
+  });
 }
 
 /**
@@ -507,7 +511,7 @@ function requestPollingAbort(reason: string, instanceId?: number): void {
       /* ignore */
     }
   }
-  }
+}
 
 /** Fleet-wide pause from Monitor tab — bots keep Chrome/session, skip slot checks. */
 let pollingPaused = false;
@@ -566,7 +570,7 @@ async function holdIfPollingPaused(
   if (gate > Date.now() && !instanceBookingActive && !instanceOnPaymentPage) {
     const remaining = gate - Date.now();
     reporter.setPhase("polling", `resuming in ${Math.round(remaining / 1000)}s (fleet stagger)`);
-        await Promise.race([
+    await Promise.race([
       new Promise<void>((r) => setTimeout(r, remaining)),
       abortSeq != null ? waitForPollingAbort(abortSeq) : new Promise<void>(() => { }),
     ]);
@@ -838,6 +842,7 @@ function ensureProxyClaimHeartbeat(): void {
 
 /**
  * Bright Data: hash this instance onto `PROXY_URLS` + rotation offset.
+ * Webshare: backbone `p.webshare.io` with a numeric sticky session per bot + rotation.
  * IP list: an exclusive claim from `proxies.txt`, where `takeNew` (every real Chrome launch)
  * releases the current IP into its cooldown and takes the next unused one — the IP rotate.
  */
@@ -852,9 +857,12 @@ function resolveProxyForInstance(instanceId: string, opts?: { takeNew?: boolean 
     startProxyListFileWatcher();
     return proxyListUrlForKey(key);
   }
+  const rot = getProxyRotationOffset(instanceId);
+  if (provider === "webshare") {
+    return buildWebshareProxyUrl(webshareStickySessionId(instanceId, rot));
+  }
   const list = listProxyUrlsForProvider(provider);
   if (list.length === 0) return null;
-  const rot = getProxyRotationOffset(instanceId);
   const session = stableSessionToken(instanceId);
   return pickProxyUrlFromList(list, instanceId, rot, session);
 }
@@ -1016,14 +1024,12 @@ async function recreateAuthProxyTunnel(selectedProxy: string): Promise<string> {
 }
 
 /**
- * Swap Bright Data / IP list for this process. Chrome keeps the same local tunnel port;
+ * Swap Bright Data / Webshare / IP list for this process. Chrome keeps the same local tunnel port;
  * existing CONNECT sockets are dropped so the next page `fetch()` uses the new upstream.
  */
 async function applyProxyProviderSwitch(provider: ProxyProviderId): Promise<{ ok: boolean; error?: string }> {
-  if (provider === "iplist") {
-    const check = isProxyListConfigured();
-    if (!check.ok) return check;
-  }
+  const ready = assertProxyProviderReady(provider);
+  if (!ready.ok) return ready;
   setMemoryProxyProvider(provider);
   const instanceId = getBotInstanceId(resolveChromeUserDataDir());
   const selected = resolveProxyForInstance(instanceId);
@@ -1052,10 +1058,8 @@ async function applyProxyProviderSwitch(provider: ProxyProviderId): Promise<{ ok
 }
 
 function commitProxyProvider(provider: ProxyProviderId): { ok: boolean; error?: string } {
-  if (provider === "iplist") {
-    const check = isProxyListConfigured();
-    if (!check.ok) return check;
-  }
+  const ready = assertProxyProviderReady(provider);
+  if (!ready.ok) return ready;
   persistProxyProvider(provider);
   void applyProxyProviderSwitch(provider);
   return { ok: true };
@@ -1108,7 +1112,7 @@ function detectScreenWorkingArea(): Promise<{ width: number; height: number }> {
       } else {
         cachedScreenSize = { width: 1920, height: 1040 };
       }
-            resolve(cachedScreenSize);
+      resolve(cachedScreenSize);
     }
   });
 }
@@ -1182,7 +1186,7 @@ async function ensureChromeWithDevTools(opts?: { preserveSession?: boolean }): P
   // Reposition into the tiled grid (not bottom-right).
   for (const url of getChromeDevToolsCheckUrls()) {
     if (await checkDevToolsEndpoint(url)) {
-            const numId = parseInt(process.env.BOT_INSTANCE_ID ?? "1", 10) || 1;
+      const numId = parseInt(process.env.BOT_INSTANCE_ID ?? "1", 10) || 1;
       const total = parseInt(process.env.BOT_TOTAL_INSTANCES ?? "1", 10) || 1;
       const grid = await computeChromeGridPosition(numId, total);
       await moveWindowByDebugPort(debugPort, grid);
@@ -1405,11 +1409,11 @@ if (-not $done) { Write-Host "${label} no window handle found" }
     const timer = setTimeout(() => { try { ps.kill(); } catch { } finish(); }, 6000);
     ps.on("exit", (code) => {
       clearTimeout(timer);
-                  finish();
+      finish();
     });
     ps.on("error", (err) => {
       clearTimeout(timer);
-            finish();
+      finish();
     });
     let resolved = false;
     function finish() {
@@ -1443,7 +1447,7 @@ async function settleOnDashboard(opts: {
   reporter.setAttention(null);
   reporter.setPreferMinimized(true);
   await minimizeChromeWindow().catch((err) => {
-      });
+  });
   // Re-assert minimize after settle wait (and once mid-wait) — late captcha
   // focus / any accidental restore should not leave Chrome visible during polling.
   const remimize = async () => {
@@ -1455,7 +1459,7 @@ async function settleOnDashboard(opts: {
     await new Promise((r) => setTimeout(r, 800));
     await remimize();
   })();
-  
+
   const waitMs = opts.waitMs ?? 0;
   if (waitMs <= 0) {
     await remimize();
@@ -1466,7 +1470,7 @@ async function settleOnDashboard(opts: {
   }
 
   reporter.setPhase("polling", `on dashboard — waiting ${Math.round(waitMs / 1000)}s`);
-  
+
   const abortSeq = opts.abortSeq;
   if (abortSeq == null) {
     await new Promise((r) => setTimeout(r, waitMs));
@@ -1518,7 +1522,7 @@ async function enterPaymentPageMode(instanceId?: number): Promise<void> {
   if (!focused) {
     await restoreChromeWindow().catch(() => { });
   }
-  }
+}
 
 /**
  * If another instance wrote `slot-state.json`, adopt their center/category and treat polling as a hit.
@@ -1543,8 +1547,8 @@ async function checkPeerFoundSlotAndJoinBooking(instanceId?: number, watcherCach
   }
   if (sharedState.centerCode && sharedState.visaCategoryCode) {
     setSlotCenterOverride(sharedState.centerCode, sharedState.visaCategoryCode);
-      } else {
-      }
+  } else {
+  }
   return true;
 }
 
@@ -1559,6 +1563,33 @@ function pollLoopReloginOpts(instanceId?: number): {
     reloginAfter: n,
     onRelogin: () => performHardRelogin(instanceId, "poll-interval"),
   };
+}
+
+function isAreLvaCurrent(): boolean {
+  return isAreLvaRoute(config.slotPayload.countryCode, config.slotPayload.missionCode);
+}
+
+/** Apply this instance's setup-form centre so applicants/calendar skip CheckIsSlotAvailable. */
+function applyAreLvaFormCenter(instanceId?: number): void {
+  const details = getApplicantDetailsOverrides(instanceId);
+  const vac = typeof details?.vacCode === "string" ? details.vacCode.trim() : "";
+  const cat = typeof details?.selectedSubvisaCategory === "string" ? details.selectedSubvisaCategory.trim() : "";
+  if (vac && cat) setSlotCenterOverride(vac, cat);
+}
+
+/**
+ * Other portals poll CheckIsSlotAvailable. are-lva goes straight to applicants after login wait.
+ */
+async function runSlotPollUnlessAreLva(
+  instanceId?: number,
+  opts?: {
+    pollStartAt?: number;
+    reloginAfter?: number;
+    onRelogin?: () => Promise<void>;
+  }
+): Promise<boolean> {
+  if (isAreLvaCurrent()) return true;
+  return runPollLoop(instanceId, opts);
 }
 
 async function runPollLoop(
@@ -1680,11 +1711,11 @@ async function runPollLoop(
             await performHardRelogin(instanceId, "polling-block-page");
             continue;
           }
-                    await telegram.alert("error", `Not on a supported VFS page for polling (${urlAfterClaim || "unknown"}). Polling stopped.`).catch(() => { });
+          await telegram.alert("error", `Not on a supported VFS page for polling (${urlAfterClaim || "unknown"}). Polling stopped.`).catch(() => { });
           return false;
         }
 
-                reporter.setPhase("polling", `checking center ${center.centerNumber} (${center.vacCode})`);
+        reporter.setPhase("polling", `checking center ${center.centerNumber} (${center.vacCode})`);
         reporter.setPoll({ center: `${center.centerNumber}:${center.vacCode}`, pollCount: pollRoundsOnSession + 1 });
 
         const { slot, response, centerNumber, centerCode, visaCategoryCode, unauthorized, accountBlocked, rateLimitedIp, rateLimitCode, forbidden, accountRecreate, forbiddenCode, gatewayTimeout, cloudflareChallenge, fetchFailed } = await polling.checkSlotsInBrowser(browser, {
@@ -1693,7 +1724,7 @@ async function runPollLoop(
           centerNumber: center.centerNumber,
         });
 
-        
+
         if (gatewayTimeout) {
           reporter.setPhase("recovering", "504 Gateway Timeout — continuing");
           await telegram.alert("error", `Bot ${instanceId ?? "?"} got 504 Gateway Timeout during polling — continuing.`).catch(() => { });
@@ -1797,7 +1828,7 @@ async function runPollLoop(
         }
 
         await telegram.alert("no_slot_found", `No slot in Center ${center.centerNumber} (${center.vacCode})`).catch(() => { });
-              } catch (err) {
+      } catch (err) {
         if (isFailedToFetchError(err)) {
           reporter.setRecoveringError("fetch fail", "Failed to fetch — hard relogin (proxy/network)");
           await telegram
@@ -1929,7 +1960,7 @@ async function recreateIndDeuAccountAndRelogin(
   reporter.setPhase("recovering", `${label} — new account + IP rotate`);
   await telegram
     .alert("error", `Bot ${instanceId ?? "?"} got ${label} — creating a new ind-deu account...`)
-    .catch(() => {});
+    .catch(() => { });
   clearApplicationUrn();
   clearApplicantIpCache();
   await relaunchChromeAfterCredentialSwapLogout();
@@ -1946,7 +1977,7 @@ async function recreateIndDeuAccountAndRelogin(
   await browser.preparePollingAfterLogin({ skipDashboardNavigate: true });
   await telegram
     .alert("info", `Bot ${instanceId ?? "?"} new ind-deu account ready after ${label} — resuming.`)
-    .catch(() => {});
+    .catch(() => { });
 }
 
 async function performHardRelogin(instanceId?: number, context?: string): Promise<void> {
@@ -1993,13 +2024,13 @@ async function recoverFromSaveApplicantsFailure(
   err: unknown
 ): Promise<boolean> {
   const msg = err instanceof Error ? err.message : String(err);
-    await telegram
+  await telegram
     .alert("error", `Save applicants failed (instance ${instanceId ?? 1}), hard relogin: ${msg}`)
     .catch(() => { });
   clearSlotCenterOverride();
   clearSlotDate();
   await performHardRelogin(instanceId, context);
-  return runPollLoop(instanceId, pollLoopReloginOpts(instanceId));
+  return runSlotPollUnlessAreLva(instanceId, pollLoopReloginOpts(instanceId));
 }
 
 /** Pause before the next booking attempt so a fast-failing poll loop cannot hot-spin. */
@@ -2020,7 +2051,7 @@ async function repollAfterBookingSetback(
   clearSlotCenterOverride();
   clearSlotDate();
   await browser.preparePollingAfterLogin({ skipDashboardNavigate: true }).catch(() => { });
-  if (!(await runPollLoop(instanceId, pollLoopReloginOpts(instanceId)))) {
+  if (!(await runSlotPollUnlessAreLva(instanceId, pollLoopReloginOpts(instanceId)))) {
     // Poll loop bailed out immediately (abort / no centers configured) — wait it out.
     reporter.setPhase("polling", `retrying after ${context}`);
     await sleepMsAsync(BOOKING_SETBACK_RETRY_MS);
@@ -2034,7 +2065,7 @@ async function recoverBookingChainFromGatewayTimeout(
   err: unknown,
   slotStateCache?: SlotFoundState
 ): Promise<boolean> {
-    if (!(await recoverFromSaveApplicantsFailure(instanceId, context, err))) {
+  if (!(await recoverFromSaveApplicantsFailure(instanceId, context, err))) {
     return false;
   }
   return runBookingChainWithRetry(instanceId, slotStateCache);
@@ -2054,7 +2085,7 @@ async function recoverBookingChainFromIpRateLimit(
   }
   clearSlotCenterOverride();
   clearSlotDate();
-  if (!(await runPollLoop(instanceId, pollLoopReloginOpts(instanceId)))) {
+  if (!(await runSlotPollUnlessAreLva(instanceId, pollLoopReloginOpts(instanceId)))) {
     return false;
   }
   return runBookingChainWithRetry(instanceId, slotStateCache);
@@ -2086,7 +2117,7 @@ async function recoverBookingChainFromAccountRecreate(
   await recreateIndDeuAccountAndRelogin(instanceId, err.code);
   clearSlotCenterOverride();
   clearSlotDate();
-  if (!(await runPollLoop(instanceId, pollLoopReloginOpts(instanceId)))) {
+  if (!(await runSlotPollUnlessAreLva(instanceId, pollLoopReloginOpts(instanceId)))) {
     return false;
   }
   return runBookingChainWithRetry(instanceId, slotStateCache);
@@ -2138,7 +2169,7 @@ async function openLoginWithForbiddenRecovery(instanceId?: number): Promise<void
           await recreateIndDeuAccountAndRelogin(instanceId, recreate);
           return;
         }
-                await telegram.alert("error", `Bot ${instanceId ?? "?"} got 403 on login page (attempt ${attempt}/${MAX_FORBIDDEN_RETRIES}). Restarting browser + rotating IP...`).catch(() => { });
+        await telegram.alert("error", `Bot ${instanceId ?? "?"} got 403 on login page (attempt ${attempt}/${MAX_FORBIDDEN_RETRIES}). Restarting browser + rotating IP...`).catch(() => { });
         clearApplicantIpCache();
         await relaunchChromeAfterCredentialSwapLogout();
         await resolveAndReportEgressIp({ logAs: "rotate-ip", instanceId });
@@ -2148,7 +2179,7 @@ async function openLoginWithForbiddenRecovery(instanceId?: number): Promise<void
         continue;
       }
       if (err instanceof VfsGatewayTimeoutError) {
-                await telegram.alert("error", `Bot ${instanceId ?? "?"} got 504 on login page (attempt ${attempt}/${MAX_FORBIDDEN_RETRIES}). Restarting browser + rotating IP...`).catch(() => { });
+        await telegram.alert("error", `Bot ${instanceId ?? "?"} got 504 on login page (attempt ${attempt}/${MAX_FORBIDDEN_RETRIES}). Restarting browser + rotating IP...`).catch(() => { });
         clearApplicantIpCache();
         await relaunchChromeAfterCredentialSwapLogout();
         await resolveAndReportEgressIp({ logAs: "rotate-ip", instanceId });
@@ -2162,7 +2193,7 @@ async function openLoginWithForbiddenRecovery(instanceId?: number): Promise<void
           await stopForAccountRateLimit(instanceId, "open-login", err.code);
           throw new Error(`Login page account rate-limit ${err.code} — stopping.`);
         }
-                await telegram
+        await telegram
           .alert(
             "error",
             `Bot ${instanceId ?? "?"} got IP rate-limit ${err.code} on login page (attempt ${attempt}/${MAX_FORBIDDEN_RETRIES}). Rotating IP...`
@@ -2220,7 +2251,7 @@ async function loginWithForbiddenRecovery(instanceId?: number): Promise<void> {
         }
         forbiddenAttempts++;
         reporter.setPhase("recovering", `403 block — rotating IP + relogin (attempt ${forbiddenAttempts})`);
-                await telegram.alert("error", `Bot ${instanceId ?? "?"} got 403 during login (attempt ${forbiddenAttempts}/${MAX_FORBIDDEN_RETRIES}). Restarting browser + rotating IP...`).catch(() => { });
+        await telegram.alert("error", `Bot ${instanceId ?? "?"} got 403 during login (attempt ${forbiddenAttempts}/${MAX_FORBIDDEN_RETRIES}). Restarting browser + rotating IP...`).catch(() => { });
         clearApplicantIpCache();
         await relaunchChromeAfterCredentialSwapLogout();
         await resolveAndReportEgressIp({ logAs: "rotate-ip", instanceId });
@@ -2232,7 +2263,7 @@ async function loginWithForbiddenRecovery(instanceId?: number): Promise<void> {
       }
 
       if (err instanceof VfsGatewayTimeoutError) {
-                await telegram.alert(
+        await telegram.alert(
           "error",
           `Bot ${instanceId ?? "?"} got 504 Gateway Timeout during login. Restarting browser + rotating IP...`
         ).catch(() => { });
@@ -2249,7 +2280,7 @@ async function loginWithForbiddenRecovery(instanceId?: number): Promise<void> {
           throw new Error(`Login account rate-limit ${err.code} — stopping.`);
         }
         const escalate = softIpRotateAwaitingSecond429;
-                await telegram
+        await telegram
           .alert(
             "error",
             escalate
@@ -2284,7 +2315,7 @@ async function loginWithForbiddenRecovery(instanceId?: number): Promise<void> {
         // This branch retries forever — keep the Monitor phase moving so a card
         // can never freeze on the stale captcha/turnstile status of attempt 1.
         reporter.setPhase("recovering", `login retry ${otpAttempts} — rotating IP + relogin`);
-                await telegram.alert(
+        await telegram.alert(
           "error",
           `Bot ${instanceId ?? "?"} OTP/login failed (attempt ${otpAttempts}): ${reason}\nRestarting browser + rotating IP...`
         ).catch(() => { });
@@ -2499,10 +2530,13 @@ async function runSaveApplicantsUntilUrn(opts: {
       }
       if (isSaveApplicants10673(err)) {
         consecutive10673 += 1;
-        if (consecutive10673 >= phase1Attempts) {
+          if (consecutive10673 >= phase1Attempts) {
           consecutive10673 = 0;
+          if (isAreLvaCurrent()) {
+            continue applicants10673Recovery;
+          }
           await performHardRelogin(instanceId, "save-applicants-10673");
-          await runPollLoop(instanceId, pollLoopReloginOpts(instanceId));
+          await runSlotPollUnlessAreLva(instanceId, pollLoopReloginOpts(instanceId));
           // New wave after re-hit so fleet re-syncs applicants stagger.
           const again = isSlotFoundByAnyInstance();
           resetApplicantsWave(again.timestamp ?? Date.now());
@@ -2515,6 +2549,9 @@ async function runSaveApplicantsUntilUrn(opts: {
 
         if (nonRecoverableAttempts >= MAX_SAVE_APPLICANTS_RETRIES) {
           nonRecoverableAttempts = 0;
+          if (isAreLvaCurrent()) {
+            continue applicants10673Recovery;
+          }
           if (!(await recoverFromSaveApplicantsFailure(instanceId, "save-applicants-max-retries", err))) {
             return done(false);
           }
@@ -2534,8 +2571,10 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
   // If a newer force-book arrived before this chain even started, exit immediately.
   if (pollingAbortSeq !== chainAbortSeq) {
     await throwIfAbortedForPageNotFound(chainAbortSeq, "booking-chain-abort");
-        return false;
+    return false;
   }
+
+  if (isAreLvaCurrent()) applyAreLvaFormCenter(instanceId);
 
   const waveSeed =
     (slotStateCache?.timestamp && slotStateCache.timestamp > 0
@@ -2543,12 +2582,13 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
       : isSlotFoundByAnyInstance().timestamp) ?? Date.now();
   ensureApplicantsWave(waveSeed);
 
-  const useApologiesInterval = isApologies1036SlotState(slotStateCache);
+  const useApologiesInterval = isAreLvaCurrent() ? false : isApologies1036SlotState(slotStateCache);
 
   // Real slot hits: every bot goes to save-applicants immediately (no join stagger).
   // Poll 1036: apologies round-robin below spaces applicants instead.
+  // are-lva: no slot poll — all bots call applicants at once after post-login delay.
 
-  for (;;) {
+  for (; ;) {
     const saved = await runSaveApplicantsUntilUrn({
       instanceId,
       slotStateCache,
@@ -2562,13 +2602,16 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
         typeof instanceId === "number" && Number.isFinite(instanceId) && instanceId >= 1
           ? Math.floor(instanceId)
           : 1;
-      return await runFleetCalendarBooking({
+      const bookingOpts = {
         browser,
         instanceId: fleetId,
         abortSeq: chainAbortSeq,
-        isAbort: (seq) => pollingAbortSeq !== seq,
+        isAbort: (seq: number) => pollingAbortSeq !== seq,
         waitForAbort: waitForPollingAbort,
-      });
+      };
+      return isAreLvaCurrent()
+        ? await runAreLvaBooking(bookingOpts)
+        : await runFleetCalendarBooking(bookingOpts);
     } catch (err) {
       if (err instanceof MissingUrnError) {
         // A relogin / account swap dropped the URN mid-booking — get a fresh one and re-enter.
@@ -2689,7 +2732,7 @@ async function runOneBotCycleCore(meta: SubmitMeta): Promise<void> {
   // If this instance already completed booking and reached the payment page, do not restart it.
   // The Chrome tab stays on the payment page indefinitely.
   if (instanceOnPaymentPage) {
-        return;
+    return;
   }
 
   // Set current instance ID for config getters (e.g., loginUser)
@@ -2702,7 +2745,7 @@ async function runOneBotCycleCore(meta: SubmitMeta): Promise<void> {
     /^true|1|yes$/i.test((process.env.VFS_CLEAR_APPLICANT_IP_CACHE_EACH_CYCLE ?? "").trim())
   ) {
     clearApplicantIpCache();
-      }
+  }
 
   // Clear shared slot state once per batch (single-instance). Cluster parent clears on first Submit.
   if (meta.firstSubmit && !isClusterChild) {
@@ -2736,7 +2779,7 @@ async function runOneBotCycleCore(meta: SubmitMeta): Promise<void> {
 
   if (kind === "blank") {
     await openLoginWithForbiddenRecovery(instanceId);
-        firstUrl = await browser.getFirstTabUrl();
+    firstUrl = await browser.getFirstTabUrl();
     kind = classifyVfsFirstTabUrl(firstUrl);
   }
 
@@ -2802,8 +2845,8 @@ async function runOneBotCycleCore(meta: SubmitMeta): Promise<void> {
       }
     }
   } else if (kind === "dashboard") {
-      } else if (kind === "vfs_other") {
-      }
+  } else if (kind === "vfs_other") {
+  }
 
   /** Retry or confirm IP after navigation/login (cached if early resolve already succeeded). */
   await resolveAndReportEgressIp(
@@ -2813,7 +2856,7 @@ async function runOneBotCycleCore(meta: SubmitMeta): Promise<void> {
   const skipDashboardNavigate = !meta.firstSubmit || kind === "vfs_other";
 
   if (config.loginOnly) {
-        return;
+    return;
   }
 
   const cycleAbortSeq = pollingAbortSeq;
@@ -2844,7 +2887,7 @@ async function runOneBotCycleCore(meta: SubmitMeta): Promise<void> {
       reason: isWorkflowRestart ? "workflow-restart" : "post-login",
     });
     if (settled === "abort") {
-            return;
+      return;
     }
   }
 
@@ -2859,13 +2902,22 @@ async function runOneBotCycleCore(meta: SubmitMeta): Promise<void> {
   // queued attack cycle can start immediately.
   if (pollingAbortSeq !== cycleAbortSeq) {
     await throwIfAbortedForPageNotFound(cycleAbortSeq, "pre-poll-abort");
-        return;
+    return;
   }
 
   // --- Coordinated poll-start gate (first submit only, cluster mode) ---
   // Wait until the shared fleet pollStartAt. After that, bots claim the next
   // poll slot every userPollInterval (gap-filling when peers are absent).
-  if (meta.firstSubmit && !meta.skipPollGate && isClusterChild && instanceId != null && typeof meta.pollStartAt === "number") {
+  // are-lva: skip this wall-clock sync so each bot calls applicants after its
+  // own post-login delay (staggered starts stay staggered).
+  if (
+    !isAreLvaCurrent() &&
+    meta.firstSubmit &&
+    !meta.skipPollGate &&
+    isClusterChild &&
+    instanceId != null &&
+    typeof meta.pollStartAt === "number"
+  ) {
     ensureFleetPollEarliest(meta.pollStartAt);
     const remainingMs = Math.max(0, meta.pollStartAt - Date.now());
 
@@ -2873,7 +2925,7 @@ async function runOneBotCycleCore(meta: SubmitMeta): Promise<void> {
       "polling",
       remainingMs > 0 ? `ready — fleet polls in ${Math.round(remainingMs / 1000)}s` : "starting poll"
     );
-    
+
     if (remainingMs > 0) {
       const pollGateSlotWatcher = createSlotFoundWatcher(instanceId);
       try {
@@ -2886,11 +2938,11 @@ async function runOneBotCycleCore(meta: SubmitMeta): Promise<void> {
 
         if (woke === "abort" || pollingAbortSeq !== cycleAbortSeq) {
           await throwIfAbortedForPageNotFound(cycleAbortSeq, "poll-gate-abort");
-                    return;
+          return;
         }
 
         if (woke === "slot" && (await checkPeerFoundSlotAndJoinBooking(instanceId, pollGateSlotWatcher.cachedState()))) {
-                    slotFoundDuringPoll = true;
+          slotFoundDuringPoll = true;
         } else if (woke === "slot") {
           await timerPromise;
         }
@@ -2901,14 +2953,20 @@ async function runOneBotCycleCore(meta: SubmitMeta): Promise<void> {
   }
 
   if (!slotFoundDuringPoll) {
-    // All instances poll actively after login.
-    reporter.setPhase("polling", "polling for slots");
-    await telegram.notify("VFS bot run: polling for slots.").catch(() => { });
-    
-    slotFoundDuringPoll = await runPollLoop(instanceId, {
-      pollStartAt: typeof meta.pollStartAt === "number" ? meta.pollStartAt : undefined,
-      ...pollLoopReloginOpts(instanceId),
-    });
+    if (isAreLvaCurrent()) {
+      applyAreLvaFormCenter(instanceId);
+      reporter.setPhase("polling", "are-lva — applicants (no slot poll)");
+      slotFoundDuringPoll = true;
+    } else {
+      // All instances poll actively after login.
+      reporter.setPhase("polling", "polling for slots");
+      await telegram.notify("VFS bot run: polling for slots.").catch(() => { });
+
+      slotFoundDuringPoll = await runPollLoop(instanceId, {
+        pollStartAt: typeof meta.pollStartAt === "number" ? meta.pollStartAt : undefined,
+        ...pollLoopReloginOpts(instanceId),
+      });
+    }
   }
 
   if (slotFoundDuringPoll) {
@@ -2978,10 +3036,10 @@ async function start(): Promise<void> {
 
         if (msg?.type === "force-book") {
           if (instanceStopped) {
-                        return;
+            return;
           }
           if (instanceOnPaymentPage) {
-                        return;
+            return;
           }
           // Abort any in-progress polling so the new poll cycle can start.
           instanceBookingActive = false;
@@ -2989,32 +3047,32 @@ async function start(): Promise<void> {
           clearSlotCenterOverride();
           clearSlotDate();
           requestPollingAbort("force-book-poll", myInstanceId);
-                    ipcChain = ipcChain.then(async () => {
+          ipcChain = ipcChain.then(async () => {
             try {
               await browser.preparePollingAfterLogin({ skipDashboardNavigate: true });
 
-              const slotFound = await runPollLoop(myInstanceId, pollLoopReloginOpts(myInstanceId));
+              const slotFound = await runSlotPollUnlessAreLva(myInstanceId, pollLoopReloginOpts(myInstanceId));
 
               if (slotFound) {
                 const slotStateSnapshot = isSlotFoundByAnyInstance();
                 instanceBookingActive = true;
-                                try {
+                try {
                   const bookingCompleted = await runBookingChainWithRetry(myInstanceId, slotStateSnapshot);
                   instanceBookingActive = false;
                   if (bookingCompleted) {
                     await enterPaymentPageMode(myInstanceId);
                   } else {
-                                      }
+                  }
                 } catch (err) {
                   instanceBookingActive = false;
-                                    await telegram.alert("error", `Bot ${myInstanceId} force-book booking failed: ${err instanceof Error ? err.message : String(err)}`).catch(() => { });
+                  await telegram.alert("error", `Bot ${myInstanceId} force-book booking failed: ${err instanceof Error ? err.message : String(err)}`).catch(() => { });
                   clearSlotCenterOverride();
                   clearSlotDate();
                 }
               } else {
-                              }
+              }
             } catch (err) {
-                            await telegram.alert("error", `Bot ${myInstanceId} force-book poll error: ${err instanceof Error ? err.message : String(err)}`).catch(() => { });
+              await telegram.alert("error", `Bot ${myInstanceId} force-book poll error: ${err instanceof Error ? err.message : String(err)}`).catch(() => { });
             }
           });
           telegram.alert("info", `Bot ${myInstanceId} — starting polling...`).catch(() => { });
@@ -3035,7 +3093,7 @@ async function start(): Promise<void> {
 
         if (msg?.type === "pause-polling") {
           setPollingPaused(true);
-                    return;
+          return;
         }
 
         if (msg?.type === "resume-polling") {
@@ -3065,7 +3123,7 @@ async function start(): Promise<void> {
               });
             } catch (err) {
               const reason = err instanceof Error ? err.message : String(err);
-                            await telegram
+              await telegram
                 .alert("error", `Bot ${myInstanceId} cycle failed.\nReason: ${reason}`)
                 .catch(() => { });
               process.send?.({
@@ -3173,7 +3231,7 @@ async function start(): Promise<void> {
     },
     setProxyProvider: (provider) => {
       const id = parseProxyProviderId(provider);
-      if (!id) return { ok: false, error: "Provider must be brightdata or iplist." };
+      if (!id) return { ok: false, error: PROXY_PROVIDER_PARSE_ERROR };
       return commitProxyProvider(id);
     },
     reloadGlobalSettings: () => {
@@ -3198,6 +3256,7 @@ async function start(): Promise<void> {
         repeatedDelaySec: resolveRepeatedDelaySec(globalDet),
         proxyProvider: getActiveProxyProvider(),
         proxyListReady: isProxyListConfigured().ok,
+        webshareReady: isWebshareConfigured().ok,
       };
     },
   };
@@ -3221,32 +3280,32 @@ async function start(): Promise<void> {
       clearSlotCenterOverride();
       clearSlotDate();
       requestPollingAbort("force-book-poll");
-            enqueueSubmitTask(async () => {
+      enqueueSubmitTask(async () => {
         try {
           await browser.preparePollingAfterLogin({ skipDashboardNavigate: true });
 
-          const slotFound = await runPollLoop(undefined, pollLoopReloginOpts(undefined));
+          const slotFound = await runSlotPollUnlessAreLva(undefined, pollLoopReloginOpts(undefined));
 
           if (slotFound) {
             const slotStateSnapshot = isSlotFoundByAnyInstance();
             instanceBookingActive = true;
-                        try {
+            try {
               const bookingCompleted = await runBookingChainWithRetry(undefined, slotStateSnapshot);
               instanceBookingActive = false;
               if (bookingCompleted) {
                 await enterPaymentPageMode(undefined);
               } else {
-                              }
+              }
             } catch (err) {
               instanceBookingActive = false;
-                            await telegram.alert("error", `Force-book failed: ${err instanceof Error ? err.message : String(err)}`).catch(() => { });
+              await telegram.alert("error", `Force-book failed: ${err instanceof Error ? err.message : String(err)}`).catch(() => { });
               clearSlotCenterOverride();
               clearSlotDate();
             }
           } else {
-                      }
+          }
         } catch (err) {
-                    await telegram.alert("error", `Force-book poll error: ${err instanceof Error ? err.message : String(err)}`).catch(() => { });
+          await telegram.alert("error", `Force-book poll error: ${err instanceof Error ? err.message : String(err)}`).catch(() => { });
         }
       });
       return { ok: true, queued: 1 };
@@ -3316,5 +3375,5 @@ process.on("exit", () => {
 });
 
 start().catch((err) => {
-    process.exit(1);
+  process.exit(1);
 });

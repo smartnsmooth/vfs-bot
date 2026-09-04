@@ -14,6 +14,7 @@ export const SCHEDULE_URL = "https://lift-api.vfsglobal.com/appointment/schedule
  */
 const ROUTE_PAYMENT_DEFAULTS: Record<string, { paymentmode: string; currency: string }> = {
   "uzb-lva": { paymentmode: "Vac", currency: "UZS" },
+  "are-lva": { paymentmode: "Vac", currency: "AED" },
 };
 
 /** POST /appointment/schedule — after timeslot; needs urn + allocationId. */

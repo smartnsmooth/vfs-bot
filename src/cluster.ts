@@ -27,11 +27,14 @@ import { clearChromeSessionDataBeforeLaunch } from "./utils/chromeProfileSession
 import { beginIndDeuProcessSession } from "./utils/indDeuProcessSession";
 import { isIndDeuRoute } from "./utils/vfsRoute";
 import {
+  assertProxyProviderReady,
   getActiveProxyProvider,
   parseProxyProviderId,
   persistProxyProvider,
+  PROXY_PROVIDER_PARSE_ERROR,
 } from "./utils/proxyProvider";
 import { isProxyListConfigured } from "./utils/proxyList";
+import { isWebshareConfigured } from "./utils/webshareProxy";
 
 /** How many bot instances are currently running. Set by ensureInstances(). */
 let currentNumInstances = 0;
@@ -396,11 +399,9 @@ function buildMonitorHooks(): MonitorHooks {
     },
     setProxyProvider: (provider) => {
       const id = parseProxyProviderId(provider);
-      if (!id) return { ok: false, error: "Provider must be brightdata or iplist." };
-      if (id === "iplist") {
-        const check = isProxyListConfigured();
-        if (!check.ok) return check;
-      }
+      if (!id) return { ok: false, error: PROXY_PROVIDER_PARSE_ERROR };
+      const check = assertProxyProviderReady(id);
+      if (!check.ok) return check;
       persistProxyProvider(id);
       broadcastToActiveChildren({ type: "proxy-provider", provider: id });
       return { ok: true };
@@ -426,6 +427,7 @@ function buildMonitorHooks(): MonitorHooks {
         repeatedDelaySec: resolveRepeatedDelaySec(global0),
         proxyProvider: getActiveProxyProvider(),
         proxyListReady: isProxyListConfigured().ok,
+        webshareReady: isWebshareConfigured().ok,
       };
     },
   };

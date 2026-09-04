@@ -2,6 +2,7 @@ import { config, getCurrentInstanceId } from "./config";
 import { getEffectiveLiftLoginUser } from "../utils/liftLoginUser";
 import { getSlotCenterOverride } from "../utils/slotCenterOverride.store";
 import { getApplicantDetailsOverrides } from "../utils/applicantDetails.store";
+import { isAreLvaRoute } from "../utils/vfsRoute";
 
 export const FEES_URL = "https://lift-api.vfsglobal.com/appointment/fees";
 
@@ -21,13 +22,26 @@ export function buildFeesBody(urn: string): Record<string, unknown> {
 
   const loginUser = getEffectiveLiftLoginUser();
   const centerCode = resolveCenterCodeForCurrentInstance();
+  const countryCode = config.slotPayload.countryCode;
+  const missionCode = config.slotPayload.missionCode;
+
+  if (isAreLvaRoute(countryCode, missionCode)) {
+    return {
+      missionCode,
+      countryCode,
+      centerCode,
+      loginUser,
+      urn: u,
+      languageCode: "en-US",
+    };
+  }
 
   return {
     centerCode,
-    countryCode: config.slotPayload.countryCode,
+    countryCode,
     languageCode: "en-US",
     loginUser,
-    missionCode: config.slotPayload.missionCode,
+    missionCode,
     urn: u,
   };
 }

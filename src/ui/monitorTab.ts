@@ -9,8 +9,8 @@ export function buildMonitorTabHtml(): string {
   return `
 <style>
   .mon-wrap { color: #e7e9ea; }
-  .mon-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 0.1rem; }
-  .mon-tile { background: #15202b; border: 1px solid #38444d; border-top: 1px solid #55606b; border-radius: 6px; padding: 0.28rem 0.35rem; font-size: 0.62rem; min-width: 0; cursor: pointer; transition: background .12s, border-color .12s; line-height: 1.25; }
+  .mon-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 0.35rem; }
+  .mon-tile { background: #15202b; border: 1px solid #38444d; border-top: 1px solid #55606b; border-radius: 6px; padding: 0.4rem 0.5rem; font-size: 0.72rem; min-width: 0; cursor: pointer; transition: background .12s, border-color .12s; line-height: 1.3; }
   .mon-tile:hover { background: #1b2836; border-color: #4a5a68; }
   .mon-tile .id { font-weight: 700; color: #fff; font-size: 0.68rem; }
   .mon-tile .phase { float: right; font-size: 0.52rem; text-transform: uppercase; letter-spacing: 0.02em; padding: 0.05rem 0.22rem; border-radius: 3px; background: #253341; color: #cdd7df; }
@@ -18,7 +18,7 @@ export function buildMonitorTabHtml(): string {
   .mon-tile .detail { color: #c4cdd4; margin-top: 0.12rem; min-height: 0.95em; font-size: 0.58rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .mon-tile .cap { margin-top: 0.12rem; font-size: 0.55rem; color: #8b98a5; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .mon-tile .actions { margin-top: 0.22rem; display: flex; gap: 0.2rem; }
-  .mon-tile .mon-btn { flex: 1; border: 1px solid #38444d; background: #1c2732; color: #e7e9ea; border-radius: 4px; padding: 0.12rem 0.2rem; font-size: 0.55rem; cursor: pointer; line-height: 1.15; }
+  .mon-tile .mon-btn { flex: 1; width: auto; min-width: 0; border: 1px solid #38444d; background: #1c2732; color: #e7e9ea; border-radius: 4px; padding: 0.12rem 0.2rem; font-size: 0.55rem; cursor: pointer; line-height: 1.15; }
   .mon-tile .mon-btn:hover { background: #253341; border-color: #4a5a68; }
   .mon-tile .mon-btn.restart { color: #6b7686; background: #1a2228; border-color: #2a3238; }
   .mon-tile .mon-btn.restart:hover { background: #222a32; border-color: #3a4349; color: #8b98a5; }
@@ -183,7 +183,9 @@ export function buildMonitorTabHtml(): string {
   .mon-fleet .v { color: #e7e9ea; font-weight: 600; }
   .mon-fleet .v.yes { color: #69f0ae; }
   .mon-fleet .v.no { color: #f5a623; }
-  .mon-fleet .list { color: #7fd1ff; font-weight: 400; }
+  .mon-fleet .list-field { flex: 1 1 100%; min-width: 0; }
+  .mon-fleet .list { color: #7fd1ff; font-weight: 400; white-space: normal; }
+  .mon-fleet .list-item { display: inline-block; white-space: nowrap; }
   .mon-fleet .empty { color: #6b7686; font-weight: 400; }
 </style>
 <div class="mon-wrap">
@@ -215,6 +217,7 @@ export function buildMonitorTabHtml(): string {
   <div class="mon-toolbar" style="margin-bottom:0.5rem;display:flex;gap:0.4rem;align-items:center;justify-content:center;font-size:0.72rem;">
     <span style="color:#8b98a5;">Proxy</span>
     <button type="button" class="mon-proxy-btn active" id="monProxyBright" data-provider="brightdata" title="Bright Data (default) — all bots switch on the next API request">Bright Data</button>
+    <button type="button" class="mon-proxy-btn" id="monProxyWebshare" data-provider="webshare" title="Webshare rotating residential — sticky session per bot, new IP on rotate">Webshare</button>
     <button type="button" class="mon-proxy-btn" id="monProxyList" data-provider="iplist" title="IP List (proxies.txt) — all bots switch on the next API request">IP List</button>
     <span id="monProxyHint" style="color:#8b98a5;font-size:0.62rem;"></span>
   </div>
@@ -446,6 +449,7 @@ export function buildMonitorTabHtml(): string {
     var list = Object.keys(instances).map(function(k){ return instances[k]; });
     list.sort(function(a,b){ return a.instanceId - b.instanceId; });
     var grid = el('monGrid');
+    if (!grid) return;
     if (!list.length) {
       grid.innerHTML = '<div class="mon-empty" style="grid-column:1/-1;color:#8b98a5;padding:1.5rem;text-align:center;">No bots yet — Submit &amp; Run from Configure.</div>';
       lastTileHtml = {};
@@ -552,26 +556,38 @@ export function buildMonitorTabHtml(): string {
   function scheduleRender(){ if (rafPending) return; rafPending = true; requestAnimationFrame(render); }
 
   // ── Fleet strip: the shared state every instance books from ────────────
-  var FLEET_LIST_MAX = 12;
-
-  function fleetField(key, value, cls){
-    return '<span><span class="k">' + esc(key) + '</span> <span class="' + (cls || 'v') + '">' + value + '</span></span>';
+  function fleetField(key, value, cls, wrapCls){
+    return '<span' + (wrapCls ? ' class="' + wrapCls + '"' : '') + '><span class="k">' + esc(key) + '</span> <span class="' + (cls || 'v') + '">' + value + '</span></span>';
   }
 
   function fleetList(items){
     if (!items || items.length === 0) return '<span class="empty">none</span>';
-    var shown = items.slice(0, FLEET_LIST_MAX).map(esc).join(', ');
-    var rest = items.length - FLEET_LIST_MAX;
-    return '<span class="list">' + shown + (rest > 0 ? ' +' + rest + ' more' : '') + '</span>';
+    return '<span class="list">' + items.map(function(x){
+      return '<span class="list-item">' + esc(x) + '</span>';
+    }).join(', ') + '</span>';
+  }
+
+  function fleetDateNoYear(d){
+    var s = String(d == null ? '' : d).trim();
+    var m = s.match(/^(\d{2})\/(\d{2})\/\d{4}$/);
+    if (m) return m[1] + '/' + m[2];
+    m = s.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    if (m) return m[3] + '/' + m[2];
+    return s;
   }
 
   function renderFleet(f){
     var box = el('monFleet');
     if (!box) return;
     if (!f) { box.innerHTML = '<span class="empty">fleet state unavailable</span>'; return; }
-    var dates = Array.isArray(f.availableDateList) ? f.availableDateList : [];
+    var dates = (Array.isArray(f.availableDateList) ? f.availableDateList : [])
+      .map(fleetDateNoYear);
     var slots = (Array.isArray(f.availableDatetimeList) ? f.availableDatetimeList : [])
-      .map(function(e){ return e.date + ' ' + e.time; });
+      .map(function(e){
+        var label = fleetDateNoYear(e.date) + ' ' + e.time;
+        if (e.instanceId != null && e.instanceId !== '') return label + ' #' + e.instanceId;
+        return label;
+      });
     var amount = f.totalAmount
       ? esc(f.totalAmount) + (f.currency ? ' ' + esc(f.currency) : '')
       : '<span class="empty">—</span>';
@@ -584,8 +600,8 @@ export function buildMonitorTabHtml(): string {
       fleetField('totalAmount', amount),
       fleetField('URN', String((f.urnHolders || []).length)),
       fleetField('turn', turn),
-      fleetField('dates (' + dates.length + ')', fleetList(dates)),
-      fleetField('timeslots (' + slots.length + ')', fleetList(slots))
+      fleetField('dates (' + dates.length + ')', fleetList(dates), null, 'list-field'),
+      fleetField('timeslots (' + slots.length + ')', fleetList(slots), null, 'list-field')
     ].join('');
   }
 
@@ -675,7 +691,16 @@ export function buildMonitorTabHtml(): string {
   });
 
   window.__monitorInit = function(){
-    if (started) return; started = true;
+    if (started) {
+      // Tab was hidden (display:none) when tiles first painted — auto-fill
+      // computed 0 columns. Rebuild now that the panel is visible.
+      lastTileHtml = {};
+      var g = el('monGrid');
+      if (g) g.innerHTML = '';
+      scheduleRender();
+      return;
+    }
+    started = true;
     warmupUntil = Date.now() + 2500;
     fetch('/api/monitor/control').then(function(r){ return r.json(); }).then(function(d){
       if (d && d.ok && d.control) {
@@ -704,7 +729,7 @@ export function buildMonitorTabHtml(): string {
           var rd = document.getElementById('monRepeatedDelay');
           if (rd) rd.value = String(c.repeatedDelaySec);
         }
-        setProxyUi(c.proxyProvider || 'brightdata', !!c.proxyListReady);
+        setProxyUi(c.proxyProvider || 'brightdata', !!c.proxyListReady, c.webshareReady !== false);
       }
     }).catch(function(){});
 
@@ -731,15 +756,31 @@ export function buildMonitorTabHtml(): string {
     bindApply('monApiDelayApply', 'monApiDelay', 'api-delay', 'API delay', 0, true);
     bindApply('monRepeatedDelayApply', 'monRepeatedDelay', 'repeated-delay', '409 delay', 1, false);
 
-    function setProxyUi(provider, proxyListReady) {
+    function proxyLabel(provider) {
+      if (provider === 'iplist') return 'IP List';
+      if (provider === 'webshare') return 'Webshare';
+      return 'Bright Data';
+    }
+
+    function setProxyUi(provider, proxyListReady, webshareReady) {
       var bright = document.getElementById('monProxyBright');
+      var webshare = document.getElementById('monProxyWebshare');
       var list = document.getElementById('monProxyList');
       var hint = document.getElementById('monProxyHint');
-      var isList = provider === 'iplist';
-      if (bright) bright.classList.toggle('active', !isList);
-      if (list) list.classList.toggle('active', isList);
+      var id = String(provider || 'brightdata').toLowerCase();
+      if (bright) bright.classList.toggle('active', id === 'brightdata');
+      if (webshare) webshare.classList.toggle('active', id === 'webshare');
+      if (list) list.classList.toggle('active', id === 'iplist');
+      window.__proxyListReady = proxyListReady !== false;
+      window.__webshareReady = webshareReady !== false;
       if (hint) {
-        hint.textContent = proxyListReady ? '' : 'proxies.txt is empty/missing or credentials are placeholders';
+        if (id === 'iplist' && !window.__proxyListReady) {
+          hint.textContent = 'proxies.txt is empty/missing or credentials are placeholders';
+        } else if (id === 'webshare' && !window.__webshareReady) {
+          hint.textContent = 'Set WEBSHARE_USERNAME and WEBSHARE_PASSWORD (or WEBSHARE_PROXY_URL) in .env';
+        } else {
+          hint.textContent = '';
+        }
       }
     }
     window.__syncMonitorProxyUi = setProxyUi;
@@ -750,16 +791,16 @@ export function buildMonitorTabHtml(): string {
       btn.addEventListener('click', function(){
         var provider = btn.getAttribute('data-provider');
         if (!provider) return;
-        var label = provider === 'iplist' ? 'IP List' : 'Bright Data';
+        var label = proxyLabel(provider);
         toast('Switching all bots to ' + label + '…');
         post('proxy-provider', { provider: provider }).then(function(r){
           if (r.ok) {
             toast('All bots now use ' + label + ' from the next API request');
             fetch('/api/monitor/control').then(function(res){ return res.json(); }).then(function(d){
               if (d && d.ok && d.control) {
-                setProxyUi(d.control.proxyProvider || provider, !!d.control.proxyListReady);
+                setProxyUi(d.control.proxyProvider || provider, !!d.control.proxyListReady, d.control.webshareReady !== false);
                 if (window.__syncConfigureProxyUi) {
-                  window.__syncConfigureProxyUi(d.control.proxyProvider || provider, !!d.control.proxyListReady);
+                  window.__syncConfigureProxyUi(d.control.proxyProvider || provider, !!d.control.proxyListReady, d.control.webshareReady !== false);
                 }
               }
             }).catch(function(){});
@@ -770,6 +811,7 @@ export function buildMonitorTabHtml(): string {
       });
     }
     bindProxy('monProxyBright');
+    bindProxy('monProxyWebshare');
     bindProxy('monProxyList');
     fetch('/api/monitor/snapshot').then(function(r){ return r.json(); }).then(function(d){
       if (d && d.ok && Array.isArray(d.instances)){

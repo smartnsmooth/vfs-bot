@@ -191,9 +191,11 @@ export interface MonitorControlState {
   /** Sleep after HTTP 409 when body has no usable `code` (seconds). */
   repeatedDelaySec: number;
   /** Active proxy source for all bots (Monitor switcher). */
-  proxyProvider: "brightdata" | "iplist";
+  proxyProvider: "brightdata" | "webshare" | "iplist";
   /** False while proxies.txt is missing/empty or its credentials are still placeholders. */
   proxyListReady: boolean;
+  /** False while Webshare username/password (or WEBSHARE_PROXY_URL) are missing. */
+  webshareReady: boolean;
 }
 
 /**
@@ -234,7 +236,7 @@ export interface MonitorHooks {
   setApiDelaySec(sec: number): { ok: boolean; error?: string };
   /** Set first 409 sleep (seconds). */
   setRepeatedDelaySec(sec: number): { ok: boolean; error?: string };
-  /** Switch all bots to Bright Data or the IP list; next API request uses the new source. */
+  /** Switch all bots to Bright Data, Webshare, or the IP list; next API request uses the new source. */
   setProxyProvider(provider: string): { ok: boolean; error?: string };
   /** Reload global settings from disk on all running bots (after /api/save). */
   reloadGlobalSettings(): { ok: boolean };

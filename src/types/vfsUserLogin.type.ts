@@ -130,6 +130,7 @@ export function flattenVfsLoginResponseForProfile(raw: unknown): Record<string, 
 /**
  * First `/user/login` (password only) usually has empty applicant fields; the real values arrive on later
  * OTP-step calls. Do not merge password-step identity into the stored profile — OTP replace should set those keys.
+ * Exception: when `enableOTPAuthentication` is false (e.g. are-lva) or India–Latvia, password-step identity is kept.
  * Keeps flags/tokens from the password response (e.g. `enableOTPAuthentication`).
  */
 export function stripPasswordStepApplicantFieldsForProfileMerge(

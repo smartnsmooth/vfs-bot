@@ -228,7 +228,6 @@ export async function runFleetCalendarBooking(opts: {
 }): Promise<boolean> {
   const { browser, abortSeq, isAbort, waitForAbort } = opts;
   const instanceId = Math.max(1, Math.floor(opts.instanceId));
-  const intervalMs = getCalendarPollingIntervalMs();
 
   registerFleetUrn(instanceId);
   registerCalendarWaiter(instanceId);
@@ -287,8 +286,7 @@ export async function runFleetCalendarBooking(opts: {
       state = readCalendarBookingState();
 
       if (state.phase === "calendar_repoll") {
-        // Failed release sets calendarSkipInterval so the next preferred waiter is not
-        // blocked by calendarPollingInterval (same as claimCalendarAttempt).
+        const intervalMs = getCalendarPollingIntervalMs();
         const readyAt =
           !state.calendarSkipInterval && state.lastCalendarAttemptAt > 0
             ? state.lastCalendarAttemptAt + intervalMs

@@ -21,22 +21,31 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     return 1;
   }
 
-  function setCfgProxyUi(provider, proxyListReady) {
+  function setCfgProxyUi(provider, proxyListReady, webshareReady) {
     var hid = document.getElementById("proxyProvider");
     var bright = document.getElementById("cfgProxyBright");
+    var webshare = document.getElementById("cfgProxyWebshare");
     var list = document.getElementById("cfgProxyList");
     var hint = document.getElementById("cfgProxyHint");
-    var isList = String(provider || "").toLowerCase() === "iplist";
-    if (hid) hid.value = isList ? "iplist" : "brightdata";
-    if (bright) bright.classList.toggle("active", !isList);
-    if (list) list.classList.toggle("active", isList);
+    var id = String(provider || "brightdata").toLowerCase();
+    if (hid) hid.value = id;
+    if (bright) bright.classList.toggle("active", id === "brightdata");
+    if (webshare) webshare.classList.toggle("active", id === "webshare");
+    if (list) list.classList.toggle("active", id === "iplist");
     window.__proxyListReady = proxyListReady !== false;
+    window.__webshareReady = webshareReady !== false;
     if (hint) {
-      hint.textContent = window.__proxyListReady ? "" : "proxies.txt is empty/missing or credentials are placeholders";
+      if (id === "iplist" && !window.__proxyListReady) {
+        hint.textContent = "proxies.txt is empty/missing or credentials are placeholders";
+      } else if (id === "webshare" && !window.__webshareReady) {
+        hint.textContent = "Set WEBSHARE_USERNAME and WEBSHARE_PASSWORD (or WEBSHARE_PROXY_URL) in .env";
+      } else {
+        hint.textContent = "";
+      }
     }
   }
-  window.__syncConfigureProxyUi = function (provider, proxyListReady) {
-    setCfgProxyUi(provider, proxyListReady);
+  window.__syncConfigureProxyUi = function (provider, proxyListReady, webshareReady) {
+    setCfgProxyUi(provider, proxyListReady, webshareReady);
   };
 
   function bindCfgProxy(btnId) {
@@ -46,16 +55,16 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       var provider = btn.getAttribute("data-provider");
       if (!provider) return;
       var prev = (document.getElementById("proxyProvider") || {}).value || "brightdata";
-      setCfgProxyUi(provider, window.__proxyListReady !== false);
+      setCfgProxyUi(provider, window.__proxyListReady !== false, window.__webshareReady !== false);
       fetch("/api/monitor/proxy-provider", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ provider: provider }),
       }).then(function (r) { return r.json(); }).then(function (j) {
         if (j && j.ok) {
-          if (window.__syncMonitorProxyUi) window.__syncMonitorProxyUi(provider, window.__proxyListReady !== false);
+          if (window.__syncMonitorProxyUi) window.__syncMonitorProxyUi(provider, window.__proxyListReady !== false, window.__webshareReady !== false);
         } else {
-          setCfgProxyUi(prev, window.__proxyListReady !== false);
+          setCfgProxyUi(prev, window.__proxyListReady !== false, window.__webshareReady !== false);
           var msg = document.getElementById("msg");
           if (msg) {
             msg.className = "err";
@@ -63,7 +72,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
           }
         }
       }).catch(function (err) {
-        setCfgProxyUi(prev, window.__proxyListReady !== false);
+        setCfgProxyUi(prev, window.__proxyListReady !== false, window.__webshareReady !== false);
         var msg = document.getElementById("msg");
         if (msg) {
           msg.className = "err";
@@ -102,6 +111,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     egy: [{label: "Portugal", value: "prt"}],
     sau: [{label: "Portugal", value: "prt"}],
     uzb: [{ label: "Latvia", value: "lva" }],
+    are: [{ label: "Latvia", value: "lva" }],
   };
 
   const centerCategoryMap = {
@@ -230,6 +240,14 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
         { value: "NV1", label: "Speciality Cook" },
         { value: "NVBA", label: "Basic or advanced in-company or school-based vocational training (§ 16a AufenthG)" },
         { value: "R124", label: "Conducting a quality analysis ((§ 16d Abs. 6 AufenthG)" },
+      ]},
+    ],
+    "are-lva": [
+      { value: "AUH", label: "Latvia Visa application center- Abu Dhabi", categories: [
+        { value: "LL", label: "National Visa (work and students with OCMA decision)" },
+      ]},
+      { value: "DXB", label: "Latvia Visa application center- Dubai", categories: [
+        { value: "LL", label: "National Visa (work and students with OCMA decision)" },
       ]},
     ],
   };
@@ -666,7 +684,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     {
       const gsrc = (globalInst && globalInst.details) || {};
       var loadedProvider = gsrc.proxyProvider != null ? String(gsrc.proxyProvider) : "brightdata";
-      setCfgProxyUi(loadedProvider, window.__proxyListReady !== false);
+      setCfgProxyUi(loadedProvider, window.__proxyListReady !== false, window.__webshareReady !== false);
     }
     const prefixEl = document.getElementById("indDeuEmailPrefix");
     if (prefixEl) {
@@ -698,6 +716,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     const mc = String(fd.get("missionCode") || "bgr");
     const isUzbLva = cc + "-" + mc === "uzb-lva";
     const isIndDeu = cc + "-" + mc === "ind-deu";
+    const isAreLva = cc + "-" + mc === "are-lva";
+    const isIndLva = cc + "-" + mc === "ind-lva";
     const firstNameRaw = isUzbLva
       ? String(fd.get("firstNameUzbLva") || "").trim()
       : String(fd.get("firstName") || "").trim();
@@ -720,12 +740,12 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       selectedSubvisaCategory: fd.get("selectedSubvisaCategory"),
       vacCode2: fd.get("vacCode2") || undefined,
       selectedSubvisaCategory2: fd.get("selectedSubvisaCategory2") || undefined,
-      firstName: firstNameSave || undefined,
-      lastName: lastNameSave || undefined,
-      dateOfBirth: String(fd.get("dateOfBirth") || "").trim() || undefined,
-      passportNumber: passportSave || undefined,
-      dialCode: isIndDeu ? undefined : (String(fd.get("dialCode") || "").trim() || undefined),
-      contactNumber: isIndDeu ? undefined : (String(fd.get("contactNumber") || "").trim() || undefined),
+      firstName: isAreLva ? undefined : (firstNameSave || undefined),
+      lastName: isAreLva ? undefined : (lastNameSave || undefined),
+      dateOfBirth: isAreLva ? undefined : (String(fd.get("dateOfBirth") || "").trim() || undefined),
+      passportNumber: isAreLva ? undefined : (passportSave || undefined),
+      dialCode: isIndDeu || isAreLva ? undefined : (String(fd.get("dialCode") || "").trim() || undefined),
+      contactNumber: isIndDeu || isAreLva ? undefined : (String(fd.get("contactNumber") || "").trim() || undefined),
       scheduleDateRangeStart: String(fd.get("scheduleDateRangeStart") ?? "").trim(),
       scheduleDateRangeEnd: String(fd.get("scheduleDateRangeEnd") ?? "").trim(),
       numInstances: getNumInstances(),
@@ -740,8 +760,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       staggerIntervalSec: parseInt(String(fd.get("staggerIntervalSec") || "6"), 10),
       proxyProvider: String(fd.get("proxyProvider") || "brightdata"),
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
-      helloVerifyNumber: String(fd.get("helloVerifyNumber") ?? "").trim() || undefined,
-      juridictionCode: String(fd.get("juridictionCode") ?? "").trim() || undefined,
+      helloVerifyNumber: isIndLva ? String(fd.get("helloVerifyNumber") ?? "").trim() || undefined : undefined,
+      juridictionCode: isIndLva ? String(fd.get("juridictionCode") ?? "").trim() || undefined : undefined,
       indDeuEmailPrefix: isIndDeu ? String(fd.get("indDeuEmailPrefix") || "").trim() || undefined : undefined,
       indDeuEmailDomain: isIndDeu ? String(fd.get("indDeuEmailDomain") || "").trim().replace(/^@+/, "") || undefined : undefined,
       indDeuAccountPassword: isIndDeu ? String(fd.get("indDeuAccountPassword") || "") || undefined : undefined,
@@ -868,13 +888,15 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       await loadInstanceData(false);
 
       bindCfgProxy("cfgProxyBright");
+      bindCfgProxy("cfgProxyWebshare");
       bindCfgProxy("cfgProxyList");
       fetch("/api/defaults").then(function (r) { return r.json(); }).then(function (d) {
         if (!d || !d.ok || !d.defaults) return;
         window.__proxyListReady = !!d.defaults.proxyListReady;
-        setCfgProxyUi(d.defaults.proxyProvider || "brightdata", window.__proxyListReady);
+        window.__webshareReady = d.defaults.webshareReady !== false;
+        setCfgProxyUi(d.defaults.proxyProvider || "brightdata", window.__proxyListReady, window.__webshareReady);
         if (window.__syncMonitorProxyUi) {
-          window.__syncMonitorProxyUi(d.defaults.proxyProvider || "brightdata", window.__proxyListReady);
+          window.__syncMonitorProxyUi(d.defaults.proxyProvider || "brightdata", window.__proxyListReady, window.__webshareReady);
         }
       }).catch(function () {});
 
@@ -955,6 +977,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     const mc = String(fd.get("missionCode") || "bgr");
     const isUzbLva = cc + "-" + mc === "uzb-lva";
     const isIndDeu = cc + "-" + mc === "ind-deu";
+    const isAreLva = cc + "-" + mc === "are-lva";
+    const isIndLva = cc + "-" + mc === "ind-lva";
     const firstNameRaw = isUzbLva
       ? String(fd.get("firstNameUzbLva") || "").trim()
       : String(fd.get("firstName") || "").trim();
@@ -981,6 +1005,10 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       if (!lastNameRaw) missing.push("Last name");
       if (!nationalityRaw) missing.push("Nationality");
       if (!passportRaw) missing.push("Passport number");
+    }
+    if (isAreLva) {
+      if (!nationalityRaw) missing.push("Nationality");
+      if (!expiryRaw) missing.push("Passport expiry");
     }
     if (isIndDeu) {
       if (!firstNameSave) missing.push("First name");
@@ -1009,12 +1037,12 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       selectedSubvisaCategory: fd.get("selectedSubvisaCategory"),
       vacCode2: fd.get("vacCode2") || undefined,
       selectedSubvisaCategory2: fd.get("selectedSubvisaCategory2") || undefined,
-      firstName: firstNameSave || undefined,
-      lastName: lastNameSave || undefined,
-      dateOfBirth: dobRaw || undefined,
-      passportNumber: passportSave || undefined,
-      dialCode: isIndDeu ? undefined : (String(fd.get("dialCode") || "").trim() || undefined),
-      contactNumber: isIndDeu ? undefined : (String(fd.get("contactNumber") || "").trim() || undefined),
+      firstName: isAreLva ? undefined : (firstNameSave || undefined),
+      lastName: isAreLva ? undefined : (lastNameSave || undefined),
+      dateOfBirth: isAreLva ? undefined : (dobRaw || undefined),
+      passportNumber: isAreLva ? undefined : (passportSave || undefined),
+      dialCode: isIndDeu || isAreLva ? undefined : (String(fd.get("dialCode") || "").trim() || undefined),
+      contactNumber: isIndDeu || isAreLva ? undefined : (String(fd.get("contactNumber") || "").trim() || undefined),
       scheduleDateRangeStart: String(fd.get("scheduleDateRangeStart") ?? "").trim(),
       scheduleDateRangeEnd: String(fd.get("scheduleDateRangeEnd") ?? "").trim(),
       numInstances: getNumInstances(),
@@ -1029,8 +1057,8 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       staggerIntervalSec: parseInt(String(fd.get("staggerIntervalSec") || "6"), 10),
       proxyProvider: String(fd.get("proxyProvider") || "brightdata"),
       instanceId: parseInt(String(fd.get("instanceId") || "1"), 10),
-      helloVerifyNumber: String(fd.get("helloVerifyNumber") ?? "").trim() || undefined,
-      juridictionCode: String(fd.get("juridictionCode") ?? "").trim() || undefined,
+      helloVerifyNumber: isIndLva ? String(fd.get("helloVerifyNumber") ?? "").trim() || undefined : undefined,
+      juridictionCode: isIndLva ? String(fd.get("juridictionCode") ?? "").trim() || undefined : undefined,
       indDeuEmailPrefix: isIndDeu ? String(fd.get("indDeuEmailPrefix") || "").trim() || undefined : undefined,
       indDeuEmailDomain: isIndDeu ? String(fd.get("indDeuEmailDomain") || "").trim().replace(/^@+/, "") || undefined : undefined,
       indDeuAccountPassword: isIndDeu ? String(fd.get("indDeuAccountPassword") || "") || undefined : undefined,

@@ -1,12 +1,16 @@
 /**
- * Fleet proxy source: Bright Data (default) vs the IP list in `proxies.txt`.
- * Selection is runtime (Monitor tab), persisted on instance 0, and applied
- * on the next Chrome request via the local proxy-chain tunnel — no Chrome restart.
+ * Fleet proxy source: Bright Data (default), Webshare rotating residential,
+ * or the IP list in `proxies.txt`. Selection is runtime (Monitor tab), persisted
+ * on instance 0, and applied on the next Chrome request via the local proxy-chain
+ * tunnel — no Chrome restart.
  */
 import { getApplicantDetailsOverrides, patchApplicantDetailsOverrides } from "./applicantDetails.store";
-import { buildProxyListUrl, listProxyListEntries } from "./proxyList";
+import { buildProxyListUrl, isProxyListConfigured, listProxyListEntries } from "./proxyList";
+import { isWebshareConfigured } from "./webshareProxy";
 
-export type ProxyProviderId = "brightdata" | "iplist";
+export type ProxyProviderId = "brightdata" | "webshare" | "iplist";
+
+export const PROXY_PROVIDER_PARSE_ERROR = "Provider must be brightdata, webshare, or iplist.";
 
 /** In-process override so IPC can apply before disk reload. */
 let memoryOverride: ProxyProviderId | null = null;
@@ -14,6 +18,7 @@ let memoryOverride: ProxyProviderId | null = null;
 export function parseProxyProviderId(raw: unknown): ProxyProviderId | null {
   const s = String(raw ?? "").trim().toLowerCase().replace(/[\s_]+/g, "-");
   if (s === "brightdata" || s === "bright-data" || s === "bd") return "brightdata";
+  if (s === "webshare" || s === "web-share" || s === "ws") return "webshare";
   if (s === "iplist" || s === "ip-list" || s === "list" || s === "proxylist" || s === "proxy-list") {
     return "iplist";
   }
@@ -46,14 +51,23 @@ export function getActiveProxyProvider(): ProxyProviderId {
   return "brightdata";
 }
 
+/** Block a Monitor switch until that source has usable credentials / list. */
+export function assertProxyProviderReady(id: ProxyProviderId): { ok: boolean; error?: string } {
+  if (id === "iplist") return isProxyListConfigured();
+  if (id === "webshare") return isWebshareConfigured();
+  return { ok: true };
+}
+
 /**
  * Bright Data: the `PROXY_URLS` lines. IP list: every IP in the file, in file order —
  * which bot gets which one is decided by `proxyClaims.ts`, not by this list.
+ * Webshare: a single backbone URL; session targeting is applied in `resolveProxyForInstance`.
  */
 export function listProxyUrlsForProvider(provider: ProxyProviderId): string[] {
   if (provider === "iplist") {
     return listProxyListEntries().map((entry) => buildProxyListUrl(entry));
   }
+  if (provider === "webshare") return [];
   return (process.env.PROXY_URLS ?? "")
     .trim()
     .split(/[\r\n,]+/)
@@ -76,5 +90,7 @@ export function pickProxyUrlFromList(
 }
 
 export function proxyProviderLabel(id: ProxyProviderId): string {
-  return id === "iplist" ? "IP List" : "Bright Data";
+  if (id === "iplist") return "IP List";
+  if (id === "webshare") return "Webshare";
+  return "Bright Data";
 }

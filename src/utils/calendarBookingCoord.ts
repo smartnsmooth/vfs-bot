@@ -42,6 +42,12 @@ export interface SharedFees {
   currency: string | null;
 }
 
+/** are-lva: one published time window, claimed by at most one instance. allocationId stays local. */
+export interface AreLvaSlotClaim {
+  time: string;
+  claimedBy: number | null;
+}
+
 export interface CalendarBookingCoordState {
   revision: number;
   phase: CalendarBookingPhase;
@@ -78,9 +84,9 @@ export interface CalendarBookingCoordState {
   lastCalendarAttemptAt: number;
   lastCalendarCallerId: number | null;
   /**
-   * After a failed Calendar call, skip the re-poll interval so the next preferred
-   * instance can claim immediately — without opening the seat to everyone (which
-   * let the failing instance reclaim before peers woke up).
+   * After an instance dies mid-call (`retireFromFleet`), skip the re-poll interval
+   * so the next preferred waiter can take the abandoned seat. Empty/error Calendar
+   * responses still honour `calendarPollingInterval`.
    */
   calendarSkipInterval: boolean;
 
@@ -89,6 +95,18 @@ export interface CalendarBookingCoordState {
 
   /** Retired instances (1037/1101 etc.) — removed from fleet. */
   retired: number[];
+
+  /** are-lva: fingerprint of the current calendar date list. */
+  areLvaDatesKey: string;
+  /** are-lva: date → instance ids assigned to that date. */
+  areLvaGroups: Record<string, number[]>;
+  /** are-lva: date → published times (no allocationId). */
+  areLvaSlots: Record<string, AreLvaSlotClaim[]>;
+  /** are-lva: date → instance currently fetching timeslot. */
+  areLvaTimeslotOwner: Record<string, number | null>;
+  areLvaTimeslotOwnerAt: Record<string, number>;
+  /** are-lva: instanceId (string) → last date this bot called timeslot on. */
+  areLvaLastTimeslotDate: Record<string, string>;
 }
 
 const COORD_FILE = join(process.cwd(), "calendar-booking-coord.json");
@@ -121,6 +139,79 @@ const FEES_SELF_RETRY_GAP_MS = 1_500;
 /** Bound on `consumedDates` so a long run cannot grow the file without limit. */
 const MAX_CONSUMED_DATES = 200;
 
+function safeIdGroups(raw: unknown): Record<string, number[]> {
+  if (!raw || typeof raw !== "object") return {};
+  const out: Record<string, number[]> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    const key = String(k).trim();
+    if (!key) continue;
+    const ids = Array.isArray(v)
+      ? v.map((n) => Math.floor(Number(n))).filter((n) => n >= 1)
+      : [];
+    out[key] = [...new Set(ids)].sort((a, b) => a - b);
+  }
+  return out;
+}
+
+function safeAreLvaSlots(raw: unknown): Record<string, AreLvaSlotClaim[]> {
+  if (!raw || typeof raw !== "object") return {};
+  const out: Record<string, AreLvaSlotClaim[]> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    const key = String(k).trim();
+    if (!key || !Array.isArray(v)) continue;
+    const byTime = new Map<string, AreLvaSlotClaim>();
+    for (const item of v) {
+      if (!item || typeof item !== "object") continue;
+      const rec = item as Record<string, unknown>;
+      const time = String(rec.time ?? "").trim() || "unknown";
+      if (byTime.has(time)) continue;
+      const claimedRaw = rec.claimedBy;
+      const claimedBy =
+        typeof claimedRaw === "number" && Number.isFinite(claimedRaw) && claimedRaw >= 1
+          ? Math.floor(claimedRaw)
+          : null;
+      byTime.set(time, { time, claimedBy });
+    }
+    out[key] = [...byTime.values()];
+  }
+  return out;
+}
+
+function safeNullableIdMap(raw: unknown): Record<string, number | null> {
+  if (!raw || typeof raw !== "object") return {};
+  const out: Record<string, number | null> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    const key = String(k).trim();
+    if (!key) continue;
+    if (v == null) out[key] = null;
+    else if (typeof v === "number" && Number.isFinite(v) && v >= 1) out[key] = Math.floor(v);
+  }
+  return out;
+}
+
+function safeNumberMap(raw: unknown): Record<string, number> {
+  if (!raw || typeof raw !== "object") return {};
+  const out: Record<string, number> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    const key = String(k).trim();
+    if (!key) continue;
+    if (typeof v === "number" && Number.isFinite(v)) out[key] = Math.max(0, Math.floor(v));
+  }
+  return out;
+}
+
+function safeStringMap(raw: unknown): Record<string, string> {
+  if (!raw || typeof raw !== "object") return {};
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+    const key = String(k).trim();
+    const val = typeof v === "string" ? v.trim() : "";
+    if (!key || !val) continue;
+    out[key] = val;
+  }
+  return out;
+}
+
 function emptyState(): CalendarBookingCoordState {
   return {
     revision: 0,
@@ -144,6 +235,12 @@ function emptyState(): CalendarBookingCoordState {
     calendarSkipInterval: false,
     scheduled: [],
     retired: [],
+    areLvaDatesKey: "",
+    areLvaGroups: {},
+    areLvaSlots: {},
+    areLvaTimeslotOwner: {},
+    areLvaTimeslotOwnerAt: {},
+    areLvaLastTimeslotDate: {},
   };
 }
 
@@ -197,6 +294,12 @@ function normalizeState(raw: Partial<CalendarBookingCoordState> | null | undefin
     calendarSkipInterval: raw.calendarSkipInterval === true,
     scheduled: safeIntArray(raw.scheduled),
     retired: safeIntArray(raw.retired),
+    areLvaDatesKey: typeof raw.areLvaDatesKey === "string" ? raw.areLvaDatesKey : "",
+    areLvaGroups: safeIdGroups(raw.areLvaGroups),
+    areLvaSlots: safeAreLvaSlots(raw.areLvaSlots),
+    areLvaTimeslotOwner: safeNullableIdMap(raw.areLvaTimeslotOwner),
+    areLvaTimeslotOwnerAt: safeNumberMap(raw.areLvaTimeslotOwnerAt),
+    areLvaLastTimeslotDate: safeStringMap(raw.areLvaLastTimeslotDate),
   };
 }
 
@@ -646,7 +749,8 @@ export function getCalendarPollingCallerId(state: CalendarBookingCoordState): nu
 /**
  * Take the Calendar seat for one call. `intervalMs` is the configured re-poll gap:
  * a fresh call is only allowed once that long has passed since the last attempt
- * (unless {@link CalendarBookingCoordState.calendarSkipInterval} after a failed call).
+ * (unless {@link CalendarBookingCoordState.calendarSkipInterval} after a peer retired
+ * mid-call).
  */
 export function claimCalendarAttempt(instanceId: number, intervalMs: number): boolean {
   const id = Math.max(1, Math.floor(instanceId));
@@ -664,8 +768,7 @@ export function claimCalendarAttempt(instanceId: number, intervalMs: number): bo
         id,
         preferred: getCalendarPollingCallerId(s),
         // After a normal attempt, the turn opens when the re-poll interval expires.
-        // After a failed release (skipInterval), the turn opens immediately for the
-        // preferred instance, then grace lets others take over if preferred is gone.
+        // After a peer retired mid-call (skipInterval), the turn opens immediately.
         openedAt: skipInterval
           ? s.lastCalendarAttemptAt
           : s.lastCalendarAttemptAt > 0
@@ -688,10 +791,9 @@ export function claimCalendarAttempt(instanceId: number, intervalMs: number): bo
 }
 
 /**
- * Calendar call came back with nothing to publish. Rotate to the next poller and
- * skip the re-poll interval for that next preferred instance — without zeroing the
- * turn clock (zeroing opened the seat to every waiter and the failing instance
- * reclaimed before peers could claim).
+ * Calendar call came back with nothing to publish. Rotate to the next poller.
+ * The re-poll interval still applies — otherwise a 1035/empty response retries
+ * the Calendar API immediately and `calendarPollingInterval` never takes effect.
  */
 export function releaseCalendarAttempt(instanceId: number): CalendarBookingCoordState {
   const id = Math.max(1, Math.floor(instanceId));
@@ -699,7 +801,7 @@ export function releaseCalendarAttempt(instanceId: number): CalendarBookingCoord
     if (s.calendarAttemptOwnerId !== id) return false;
     s.calendarAttemptOwnerId = null;
     s.lastCalendarAttemptAt = Date.now();
-    s.calendarSkipInterval = true;
+    s.calendarSkipInterval = false;
     s.calendarAttemptIndex = Math.max(0, s.calendarAttemptIndex) + 1;
     return true;
   });
@@ -717,8 +819,7 @@ export function enterCalendarRepoll(): boolean {
     s.phase = "calendar_repoll";
     s.calendarAttemptIndex = 0;
     s.calendarAttemptOwnerId = null;
-    // No attempt yet in this round, so the first caller goes without waiting out the interval.
-    s.lastCalendarAttemptAt = 0;
+    // Keep lastCalendarAttemptAt so calendarPollingInterval still gates the next call.
     s.lastCalendarCallerId = null;
     s.calendarSkipInterval = false;
     // Fresh round: a date that went nowhere last round may have opened up again.
@@ -727,6 +828,28 @@ export function enterCalendarRepoll(): boolean {
     return true;
   });
   return entered;
+}
+
+/** are-lva: drop published dates/slots and open a new calendar round-robin. */
+export function forceCalendarRepoll(): CalendarBookingCoordState {
+  return updateCalendarBookingState((s) => {
+    s.availableDateList = [];
+    s.availableDatetimeList = [];
+    s.consumedDates = [];
+    s.phase = "calendar_repoll";
+    s.calendarAttemptIndex = 0;
+    s.calendarAttemptOwnerId = null;
+    s.lastCalendarAttemptAt = 0;
+    s.lastCalendarCallerId = null;
+    s.calendarSkipInterval = false;
+    s.areLvaDatesKey = "";
+    s.areLvaGroups = {};
+    s.areLvaSlots = {};
+    s.areLvaTimeslotOwner = {};
+    s.areLvaTimeslotOwnerAt = {};
+    s.areLvaLastTimeslotDate = {};
+    return true;
+  });
 }
 
 // ── Schedule result tracking ────────────────────────────────────────────

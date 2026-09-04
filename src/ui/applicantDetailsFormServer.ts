@@ -7,7 +7,7 @@ import {
   setApplicantDetailsOverrides,
   getAllInstanceApplicantDetails,
 } from "../utils/applicantDetails.store";
-import { isIndDeuRoute } from "../utils/vfsRoute";
+import { isIndDeuRoute, isIndLvaRoute } from "../utils/vfsRoute";
 import { preserveIndDeuInternalFields } from "../utils/indDeuAccountState";
 import { applyIndDeuPhoneToInstanceFields } from "../utils/indDeuPhone";
 import { getSessionLoginCredentials, setSessionLoginCredentials, getAllInstanceCredentials } from "../utils/sessionLogin.store";
@@ -15,11 +15,14 @@ import { buildApplicantFormPageScript } from "./applicantDetailsFormClientScript
 import { buildMonitorTabHtml } from "./monitorTab";
 import type { MonitorHooks } from "../monitoring/status.types";
 import {
+  assertProxyProviderReady,
   getActiveProxyProvider,
   parseProxyProviderId,
   persistProxyProvider,
+  PROXY_PROVIDER_PARSE_ERROR,
 } from "../utils/proxyProvider";
 import { isProxyListConfigured } from "../utils/proxyList";
+import { isWebshareConfigured } from "../utils/webshareProxy";
 import {
   getCalendarPollingCallerId,
   getFeesCallerId,
@@ -52,6 +55,24 @@ export function closeApplicantFormServer(): Promise<void> {
  * and timeslot pools every instance draws from, and whose turn each round-robin is on.
  * Read from the coordination file, so it is the same view the bots act on.
  */
+function fleetTimeslotMonitorRows(s: ReturnType<typeof readCalendarBookingState>): Array<{
+  date: string;
+  time: string;
+  instanceId: number | null;
+}> {
+  const areKeys = Object.keys(s.areLvaSlots ?? {});
+  if (areKeys.length > 0) {
+    const rows: Array<{ date: string; time: string; instanceId: number | null }> = [];
+    for (const date of areKeys.sort()) {
+      for (const slot of s.areLvaSlots[date] ?? []) {
+        rows.push({ date, time: slot.time, instanceId: slot.claimedBy });
+      }
+    }
+    return rows;
+  }
+  return s.availableDatetimeList.map((e) => ({ date: e.date, time: e.time, instanceId: null }));
+}
+
 function buildFleetSummary(): Record<string, unknown> {
   const s = readCalendarBookingState();
   return {
@@ -65,7 +86,7 @@ function buildFleetSummary(): Record<string, unknown> {
     calendarCallerId: s.phase === "calendar_repoll" ? getCalendarPollingCallerId(s) : null,
     lastCalendarCallerId: s.lastCalendarCallerId,
     availableDateList: s.availableDateList,
-    availableDatetimeList: s.availableDatetimeList,
+    availableDatetimeList: fleetTimeslotMonitorRows(s),
     scheduled: s.scheduled,
   };
 }
@@ -109,7 +130,7 @@ export function buildApplicantFormSubmitJsonForBot(collectLogin: boolean): Recor
     return null;
   }
   const mission = typeof base.missionCode === "string" ? base.missionCode.trim().toLowerCase() : "";
-  if (mission === "lva") {
+  if (isIndLvaRoute(base.countryCode, base.missionCode)) {
     const hvRaw = typeof base.helloVerifyNumber === "string" ? base.helloVerifyNumber.replace(/\D/g, "") : "";
     const jur = typeof base.juridictionCode === "string" ? base.juridictionCode.trim() : "";
     if (hvRaw.length !== 6 || !jur) {
@@ -325,13 +346,11 @@ function applyProxyProviderFromBody(
 ): { ok: boolean; error?: string } {
   if (!("proxyProvider" in j)) return { ok: true };
   const id = parseProxyProviderId(j.proxyProvider);
-  if (!id) return { ok: false, error: "Provider must be brightdata or iplist." };
+  if (!id) return { ok: false, error: PROXY_PROVIDER_PARSE_ERROR };
   if (getActiveProxyProvider() === id) return { ok: true };
   if (monitor) return monitor.setProxyProvider(id);
-  if (id === "iplist") {
-    const check = isProxyListConfigured();
-    if (!check.ok) return check;
-  }
+  const check = assertProxyProviderReady(id);
+  if (!check.ok) return check;
   persistProxyProvider(id);
   return { ok: true };
 }
@@ -358,6 +377,7 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
         <option value="egy">Egypt</option>
         <option value="sau">Saudi Arabia</option>
         <option value="uzb">Uzbekistan</option>
+        <option value="are">United Arab Emirates</option>
       </select>
       <label for="missionCode" style="margin:0">To</label>
       <select id="missionCode" name="missionCode" style="flex:1;min-width:8rem">
@@ -371,6 +391,7 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
     <input type="hidden" id="proxyProvider" name="proxyProvider" value="brightdata" />
     <div class="cfg-proxy-row" role="group" aria-label="Proxy provider">
       <button type="button" class="cfg-proxy-btn active" id="cfgProxyBright" data-provider="brightdata" title="Bright Data (default)">Bright Data</button>
+      <button type="button" class="cfg-proxy-btn" id="cfgProxyWebshare" data-provider="webshare" title="Webshare rotating residential (p.webshare.io sticky session per bot)">Webshare</button>
       <button type="button" class="cfg-proxy-btn" id="cfgProxyList" data-provider="iplist" title="IP List (proxies.txt)">IP List</button>
       <span id="cfgProxyHint" style="color:#8b98a5;font-size:0.78rem;"></span>
     </div>
@@ -1222,6 +1243,7 @@ export function runApplicantFormWithSubmitHandler(
             }
             defaults.proxyProvider = getActiveProxyProvider();
             defaults.proxyListReady = isProxyListConfigured().ok;
+            defaults.webshareReady = isWebshareConfigured().ok;
             if (globalDet && typeof globalDet.indDeuEmailPrefix === "string") {
               defaults.indDeuEmailPrefix = globalDet.indDeuEmailPrefix;
             }

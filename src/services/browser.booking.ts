@@ -569,6 +569,8 @@ async function callScheduleRedirectGetIfPresent(
   let isDashboardFallback = false;
 
   if (!finalUrl) {
+    // Only uzb-lva needs a dashboard fallback. Other routes (including are-lva):
+    // if schedule has a URL, go to payment; if it doesn't, skip navigation.
     const rc = String(config.slotPayload.countryCode ?? "").trim().toLowerCase();
     const rm = String(config.slotPayload.missionCode ?? "").trim().toLowerCase();
     const routeKey = `${rc}-${rm}`;

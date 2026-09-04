@@ -10,7 +10,7 @@ import { VfsForbiddenError, VfsGatewayTimeoutError, VfsRateLimitedError, VfsAlre
 import { isPageNotFoundUrl } from "../flows/pageNotFound";
 import type { BrowserServiceCore } from "./browser.core";
 import { clickTurnstile, waitForManualTurnstile } from "./turnstile.click";
-import { isIndDeuRoute } from "../utils/vfsRoute";
+import { isAreLvaRoute, isIndDeuRoute, isIndLvaRoute } from "../utils/vfsRoute";
 import { extractIndDeu4030xx } from "../utils/vfs4030";
 import { getCurrentInstanceId } from "../config/config";
 import { getStoredHeroSmsActivationId, getStoredHeroSmsLastCode } from "../utils/indDeuAccountState";
@@ -919,10 +919,12 @@ async function runLoginOnFirstTab(core: BrowserServiceCore, username: string, pa
     });
     const submitBtn = await resolveLoginSubmitButton(page);
     const indDeuLogin = isIndDeuRoute(config.slotPayload.countryCode, config.slotPayload.missionCode);
+    const areLvaLogin = isAreLvaRoute(config.slotPayload.countryCode, config.slotPayload.missionCode);
     const wantMailTm = config.mailTmOtpEnabled
         && username.trim().includes("@")
         && password.length > 0
-        && !indDeuLogin;
+        && !indDeuLogin
+        && !areLvaLogin;
     let mailTmReady: {
         token: string;
         baseline: Set<string>;
@@ -973,6 +975,7 @@ async function runLoginOnFirstTab(core: BrowserServiceCore, username: string, pa
     await submitLoginImmediately(page, submitBtn, {
         loginRefill: { username, password, usernameSelectors, passwordSelectors },
     });
+    let passwordLoginSkipsOtp = areLvaLogin;
     const pwdLoginRes = await passwordLoginResponsePromise;
     if (pwdLoginRes) {
         const pwdStatus = pwdLoginRes.status();
@@ -1009,7 +1012,12 @@ async function runLoginOnFirstTab(core: BrowserServiceCore, username: string, pa
             const flat = flattenVfsLoginResponseForProfile(pwdJson);
             const cc = String(config.slotPayload.countryCode ?? "").trim().toLowerCase();
             const mc = String(config.slotPayload.missionCode ?? "").trim().toLowerCase();
-            const mergeApplicantFromPasswordStep = pwdJson.enableOTPAuthentication === false || (cc === "ind" && mc === "lva");
+            const mergeApplicantFromPasswordStep = pwdJson.enableOTPAuthentication === false
+                || isAreLvaRoute(cc, mc)
+                || isIndLvaRoute(cc, mc);
+            if (pwdJson.enableOTPAuthentication === false || areLvaLogin) {
+                passwordLoginSkipsOtp = true;
+            }
             let forStore: Record<string, unknown> | null;
             if (mergeApplicantFromPasswordStep && flat) {
                 const o = { ...flat };
@@ -1036,14 +1044,32 @@ async function runLoginOnFirstTab(core: BrowserServiceCore, username: string, pa
             signInEpochMs,
         });
     }
-    await finishLoginAfterFirstSubmit(page, mailOtpFetchPromise, core);
+    await finishLoginAfterFirstSubmit(page, mailOtpFetchPromise, core, { skipOtp: passwordLoginSkipsOtp });
     if (heroSmsOtp.activationId && heroSmsOtp.code) {
         patchApplicantDetailsOverrides({ heroSmsLastCode: heroSmsOtp.code }, getCurrentInstanceId());
         await heroSmsReadyForNext(heroSmsOtp.activationId);
     }
 }
-async function finishLoginAfterFirstSubmit(page: Page, mailOtpFetchPromise: Promise<string> | null, core: BrowserServiceCore): Promise<void> {
+async function finishLoginAfterFirstSubmit(
+    page: Page,
+    mailOtpFetchPromise: Promise<string> | null,
+    core: BrowserServiceCore,
+    opts?: { skipOtp?: boolean },
+): Promise<void> {
     const dash = dashboardUrlRegex();
+    if (opts?.skipOtp) {
+        void mailOtpFetchPromise?.catch(() => { });
+        try {
+            await page.waitForURL(dash, { timeout: 120000 });
+        } catch {
+            /* classified below */
+        }
+        const kindNoOtp = classifyVfsFirstTabUrl(page.url());
+        if (kindNoOtp === "login" || kindNoOtp === "blank") {
+            throw new Error("Login did not complete (still on login or blank). This portal has no OTP step.");
+        }
+        return;
+    }
     const phase = await waitForDashboardOrOtpStep(page, dash, 45000);
     if (phase === "dashboard") {
         void mailOtpFetchPromise?.catch(() => { });

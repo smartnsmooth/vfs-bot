@@ -1,17 +1,12 @@
 {
-  "revision": 149,
+  "revision": 150,
   "claims": [
     {
       "key": "65.20.90.24:3128",
       "instanceId": 1,
-      "claimedAt": 1787437545281,
-      "heartbeatAt": 1787437605290
+      "claimedAt": 1788474228050,
+      "heartbeatAt": 1788474228050
     }
   ],
-  "cooldowns": [
-    {
-      "key": "139.84.162.204:3128",
-      "until": 1787438718333
-    }
-  ]
+  "cooldowns": []
 }
