@@ -8,6 +8,8 @@ applicants-coord.json
 calendar-booking-coord.json
 fleet-poll-coord.json
 fleet-poll-coord.lock
+egress-claims.json
+egress-claims.lock
 poll-ready-state.json
 slot-state.json
 bookings/

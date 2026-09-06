@@ -1,6 +1,6 @@
 import type { Page } from "playwright";
 import { config, getCurrentInstanceId } from "../config/config";
-import { buildCalendarBody, CALENDAR_URL, firstDayOfNextMonthFromDdMmYyyy } from "../config/calendar";
+import { buildCalendarBody, CALENDAR_URL, firstDayOfNextMonthFromDdMmYyyy, shouldRetryCalendarNextMonth } from "../config/calendar";
 import { buildScheduleBody, SCHEDULE_URL } from "../config/schedule";
 import { buildTimeslotBody, TIMESLOT_URL } from "../config/timeslot";
 import { buildFeesBody, FEES_URL } from "../config/fees";
@@ -408,7 +408,7 @@ export async function fetchCalendarDatesForFleetOnPage(page: Page, urn: string):
   let j: CalJson;
   try {
     j = JSON.parse(res.body) as CalJson;
-    if (isCalendar1035FullSlot(j.error)) {
+    if (isCalendar1035FullSlot(j.error) && shouldRetryCalendarNextMonth()) {
       const prevFrom = String(payload.fromDate ?? "");
       const retryFrom = firstDayOfNextMonthFromDdMmYyyy(prevFrom);
             payload = buildCalendarBody(urn, { fromDate: retryFrom });

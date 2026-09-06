@@ -5,6 +5,8 @@
  * in fleet order. Dates are split across instances. Every bot on a date calls
  * timeslot; the first response publishes times only. Each bot then takes a
  * distinct time and schedules with the allocationId from its own timeslot call.
+ * Each instance's calendar API calls are counted like CheckIsSlotAvailable; after
+ * `reloginAfter` empty polls, hard-relogin then applicants then calendar again.
  */
 
 import type { BrowserService } from "../services/browser.service";
@@ -23,6 +25,7 @@ import {
   claimCalendarAttempt,
   createCalendarBookingWatcher,
   forceCalendarRepoll,
+  leaveFleetCalendar,
   markScheduledSuccess,
   publishCalendarDates,
   publishSharedFees,
@@ -127,6 +130,23 @@ async function runFeesIfMissing(browser: BrowserService, instanceId: number): Pr
 
 type LocalTimeslotEntry = { allocationId: string; time: string };
 
+function showCalendarPoll(n: number): void {
+  reporter.setPoll({ pollCount: n });
+  reporter.setBookingStep(`poll #${n} · calendar`);
+}
+
+async function maybeCalendarPollRelogin(
+  instanceId: number,
+  calendarPolls: number,
+  opts: { reloginAfter?: number; onRelogin?: () => Promise<void> }
+): Promise<void> {
+  const reloginAfter = opts.reloginAfter;
+  if (!(reloginAfter && reloginAfter > 0 && calendarPolls >= reloginAfter && opts.onRelogin)) return;
+  leaveFleetCalendar(instanceId);
+  await opts.onRelogin();
+  throw new MissingUrnError("calendar poll interval — need applicants");
+}
+
 function localTimesOf(cache: Map<string, LocalTimeslotEntry[]>, date: string): Set<string> {
   return new Set(
     (cache.get(date) ?? []).map((e) => e.time.trim()).filter(Boolean)
@@ -167,9 +187,13 @@ export async function runAreLvaBooking(opts: {
   abortSeq: number;
   isAbort: (seq: number) => boolean;
   waitForAbort: (seq: number) => Promise<void>;
+  /** After this many calendar API calls by this instance, hard-relogin (same as CheckIsSlotAvailable). */
+  reloginAfter?: number;
+  onRelogin?: () => Promise<void>;
 }): Promise<boolean> {
   const { browser, abortSeq, isAbort, waitForAbort } = opts;
   const instanceId = Math.max(1, Math.floor(opts.instanceId));
+  let calendarPolls = 0;
 
   registerFleetUrn(instanceId);
   registerCalendarWaiter(instanceId);
@@ -215,24 +239,29 @@ export async function runAreLvaBooking(opts: {
         const waitMs = Math.max(0, readyAt - Date.now());
 
         if (waitMs === 0 && claimCalendarAttempt(instanceId, intervalMs)) {
-          reporter.setBookingStep("calendar");
+          showCalendarPoll(calendarPolls + 1);
+          let gotDates = false;
           try {
             const calDates = await browser.fetchCalendarDatesForFleet();
             publishCalendarDates(instanceId, calDates);
             const next = readCalendarBookingState();
             if (next.availableDateList.length > 0) {
               ensureAreLvaDateGroups(next.availableDateList);
+              gotDates = true;
             }
           } catch (err) {
             releaseCalendarAttempt(instanceId);
             if (isUnrecoverableHere(err)) throw err;
           }
+          calendarPolls += 1;
+          reporter.setPoll({ pollCount: calendarPolls });
+          if (!gotDates) {
+            await maybeCalendarPollRelogin(instanceId, calendarPolls, opts);
+          }
           continue;
         }
 
-        reporter.setBookingStep(
-          waitMs > 0 ? `calendar · re-poll in ${Math.round(waitMs / 1000)}s` : "calendar · waiting turn"
-        );
+        showCalendarPoll(calendarPolls);
         const woke = await waitForCoordOrTimeout({
           abortSeq,
           waitForAbort,
@@ -307,7 +336,7 @@ export async function runAreLvaBooking(opts: {
       }
 
       if (!slot) {
-        reporter.setBookingStep("calendar · no slots left");
+        showCalendarPoll(calendarPolls);
         forceCalendarRepoll();
         localTimeslots.clear();
         continue;

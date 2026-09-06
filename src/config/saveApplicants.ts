@@ -328,6 +328,7 @@ const APPLICANT_UI_ONLY_KEYS = [
   "staggerIntervalSec",
   "calendarPollingStartDate",
   "calendarPollingInterval",
+  "calendarRetryNextMonth",
   "apiDelaySec",
   "repeatedDelaySec",
   "heroSmsActivationId",

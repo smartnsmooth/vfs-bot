@@ -239,12 +239,15 @@ export type InstanceIpLogReason = "login" | "rotate-ip" | "recover";
 export function logInstanceIp(
   reason: InstanceIpLogReason,
   ip: string,
-  instanceId?: number
+  instanceId?: number,
+  detail?: string
 ): void {
   const id = resolveInstanceId(instanceId);
   const time = formatLogClockTime();
   const addr = (ip || "").trim() || "(unknown)";
-  const entry = `- instance ${id} -> ${reason} -> ${time} -> ${addr}\n`;
+  const note = (detail ?? "").trim();
+  const extra = note ? ` (${note})` : "";
+  const entry = `- instance ${id} -> ${reason} -> ${time} -> ${addr}${extra}\n`;
   try {
     appendFileSync(LOG_FILE, entry, "utf8");
   } catch {

@@ -2,8 +2,13 @@
  * Webshare rotating residential (backbone `p.webshare.io`).
  *
  * VFS sessions are IP-bound, so this always uses a sticky numeric session id —
- * never `-rotate` (new IP on every request). Chrome launch / IP rotate bumps
- * the rotation offset, which changes the session id and therefore the exit IP.
+ * never `-rotate` (new IP on every request). Live assignment is exclusive via
+ * `claimProxyForInstance` over sessions 1–N (`WEBSHARE_MAX_STICKY_SESSION`,
+ * default 100): a rotate takes a free (idle) session, not one another bot
+ * is already on.
+ *
+ * Different session ids can still map to the same public exit IP. Observed
+ * egress uniqueness is enforced separately in `egressIpClaims.ts`.
  *
  * Dashboard username parameters: `{username}-{country}-{geo}-{sessionId}`.
  *
@@ -28,28 +33,48 @@ export function isWebshareConfigured(): { ok: boolean; error?: string } {
   return { ok: true };
 }
 
+const DEFAULT_MAX_STICKY_SESSION = 100;
+
 /**
- * Numeric sticky id required by Webshare. Stable for a given bot + rotation
- * offset so instance 1 and instance 2 never share an exit IP, and each IP
- * rotate gets a new session.
+ * Sticky session pool size (IP count). `WEBSHARE_MAX_STICKY_SESSION` in `.env`.
+ * Backbone plans typically cap at 100 (101+ → HTTP 407).
+ */
+export function maxStickySession(): number {
+  const n = Number.parseInt((process.env.WEBSHARE_MAX_STICKY_SESSION ?? "").trim(), 10);
+  if (!Number.isFinite(n) || n < 1) return DEFAULT_MAX_STICKY_SESSION;
+  return Math.min(10_000, Math.floor(n));
+}
+
+/** Session ids 1–N for exclusive claims (`proxy-claims.json`). */
+export function webshareStickySessionKeys(): string[] {
+  const max = maxStickySession();
+  return Array.from({ length: max }, (_, i) => String(i + 1));
+}
+
+/**
+ * Fallback sticky id if the claim lock cannot be taken. Prefer
+ * `claimProxyForInstance(..., webshareStickySessionKeys())` so a rotate
+ * lands on an idle session instead of colliding with a live bot.
  */
 export function webshareStickySessionId(instanceId: string, rotationOffset: number): string {
   const digits = instanceId.replace(/\D/g, "");
   const parsed = Number.parseInt(digits, 10);
   const inst =
     Number.isFinite(parsed) && parsed > 0
-      ? Math.min(Math.floor(parsed), 999)
-      : hashToInstanceSlot(instanceId);
-  const rot = Math.max(0, Math.floor(rotationOffset)) % 100000;
-  return String(inst * 100000 + rot);
+      ? ((Math.floor(parsed) - 1) % maxStickySession()) + 1
+      : hashToSessionSlot(instanceId);
+  const rot = Math.max(0, Math.floor(rotationOffset));
+  const session = ((inst - 1 + rot) % maxStickySession()) + 1;
+  return String(session);
 }
 
-function hashToInstanceSlot(input: string): number {
+function hashToSessionSlot(input: string): number {
+  const max = maxStickySession();
   let h = 0;
   for (let i = 0; i < input.length; i++) {
     h = (h * 31 + input.charCodeAt(i)) | 0;
   }
-  return (Math.abs(h) % 900) + 100;
+  return (Math.abs(h) % max) + 1;
 }
 
 export function buildWebshareProxyUrl(sessionNumeric: string): string | null {
