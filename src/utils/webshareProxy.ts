@@ -31,17 +31,17 @@ export function isWebshareConfigured(): { ok: boolean; error?: string } {
 /**
  * Numeric sticky id required by Webshare. Stable for a given bot + rotation
  * offset so instance 1 and instance 2 never share an exit IP, and each IP
- * rotate gets a new session.
+ * rotate gets a new session. Plan limit: session ids 1–100.
  */
 export function webshareStickySessionId(instanceId: string, rotationOffset: number): string {
   const digits = instanceId.replace(/\D/g, "");
   const parsed = Number.parseInt(digits, 10);
   const inst =
     Number.isFinite(parsed) && parsed > 0
-      ? Math.min(Math.floor(parsed), 999)
+      ? Math.min(Math.floor(parsed), 99)
       : hashToInstanceSlot(instanceId);
-  const rot = Math.max(0, Math.floor(rotationOffset)) % 100000;
-  return String(inst * 100000 + rot);
+  const rot = Math.max(0, Math.floor(rotationOffset)) % 100;
+  return String(Math.min(100, Math.max(1, inst + rot)));
 }
 
 function hashToInstanceSlot(input: string): number {
@@ -49,7 +49,7 @@ function hashToInstanceSlot(input: string): number {
   for (let i = 0; i < input.length; i++) {
     h = (h * 31 + input.charCodeAt(i)) | 0;
   }
-  return (Math.abs(h) % 900) + 100;
+  return (Math.abs(h) % 99) + 1;
 }
 
 export function buildWebshareProxyUrl(sessionNumeric: string): string | null {
