@@ -57,6 +57,12 @@ function calendarFromDateFromPollingStart(): string {
   return fallbackCalendarFromDate();
 }
 
+/** True when setup form allows a next-month calendar call after 1035 (full slot). Default false. */
+export function shouldRetryCalendarNextMonth(): boolean {
+  const global0 = getApplicantDetailsOverrides(0);
+  return global0?.calendarRetryNextMonth === true;
+}
+
 export type BuildCalendarBodyOptions = { fromDate?: string };
 
 /** POST /appointment/calendar — requires urn from save applicants. */

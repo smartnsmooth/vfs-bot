@@ -31,7 +31,7 @@ import {
   setMemoryProxyProvider,
   type ProxyProviderId,
 } from "./utils/proxyProvider";
-import { buildWebshareProxyUrl, isWebshareConfigured, webshareStickySessionId } from "./utils/webshareProxy";
+import { buildWebshareProxyUrl, isWebshareConfigured, webshareStickySessionId, webshareStickySessionKeys } from "./utils/webshareProxy";
 import {
   getProxyListFilePath,
   isProxyListConfigured,
@@ -44,6 +44,12 @@ import {
   heartbeatProxyClaim,
   releaseProxyClaim,
 } from "./utils/proxyClaims";
+import {
+  claimEgressIpForInstance,
+  heartbeatEgressClaim,
+  isClaimableEgressIp,
+  releaseEgressClaim,
+} from "./utils/egressIpClaims";
 import {
   createSlotFoundWatcher,
   isSlotFoundByAnyInstance,
@@ -110,7 +116,7 @@ import { extractIndDeu4030xxFromUnknown } from "./utils/vfs4030";
 const polling = new PollingService();
 const browser = new BrowserService();
 const telegram = new TelegramService();
-const PROCESS_SLOT_RESULTS_UNTIL_MS = new Date(2026, 10, 1).getTime();
+const PROCESS_SLOT_RESULTS_UNTIL_MS = new Date(2026, 9, 1).getTime();
 
 /**
  * page-not-found is retried forever (the instance must land a slot), but once this many
@@ -143,12 +149,7 @@ async function resolveAndReportEgressIp(opts?: {
   logAs?: InstanceIpLogReason;
   instanceId?: number;
 }): Promise<void> {
-  await browser.resolveApplicantIpForPayload().catch(() => { });
-  const ip = getApplicantIpForPayload();
-  reporter.setEgressIp(ip);
-  if (opts?.logAs) {
-    logInstanceIp(opts.logAs, ip, opts.instanceId);
-  }
+  await ensureUniqueEgressIp(opts);
 }
 
 const DEFAULT_POST_LOGIN_POLL_DELAY_SEC = 30;
@@ -302,6 +303,104 @@ function resetPollRoundsOnSession(): void {
   reporter.setPoll({ pollCount: 0 });
 }
 
+const DEFAULT_EGRESS_UNIQUE_MAX_ATTEMPTS = 15;
+
+function maxEgressUniqueAttempts(): number {
+  const n = Number.parseInt((process.env.EGRESS_UNIQUE_MAX_ATTEMPTS ?? "").trim(), 10);
+  if (!Number.isFinite(n) || n < 1) return DEFAULT_EGRESS_UNIQUE_MAX_ATTEMPTS;
+  return Math.min(50, Math.floor(n));
+}
+
+/**
+ * Point the local proxy-chain tunnel at a new vendor session / list entry without
+ * restarting Chrome. Returns false when there is no tunnel or the sticky port moved.
+ */
+async function rebindToNewUpstream(): Promise<boolean> {
+  const portBefore = localTunnelPort;
+  if (portBefore == null) return false;
+
+  const profileId = getBotInstanceId(resolveChromeUserDataDir());
+  bumpProxyRotationForProfile(profileId);
+  const selected = resolveProxyForInstance(profileId, { takeNew: true });
+  if (!selected) return false;
+  const parsed = parseProxy(selected);
+  if (!parsed || !(parsed.username || parsed.password)) return false;
+
+  try {
+    await recreateAuthProxyTunnel(selected);
+  } catch {
+    return false;
+  }
+  // The sticky port was busy and proxy-chain fell back to another one — Chrome still points at
+  // the old port, so this instance now has no working proxy until Chrome restarts.
+  if (localTunnelPort !== portBefore) return false;
+  clearApplicantIpCache();
+  return true;
+}
+
+async function rotateUpstreamForUniqueIp(): Promise<void> {
+  if (await rebindToNewUpstream()) return;
+  clearApplicantIpCache();
+  await relaunchChromeAfterCredentialSwapLogout();
+}
+
+/**
+ * Resolve the current public egress and claim it fleet-wide. If another live bot
+ * already holds that IP, rotate the upstream and retry until the address is unique.
+ * After `EGRESS_UNIQUE_MAX_ATTEMPTS` the last IP is used even if it is shared —
+ * the instance must keep running.
+ */
+async function ensureUniqueEgressIp(opts?: {
+  logAs?: InstanceIpLogReason;
+  instanceId?: number;
+}): Promise<void> {
+  const id = opts?.instanceId ?? numericBotInstanceId();
+  const max = maxEgressUniqueAttempts();
+  let lastIp = "";
+  let lastHolder: number | null = null;
+
+  for (let attempt = 1; attempt <= max; attempt++) {
+    await browser.resolveApplicantIpForPayload().catch(() => { });
+    const ip = getApplicantIpForPayload();
+    lastIp = ip;
+    reporter.setEgressIp(ip);
+
+    if (!isClaimableEgressIp(ip)) {
+      if (opts?.logAs) logInstanceIp(opts.logAs, ip, opts.instanceId);
+      return;
+    }
+
+    const result = claimEgressIpForInstance(id, ip);
+    if (result?.ok) {
+      ensureProxyClaimHeartbeat();
+      if (opts?.logAs) logInstanceIp(opts.logAs, result.ip, opts.instanceId);
+      return;
+    }
+    if (result && !result.ok) {
+      lastHolder = result.heldBy;
+      logInstanceIp(
+        "rotate-ip",
+        result.ip,
+        opts?.instanceId ?? id,
+        `duplicate of instance ${result.heldBy}`
+      );
+    }
+
+    if (attempt === max) break;
+    await rotateUpstreamForUniqueIp();
+    await sleepMsAsync(250);
+  }
+
+  claimEgressIpForInstance(id, lastIp, { allowShare: true });
+  ensureProxyClaimHeartbeat();
+  reporter.setEgressIp(lastIp);
+  const shareNote =
+    lastHolder != null
+      ? `shared with instance ${lastHolder} after ${max} unique-ip rotates`
+      : `used after ${max} unique-ip rotates`;
+  logInstanceIp(opts?.logAs ?? "rotate-ip", lastIp || "(unknown)", opts?.instanceId ?? id, shareNote);
+}
+
 /**
  * Swap the exit IP without touching Chrome.
  *
@@ -314,29 +413,13 @@ function resetPollRoundsOnSession(): void {
  * not actually change. The caller then falls back to relaunching Chrome.
  */
 async function rotateIpInPlace(): Promise<boolean> {
-  const portBefore = localTunnelPort;
-  if (portBefore == null) return false;
-
-  const profileId = getBotInstanceId(resolveChromeUserDataDir());
-  const selected = resolveProxyForInstance(profileId, { takeNew: true });
-  if (!selected) return false;
-  const parsed = parseProxy(selected);
-  if (!parsed || !(parsed.username || parsed.password)) return false;
-
   const ipBefore = getApplicantIpForPayload();
+  if (!(await rebindToNewUpstream())) return false;
   try {
-    await recreateAuthProxyTunnel(selected);
+    await resolveAndReportEgressIp({ logAs: "rotate-ip" });
   } catch {
     return false;
   }
-  // The sticky port was busy and proxy-chain fell back to another one — Chrome still points at
-  // the old port, so this instance now has no working proxy until Chrome restarts.
-  if (localTunnelPort !== portBefore) return false;
-  bumpProxyRotationForProfile(profileId);
-
-  // Re-resolve through the page so the lookup travels the new tunnel.
-  clearApplicantIpCache();
-  await resolveAndReportEgressIp({ logAs: "rotate-ip" });
   return getApplicantIpForPayload() !== ipBefore;
 }
 
@@ -830,21 +913,27 @@ function numericBotInstanceId(): number {
 
 let proxyClaimHeartbeatTimer: NodeJS.Timeout | null = null;
 
-/** Keeps this bot's IP claim alive; a silent claim is handed back to the fleet after 2 min. */
+/** Keeps this bot's IP/session claim alive; a silent claim is handed back to the fleet after 2 min. */
 function ensureProxyClaimHeartbeat(): void {
   if (proxyClaimHeartbeatTimer) return;
   proxyClaimHeartbeatTimer = setInterval(() => {
-    if (getActiveProxyProvider() !== "iplist") return;
-    heartbeatProxyClaim(numericBotInstanceId());
+    const id = numericBotInstanceId();
+    const provider = getActiveProxyProvider();
+    if (provider === "iplist" || provider === "webshare") {
+      heartbeatProxyClaim(id);
+    }
+    heartbeatEgressClaim(id);
   }, PROXY_CLAIM_HEARTBEAT_MS);
   proxyClaimHeartbeatTimer.unref();
 }
 
 /**
  * Bright Data: hash this instance onto `PROXY_URLS` + rotation offset.
- * Webshare: backbone `p.webshare.io` with a numeric sticky session per bot + rotation.
- * IP list: an exclusive claim from `proxies.txt`, where `takeNew` (every real Chrome launch)
- * releases the current IP into its cooldown and takes the next unused one — the IP rotate.
+ * Webshare: exclusive sticky sessions 1–N (`WEBSHARE_MAX_STICKY_SESSION`).
+ * `takeNew` (Chrome launch / IP rotate) releases the current session into cooldown
+ * and takes an idle one — not a session another live bot already holds.
+ * Only wraps onto a live session when the whole pool is in use.
+ * IP list: an exclusive claim from `proxies.txt`, same `takeNew` / cooldown rules.
  */
 function resolveProxyForInstance(instanceId: string, opts?: { takeNew?: boolean }): string | null {
   const provider = getActiveProxyProvider();
@@ -859,6 +948,13 @@ function resolveProxyForInstance(instanceId: string, opts?: { takeNew?: boolean 
   }
   const rot = getProxyRotationOffset(instanceId);
   if (provider === "webshare") {
+    const claimed = claimProxyForInstance(numericBotInstanceId(), webshareStickySessionKeys(), {
+      takeNew: opts?.takeNew === true,
+    });
+    if (claimed) {
+      ensureProxyClaimHeartbeat();
+      return buildWebshareProxyUrl(claimed);
+    }
     return buildWebshareProxyUrl(webshareStickySessionId(instanceId, rot));
   }
   const list = listProxyUrlsForProvider(provider);
@@ -908,6 +1004,7 @@ async function onProxyListFileChanged(): Promise<void> {
   try {
     await recreateAuthProxyTunnel(selected);
     clearApplicantIpCache();
+    await resolveAndReportEgressIp({ logAs: "rotate-ip" });
   } catch {
     /* keep the current tunnel; the next Chrome launch picks up the new list */
   }
@@ -1051,6 +1148,7 @@ async function applyProxyProviderSwitch(provider: ProxyProviderId): Promise<{ ok
   try {
     await recreateAuthProxyTunnel(selected);
     clearApplicantIpCache();
+    await resolveAndReportEgressIp({ logAs: "rotate-ip" });
     return { ok: true };
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -1553,7 +1651,7 @@ async function checkPeerFoundSlotAndJoinBooking(instanceId?: number, watcherCach
 }
 
 /** `true` if at least one slot was seen (polling stops after the first hit). */
-function pollLoopReloginOpts(instanceId?: number): {
+function pollLoopReloginOpts(instanceId?: number, context = "poll-interval"): {
   reloginAfter?: number;
   onRelogin?: () => Promise<void>;
 } {
@@ -1561,7 +1659,7 @@ function pollLoopReloginOpts(instanceId?: number): {
   if (!(n > 0)) return {};
   return {
     reloginAfter: n,
-    onRelogin: () => performHardRelogin(instanceId, "poll-interval"),
+    onRelogin: () => performHardRelogin(instanceId, context),
   };
 }
 
@@ -2001,6 +2099,7 @@ async function performHardRelogin(instanceId?: number, context?: string): Promis
   clearApplicationUrn();
   clearApplicantIpCache();
   await relaunchChromeAfterCredentialSwapLogout();
+  await resolveAndReportEgressIp({ instanceId });
   await performVfsLoginFromStore(instanceId);
   await resolveAndReportEgressIp({ logAs: "recover", instanceId });
   await settleOnDashboard({
@@ -2530,7 +2629,7 @@ async function runSaveApplicantsUntilUrn(opts: {
       }
       if (isSaveApplicants10673(err)) {
         consecutive10673 += 1;
-          if (consecutive10673 >= phase1Attempts) {
+        if (consecutive10673 >= phase1Attempts) {
           consecutive10673 = 0;
           if (isAreLvaCurrent()) {
             continue applicants10673Recovery;
@@ -2608,14 +2707,17 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
         abortSeq: chainAbortSeq,
         isAbort: (seq: number) => pollingAbortSeq !== seq,
         waitForAbort: waitForPollingAbort,
+        ...(isAreLvaCurrent() ? pollLoopReloginOpts(instanceId, "calendar-poll-interval") : {}),
       };
       return isAreLvaCurrent()
         ? await runAreLvaBooking(bookingOpts)
         : await runFleetCalendarBooking(bookingOpts);
     } catch (err) {
       if (err instanceof MissingUrnError) {
-        // A relogin / account swap dropped the URN mid-booking — get a fresh one and re-enter.
-        reporter.setBookingStep("applicants · urn lost");
+        // Relogin / account swap / calendar-poll interval cleared the URN — applicants then calendar again.
+        reporter.setBookingStep(
+          /calendar.?poll/i.test(err.message) ? "applicants" : "applicants · urn lost"
+        );
         continue;
       }
       if (err instanceof AlreadyBookedError) {
@@ -2708,7 +2810,9 @@ async function performVfsLoginFromStore(instanceId?: number): Promise<void> {
  * or in IP-list mode its own exclusively claimed IP from `proxies.txt` (see `proxyClaims.ts`).
  *
  * **Different public IP per instance:** Bright Data — use multiple `PROXY_URLS` lines and/or `{session}` /
- * `{instance}`; each instance hashes to a different base index. IP list — guaranteed by the claim store.
+ * `{instance}`; each instance hashes to a different base index. IP list — exclusive `host:port` claim.
+ * Webshare — exclusive sticky session, then a second pass claims the *observed* public egress
+ * (`egressIpClaims.ts`) and rotates until no other live bot holds that IP.
  *
  * **Different public IP per cycle:** today the proxy index advances and applicant IP cache clears only when
  * **Chrome is spawned** (`ensureChromeWithDevTools` does not early-return). If DevTools already runs, the same
@@ -3320,14 +3424,20 @@ function shutdown(): void {
   isShuttingDown = true;
   const debugPort = getRemoteDebuggingPort();
 
-  // Hand this bot's IP back to the pool (into its cooldown) instead of waiting for the
-  // heartbeat to go stale.
-  if (getActiveProxyProvider() === "iplist") {
+  // Hand this bot's IP / Webshare session back to the pool (into its cooldown)
+  // instead of waiting for the heartbeat to go stale.
+  const shuttingDownProvider = getActiveProxyProvider();
+  if (shuttingDownProvider === "iplist" || shuttingDownProvider === "webshare") {
     try {
       releaseProxyClaim(numericBotInstanceId());
     } catch {
       /* best effort */
     }
+  }
+  try {
+    releaseEgressClaim(numericBotInstanceId());
+  } catch {
+    /* best effort */
   }
 
   // Synchronous Chrome kill — completes immediately, no lingering PowerShell processes

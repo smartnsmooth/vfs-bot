@@ -1,14 +1,17 @@
 /**
- * Exclusive proxy-IP assignment across bot processes.
+ * Exclusive proxy-IP / Webshare-session assignment across bot processes.
  *
  * Each bot runs in its own child process, so "no two bots on the same IP" needs shared
  * state on disk. `proxy-claims.json` holds the live claims plus a cooldown list, guarded
  * by the same lock-file pattern used by `fleetPollCoord.ts`.
  *
+ * Used by the IP list (`host:port` keys) and Webshare (sticky session ids `1`–N).
+ *
  * Rules:
  * - Instance 1 takes the first free IP in file order, instance 2 the next, and so on.
  * - Rotating releases the current IP into a cooldown (default 20 min) so a just-burned IP
- *   is not handed straight to another bot.
+ *   is not handed straight to another bot. The next pick is an idle (unclaimed, not
+ *   cooling) entry whenever one exists.
  * - A claim whose owner stopped heartbeating (crash / kill) is freed and cooled down from
  *   its last sign of life.
  * - When every IP is claimed or cooling, the pool wraps around rather than failing:

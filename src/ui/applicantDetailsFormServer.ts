@@ -12,7 +12,7 @@ import { preserveIndDeuInternalFields } from "../utils/indDeuAccountState";
 import { applyIndDeuPhoneToInstanceFields } from "../utils/indDeuPhone";
 import { getSessionLoginCredentials, setSessionLoginCredentials, getAllInstanceCredentials } from "../utils/sessionLogin.store";
 import { buildApplicantFormPageScript } from "./applicantDetailsFormClientScript";
-import { buildMonitorTabHtml } from "./monitorTab";
+import { buildMonitorTabClientScript, buildMonitorTabHtml } from "./monitorTab";
 import type { MonitorHooks } from "../monitoring/status.types";
 import {
   assertProxyProviderReady,
@@ -332,6 +332,11 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
     const v = parseInt(j.calendarPollingInterval, 10);
     if (Number.isFinite(v) && v >= 1) out.calendarPollingInterval = v;
   }
+  if ("calendarRetryNextMonth" in j) {
+    const v = j.calendarRetryNextMonth;
+    out.calendarRetryNextMonth =
+      v === true || v === 1 || (typeof v === "string" && /^(true|on|1)$/i.test(v.trim()));
+  }
   if (typeof out.helloVerifyNumber === "string") {
     const digits = out.helloVerifyNumber.replace(/\D/g, "").slice(0, 6);
     if (digits.length > 0) out.helloVerifyNumber = digits;
@@ -426,6 +431,10 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
       <label for="calendarPollingInterval" style="margin-top:0.75rem">Calendar polling interval (seconds)</label>
       <input type="number" id="calendarPollingInterval" name="calendarPollingInterval" min="1" value="60" />
       </div>
+    </div>
+    <div class="chk-row">
+      <input type="checkbox" id="calendarRetryNextMonth" name="calendarRetryNextMonth" />
+      <label for="calendarRetryNextMonth">Retry next month if current month is full</label>
     </div>
     <div class="row2">
       <div>
@@ -594,6 +603,9 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
     .date-chip-remove { margin: 0; padding: 0 0.2rem; width: auto; min-width: 0; background: transparent; color: #8b98a5; font-size: 1.15rem; line-height: 1; font-weight: 400; }
     .date-chip-remove:hover { color: #f4212e; filter: none; }
     .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
+    .chk-row { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.75rem; }
+    .chk-row input[type="checkbox"] { width: auto; margin: 0; padding: 0; flex: none; accent-color: #1d9bf0; }
+    .chk-row label { margin: 0; color: #e7e9ea; cursor: pointer; }
     .row3 { display: grid; grid-template-columns: 1fr 1fr 0.5fr; gap: 0.75rem; }
     @media (max-width: 720px) {
       .row3 { grid-template-columns: 1fr; }
@@ -986,6 +998,7 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
     });
   })();
   </script>
+  ${hasMonitor ? buildMonitorTabClientScript() : ""}
   ${buildApplicantFormPageScript(collectLoginJs)}
 </body>
 </html>`;
@@ -1235,6 +1248,7 @@ export function runApplicantFormWithSubmitHandler(
             if (globalDet && typeof globalDet.calendarPollingInterval === "number") {
               defaults.calendarPollingInterval = globalDet.calendarPollingInterval;
             }
+            defaults.calendarRetryNextMonth = globalDet?.calendarRetryNextMonth === true;
             if (globalDet && typeof globalDet.apiDelaySec === "number") {
               defaults.apiDelaySec = globalDet.apiDelaySec;
             }
@@ -1333,6 +1347,7 @@ export function runApplicantFormWithSubmitHandler(
             staggerIntervalSec: sis,
             calendarPollingStartDate: cpsd,
             calendarPollingInterval: cpi,
+            calendarRetryNextMonth: crnm,
             apiDelaySec: ads,
             repeatedDelaySec: rds,
             ...instanceFields
@@ -1359,6 +1374,7 @@ export function runApplicantFormWithSubmitHandler(
             if (typeof cpsd === "string") { global0.calendarPollingStartDate = cpsd; changed = true; }
             else if ("calendarPollingStartDate" in rest) { delete global0.calendarPollingStartDate; changed = true; }
             if (typeof cpi === "number") { global0.calendarPollingInterval = cpi; changed = true; }
+            if (typeof crnm === "boolean") { global0.calendarRetryNextMonth = crnm; changed = true; }
             if (typeof ads === "number") { global0.apiDelaySec = ads; changed = true; }
             if (typeof rds === "number") { global0.repeatedDelaySec = rds; changed = true; }
             if (typeof instanceFields.countryCode === "string") { global0.countryCode = instanceFields.countryCode; changed = true; }
@@ -1457,6 +1473,13 @@ export function runApplicantFormWithSubmitHandler(
               ? j.calendarPollingStartDate.trim()
               : undefined;
 
+          const submittedCalendarRetryNextMonth =
+            typeof j.calendarRetryNextMonth === "boolean"
+              ? j.calendarRetryNextMonth
+              : typeof j.calendarRetryNextMonth === "string"
+                ? /^(true|on|1)$/i.test(j.calendarRetryNextMonth.trim())
+                : undefined;
+
           const submittedApiDelaySec =
             typeof j.apiDelaySec === "number" && j.apiDelaySec >= 0
               ? j.apiDelaySec
@@ -1481,7 +1504,8 @@ export function runApplicantFormWithSubmitHandler(
             submittedCalendarPollingInterval != null ||
             submittedApiDelaySec != null ||
             submittedRepeatedDelaySec != null ||
-            "calendarPollingStartDate" in j
+            "calendarPollingStartDate" in j ||
+            "calendarRetryNextMonth" in j
           ) {
             const global0 = getApplicantDetailsOverrides(0) ?? {};
             let changed = false;
@@ -1520,6 +1544,10 @@ export function runApplicantFormWithSubmitHandler(
               } else {
                 delete global0.calendarPollingStartDate;
               }
+              changed = true;
+            }
+            if ("calendarRetryNextMonth" in j) {
+              global0.calendarRetryNextMonth = submittedCalendarRetryNextMonth === true;
               changed = true;
             }
             if (changed) setApplicantDetailsOverrides(global0, 0);

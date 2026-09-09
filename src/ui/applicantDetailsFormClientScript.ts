@@ -241,6 +241,11 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
         { value: "NVBA", label: "Basic or advanced in-company or school-based vocational training (§ 16a AufenthG)" },
         { value: "R124", label: "Conducting a quality analysis ((§ 16d Abs. 6 AufenthG)" },
       ]},
+      { value: "DEL", label: "New Delhi - Visa Application Centre", categories: [
+        { value: "NVAOE", label: "Any Other Employment" },
+        { value: "NVBA", label: "Basic or advanced in-company or school-based vocational training (§ 16a AufenthG)" },
+        { value: "R124", label: "Conducting a quality analysis ((§ 16d Abs. 6 AufenthG)" },
+      ]},
     ],
     "are-lva": [
       { value: "AUH", label: "Latvia Visa application center- Abu Dhabi", categories: [
@@ -599,7 +604,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
         const k = keys[ki];
         if (skipDetailIds[k] || skipCenterCatIds[k]) continue;
         if (k === "scheduleDateRangeStart" || k === "scheduleDateRangeEnd") continue;
-        if (k === "calendarPollingStartDate" || k === "calendarPollingInterval" || k === "apiDelaySec" || k === "repeatedDelaySec") continue;
+        if (k === "calendarPollingStartDate" || k === "calendarPollingInterval" || k === "calendarRetryNextMonth" || k === "apiDelaySec" || k === "repeatedDelaySec") continue;
         if (k === "proxyProvider") continue;
         const el = document.getElementById(k);
         if (el) el.value = inst.details[k] == null ? "" : String(inst.details[k]);
@@ -670,6 +675,11 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
     if (cpiEl) {
       const gsrc = (globalInst && globalInst.details) || {};
       cpiEl.value = gsrc.calendarPollingInterval != null ? String(gsrc.calendarPollingInterval) : "60";
+    }
+    const crnmEl = document.getElementById("calendarRetryNextMonth");
+    if (crnmEl) {
+      const gsrc = (globalInst && globalInst.details) || {};
+      crnmEl.checked = gsrc.calendarRetryNextMonth === true;
     }
     const adsEl = document.getElementById("apiDelaySec");
     if (adsEl) {
@@ -754,6 +764,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       applicantsJoinStaggerSec: parseFloat(String(fd.get("applicantsJoinStaggerSec") || "0.5")) || 0.5,
       calendarPollingStartDate: String(fd.get("calendarPollingStartDate") ?? "").trim(),
       calendarPollingInterval: parseInt(String(fd.get("calendarPollingInterval") || "60"), 10) || 60,
+      calendarRetryNextMonth: !!(document.getElementById("calendarRetryNextMonth") && document.getElementById("calendarRetryNextMonth").checked),
       apiDelaySec: parseFloat(String(fd.get("apiDelaySec") || "0")),
       repeatedDelaySec: parseInt(String(fd.get("repeatedDelaySec") || "35"), 10) || 35,
       postLoginPollDelay: parseInt(String(fd.get("postLoginPollDelay") || "30"), 10),
@@ -1051,6 +1062,7 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
       applicantsJoinStaggerSec: parseFloat(String(fd.get("applicantsJoinStaggerSec") || "0.5")) || 0.5,
       calendarPollingStartDate: String(fd.get("calendarPollingStartDate") ?? "").trim(),
       calendarPollingInterval: parseInt(String(fd.get("calendarPollingInterval") || "60"), 10) || 60,
+      calendarRetryNextMonth: !!(document.getElementById("calendarRetryNextMonth") && document.getElementById("calendarRetryNextMonth").checked),
       apiDelaySec: parseFloat(String(fd.get("apiDelaySec") || "0")),
       repeatedDelaySec: parseInt(String(fd.get("repeatedDelaySec") || "35"), 10) || 35,
       postLoginPollDelay: parseInt(String(fd.get("postLoginPollDelay") || "30"), 10),

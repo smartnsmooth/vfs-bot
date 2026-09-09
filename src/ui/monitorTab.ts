@@ -187,6 +187,16 @@ export function buildMonitorTabHtml(): string {
   .mon-fleet .list { color: #7fd1ff; font-weight: 400; white-space: normal; }
   .mon-fleet .list-item { display: inline-block; white-space: nowrap; }
   .mon-fleet .empty { color: #6b7686; font-weight: 400; }
+  .mon-empty { grid-column: 1 / -1; color: #8b98a5; padding: 1.5rem; text-align: center; }
+  .mon-grid { min-height: 4rem; }
+  .mon-grid:empty::after {
+    content: "No bots yet — Submit & Run from Configure.";
+    color: #8b98a5;
+    padding: 1.5rem;
+    text-align: center;
+    display: block;
+    grid-column: 1 / -1;
+  }
 </style>
 <div class="mon-wrap">
   <div class="mon-toolbar" style="margin-bottom:0.5rem;display:flex;gap:0.4rem;align-items:center;justify-content:center;font-size:0.72rem;">
@@ -224,8 +234,14 @@ export function buildMonitorTabHtml(): string {
   <div class="mon-fleet" id="monFleet"></div>
   <div class="mon-grid" id="monGrid"></div>
 </div>
-<div class="mon-toast" id="monToast"></div>
-<script>
+<div class="mon-toast" id="monToast"></div>`;
+}
+
+/** Inline script — must sit outside `#tab-monitor[hidden]` or some browsers never run it. */
+export function buildMonitorTabClientScript(): string {
+  // String.raw keeps regex escapes (\/, \d, \s, \b). A normal template turns
+  // /^(\d{2})\/(\d{2})/ into broken JS and the whole monitor script never runs.
+  return String.raw`<script>
 (function(){
   if (window.__monitorInit) return;
   var started = false;
@@ -642,6 +658,18 @@ export function buildMonitorTabHtml(): string {
     warmupUntil = Date.now() + 2500;
     var es = new EventSource('/api/monitor/events');
     es.onmessage = function(ev){ try { onStatus(JSON.parse(ev.data)); } catch(e){} };
+    es.onerror = function(){
+      fetch('/api/monitor/snapshot').then(function(r){ return r.json(); }).then(function(d){
+        if (d && d.ok && Array.isArray(d.instances)){
+          for (var i = 0; i < d.instances.length; i++){
+            var s = d.instances[i];
+            if (!s || s.instanceId == null) continue;
+            instances[s.instanceId] = s;
+          }
+          scheduleRender();
+        }
+      }).catch(function(){});
+    };
   }
 
   document.addEventListener('click', function(ev){
@@ -817,12 +845,12 @@ export function buildMonitorTabHtml(): string {
       if (d && d.ok && Array.isArray(d.instances)){
         for (var i = 0; i < d.instances.length; i++){
           var s = d.instances[i];
+          if (!s || s.instanceId == null) continue;
           instances[s.instanceId] = s;
           prevAttn[s.instanceId] = needsManual(s);
         }
-        render();
       }
-    }).catch(function(){});
+    }).catch(function(){}).then(function(){ render(); });
     pollFleet();
     setInterval(pollFleet, 1000);
     connect();

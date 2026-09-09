@@ -491,6 +491,34 @@ export function registerCalendarWaiter(instanceId: number): CalendarBookingCoord
   });
 }
 
+/**
+ * Leave fees/calendar round-robin without retiring (calendar-poll hard-relogin).
+ * Peers can take the next turn immediately; registerFleetUrn puts this bot back after applicants.
+ */
+export function leaveFleetCalendar(instanceId: number): CalendarBookingCoordState {
+  const id = Math.max(1, Math.floor(instanceId));
+  return updateCalendarBookingState((s) => {
+    const wasWaiter = s.waiters.includes(id);
+    const wasHolder = s.urnHolders.includes(id);
+    const ownedCal = s.calendarAttemptOwnerId === id;
+    const ownedFees = s.feesAttemptOwnerId === id;
+    if (!wasWaiter && !wasHolder && !ownedCal && !ownedFees) return false;
+    s.waiters = s.waiters.filter((w) => w !== id);
+    s.urnHolders = s.urnHolders.filter((w) => w !== id);
+    if (ownedFees) {
+      s.feesAttemptOwnerId = null;
+      s.feesAttemptIndex = Math.max(0, s.feesAttemptIndex) + 1;
+    }
+    if (ownedCal) {
+      s.calendarAttemptOwnerId = null;
+      s.lastCalendarAttemptAt = Date.now();
+      s.calendarSkipInterval = true;
+      s.calendarAttemptIndex = Math.max(0, s.calendarAttemptIndex) + 1;
+    }
+    return true;
+  });
+}
+
 /** Retire instance from fleet (1037/1101). */
 export function retireFromFleet(instanceId: number): CalendarBookingCoordState {
   const id = Math.max(1, Math.floor(instanceId));

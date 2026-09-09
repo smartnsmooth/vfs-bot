@@ -100,8 +100,9 @@ export const config = {
   loginOnly: process.env.VFS_LOGIN_ONLY === "true" || process.env.VFS_LOGIN_ONLY === "1",
 
   /**
-   * After this many CheckIsSlotAvailable calls, hard-relogin (fresh session / 429 reset).
-   * 0 = disabled. Also used as applicants 10673 retry count before hard relogin.
+   * After this many CheckIsSlotAvailable calls (or are-lva calendar API calls),
+   * hard-relogin (fresh session / 429 reset). 0 = disabled.
+   * Also used as applicants 10673 retry count before hard relogin.
    */
   pollReloginInterval: (() => {
     const raw = parseInt(process.env.VFS_POLL_RELOGIN_INTERVAL ?? "0", 10);
