@@ -235,13 +235,16 @@ export function buildApplicantFormPageScript(collectLoginJs: string): string {
         { value: "NV1", label: "Speciality Cook" },
         { value: "NVBA", label: "Basic or advanced in-company or school-based vocational training (§ 16a AufenthG)" },
         { value: "R124", label: "Conducting a quality analysis ((§ 16d Abs. 6 AufenthG)" },
-        { value: "NVAOE", label: "Any Other Employment" },
       ]},
       { value: "COK", label: "Cochin - Visa Application Centre", categories: [
         { value: "NV1", label: "Speciality Cook" },
         { value: "NVBA", label: "Basic or advanced in-company or school-based vocational training (§ 16a AufenthG)" },
         { value: "R124", label: "Conducting a quality analysis ((§ 16d Abs. 6 AufenthG)" },
+      ]},
+      { value: "DEL", label: "New Delhi - Visa Application Centre", categories: [
         { value: "NVAOE", label: "Any Other Employment" },
+        { value: "NVBA", label: "Basic or advanced in-company or school-based vocational training (§ 16a AufenthG)" },
+        { value: "R124", label: "Conducting a quality analysis ((§ 16d Abs. 6 AufenthG)" },
       ]},
     ],
     "are-lva": [
