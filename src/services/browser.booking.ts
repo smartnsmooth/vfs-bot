@@ -15,7 +15,7 @@ import { saveBookingConfirmationFile } from "../utils/bookingConfirmationFile";
 import { isScheduleAlreadyBooked, saveAlreadyBookedAccountFile } from "../utils/alreadyBookedAccountFile";
 import { buildScheduleRedirectUrl } from "../utils/scheduleRedirectUrl";
 import { classifyVfsFirstTabUrl } from "../flows/vfsTabUrl";
-import { AlreadyBookedError, VfsForbiddenError, VfsGatewayTimeoutError, isFailedToFetchError, throwVfsRateLimited } from "./browser.errors";
+import { AlreadyBookedError, PaymentPendingError, VfsForbiddenError, VfsGatewayTimeoutError, isFailedToFetchError, throwVfsRateLimited } from "./browser.errors";
 import { classifyVfs429FromHttp } from "../utils/vfsRateLimit";
 import { throwIfLiftAuthBlocked } from "../utils/vfsAuthBlock";
 import { bumpJoinStaggerOn504 } from "../utils/joinStaggerCoord";
@@ -300,7 +300,7 @@ function parseApplicantsResponseJson(body: string): { urn?: string; error?: unkn
       throw new AlreadyBookedError(`Save applicants: already booked (code 1037) — ${JSON.stringify(parsed.error)}`);
     }
     if (code === 1101) {
-      throw new AlreadyBookedError(`Save applicants: payment pending (code 1101) — ${JSON.stringify(parsed.error)}`);
+      throw new PaymentPendingError(`Save applicants: payment pending (code 1101) — ${JSON.stringify(parsed.error)}`);
     }
     throw new Error(`Save applicants API error: ${JSON.stringify(parsed.error)}`);
   }

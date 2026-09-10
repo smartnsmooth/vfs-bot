@@ -255,7 +255,7 @@ export function buildMonitorTabClientScript(): string {
   var PHASE_COLORS = {
     idle: '#8b98a5', launching: '#5aa9ff', login: '#f5a623', otp: '#f5a623',
     turnstile: '#f5a623', polling: '#1d9bf0', booking: '#a48bec', payment: '#00ba7c',
-    recovering: '#ff8a3d', stopped: '#f4212e', already_booked: '#8b98a5',
+    recovering: '#ff8a3d', stopped: '#f4212e', already_booked: '#8b98a5', pay_pending: '#f5a623',
     needs_attention: '#f4212e', unresponsive: '#6b7686',
     applicants: '#a48bec', calendar: '#1d9bf0', fees: '#f5a623', timeslot: '#00ba7c', schedule: '#69f0ae',
     'fetch fail': '#ff8a3d', '401': '#f4212e'
@@ -335,6 +335,15 @@ export function buildMonitorTabClientScript(): string {
     return !!(s && (s.alreadyBooked || s.phase === 'already_booked'));
   }
 
+  function isPayPending(s){
+    return !!(s && (s.payPending || s.phase === 'pay_pending'));
+  }
+
+  /** Terminal retire states: already booked (1037) or pay pending (1101). */
+  function isTerminalRetired(s){
+    return isAlreadyBooked(s) || isPayPending(s);
+  }
+
   /** Chrome kill/relaunch is expected — do not grey-out / dead-blink the card. */
   function isTransientRecoverPhase(s){
     if (!s) return false;
@@ -344,7 +353,7 @@ export function buildMonitorTabClientScript(): string {
 
   function isClosed(s){
     if (!s) return false;
-    if (isAlreadyBooked(s)) return true;
+    if (isTerminalRetired(s)) return true;
     // During hard relogin Chrome is intentionally killed — keep the card stable.
     if (isTransientRecoverPhase(s)) return false;
     if (s.chromeAlive === false) return true;
@@ -355,7 +364,7 @@ export function buildMonitorTabClientScript(): string {
   /** Errors that need the operator — only while Chrome is still open so they can act. */
   function needsManual(s){
     if (!s) return false;
-    if (isAlreadyBooked(s)) return false;
+    if (isTerminalRetired(s)) return false;
     if (isTransientRecoverPhase(s)) return false;
     if (isClosed(s)) return false;
     // Auto-recovery must not blink — only true operator attention.
@@ -367,12 +376,14 @@ export function buildMonitorTabClientScript(): string {
 
   function tileHtml(s){
     var booked = isAlreadyBooked(s);
+    var payPend = isPayPending(s);
+    var terminal = booked || payPend;
     var paused = !!s.pollingPaused;
     var closed = isClosed(s);
     var step = s.bookingStep || '';
-    var bKind = (!closed && !booked && s.phase === 'booking') ? (bookingKind(step) || bookingKind(s.detail) || s.cardApiBg) : null;
-    var recoverLbl = (!closed && !booked && s.phase === 'recovering') ? recoverLabel(s.detail, s.lastError) : null;
-    var color = PHASE_COLORS[booked ? 'already_booked' : (recoverLbl || bKind || s.phase)] || '#55606b';
+    var bKind = (!closed && !terminal && s.phase === 'booking') ? (bookingKind(step) || bookingKind(s.detail) || s.cardApiBg) : null;
+    var recoverLbl = (!closed && !terminal && s.phase === 'recovering') ? recoverLabel(s.detail, s.lastError) : null;
+    var color = PHASE_COLORS[booked ? 'already_booked' : (payPend ? 'pay_pending' : (recoverLbl || bKind || s.phase))] || '#55606b';
     var attn = (!closed && needsManual(s)) ? ' attn' : '';
     var cap = s.captcha || {};
     var capBadge = '';
@@ -382,11 +393,12 @@ export function buildMonitorTabClientScript(): string {
     var capCounts = ' <span style="color:#6b7686">(' + (cap.solved||0) + '/' + (cap.attempts||0) + ')</span>';
     var detail = s.detail || '';
     if (booked) detail = detail || 'already booked';
+    else if (payPend) detail = detail || 'pay pending';
     else if (recoverLbl) detail = (s.lastError && s.lastError.message) || detail || recoverLbl;
     else if (s.phase === 'booking' && step) detail = step;
     else if (s.lastError && (s.phase === 'stopped' || s.attention || needsManual(s) || closed)) detail = s.lastError.message || detail;
     // Once slot polling has started, prefer the live poll count in this slot.
-    if (!closed && !booked && !recoverLbl && s.phase !== 'booking' && (s.phase === 'polling' || (paused && (s.pollCount || 0) > 0))) {
+    if (!closed && !terminal && !recoverLbl && s.phase !== 'booking' && (s.phase === 'polling' || (paused && (s.pollCount || 0) > 0))) {
       detail = 'poll #' + (s.pollCount || 0);
       if (s.center) detail += ' · ' + s.center;
     }
@@ -402,6 +414,7 @@ export function buildMonitorTabClientScript(): string {
     if (s.lastCode) tip.push('code:' + s.lastCode);
     if (paused) tip.push('polling paused');
     if (booked) tip.push('already booked');
+    else if (payPend) tip.push('pay pending');
     else if (recoverLbl) tip.push(recoverLbl);
     else if (bKind) tip.push(bKind);
     else if (closed) tip.push('bot closed');
@@ -415,35 +428,35 @@ export function buildMonitorTabClientScript(): string {
       // Freeze liveness dot during hard relogin — DevTools probe flaps false→true and was blinking the card.
       chromeDot = '<span style="color:#f5a623" title="Recovering / relaunching">●</span> ';
     } else if (closed) {
-      chromeDot = '<span style="color:#55606b" title="' + (booked ? 'Already booked' : 'Bot closed') + '">●</span> ';
+      chromeDot = '<span style="color:#55606b" title="' + (booked ? 'Already booked' : (payPend ? 'Pay pending' : 'Bot closed')) + '">●</span> ';
     } else if (s.chromeAlive === true) {
       chromeDot = '<span style="color:#00ba7c" title="Chrome DevTools up">●</span> ';
     } else {
       chromeDot = '<span style="color:#55606b" title="Chrome status unknown">●</span> ';
     }
 
-    var pollBtn = (closed || booked)
+    var pollBtn = (closed || terminal)
       ? ''
       : (paused
         ? '<button type="button" class="mon-btn resume" data-action="resume-polling" title="Resume polling (fleet poll-interval stagger)">Resume</button>'
         : '<button type="button" class="mon-btn stop" data-action="pause-polling" title="Stop polling (keep Chrome/session)">Stop</button>');
 
-    var restartBtn = booked
+    var restartBtn = terminal
       ? ''
       : '<button type="button" class="mon-btn restart" data-action="restart" title="Clear session, rotate IP, restart Chrome + bot">Restart</button>';
 
-    var phaseLabel = booked ? 'already booked' : (recoverLbl ? recoverLbl : (closed ? 'closed' : (paused ? 'paused' : (bKind || s.phase))));
-    if (!closed && !booked && !recoverLbl && !bKind && needsManual(s) && !paused) phaseLabel = s.phase === 'stopped' ? 'stopped' : (s.attention && s.attention.reason) || s.phase;
+    var phaseLabel = booked ? 'already booked' : (payPend ? 'pay pending' : (recoverLbl ? recoverLbl : (closed ? 'closed' : (paused ? 'paused' : (bKind || s.phase))));
+    if (!closed && !terminal && !recoverLbl && !bKind && needsManual(s) && !paused) phaseLabel = s.phase === 'stopped' ? 'stopped' : (s.attention && s.attention.reason) || s.phase;
 
     var apiBgKind = null;
-    if (!closed && !booked) {
+    if (!closed && !terminal) {
       if (recoverLbl) apiBgKind = recoverBgClass(recoverLbl);
       else if (bKind) apiBgKind = bKind;
       else if (s.cardApiBg) apiBgKind = s.cardApiBg;
     }
     var apiBg = apiBgKind ? (' bg-' + apiBgKind) : '';
-    var topColor = booked ? '#6b7686' : (recoverLbl ? color : (closed ? '#3a4349' : (needsManual(s) ? '#f4212e' : color)));
-    var phaseColor = booked ? '#8b98a5' : (recoverLbl ? color : (closed ? '#6b7686' : (needsManual(s) ? '#f4212e' : color)));
+    var topColor = booked ? '#6b7686' : (payPend ? '#c48a1a' : (recoverLbl ? color : (closed ? '#3a4349' : (needsManual(s) ? '#f4212e' : color))));
+    var phaseColor = booked ? '#8b98a5' : (payPend ? '#f5a623' : (recoverLbl ? color : (closed ? '#6b7686' : (needsManual(s) ? '#f4212e' : color))));
 
     return '<div class="mon-tile' + attn + apiBg + (paused && !closed ? ' paused' : '') + (closed ? ' dead' : '') + '" data-id="' + s.instanceId + '" title="' + esc(tip.join(' · ') || ('Focus bot #' + s.instanceId)) + '" style="border-top-color:' + topColor + '">' +
       '<span class="phase" style="color:' + phaseColor + '">' + esc(phaseLabel) + '</span>' +

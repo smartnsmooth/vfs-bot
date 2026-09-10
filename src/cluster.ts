@@ -289,6 +289,9 @@ function buildMonitorHooks(): MonitorHooks {
       if (cur?.alreadyBooked || cur?.phase === "already_booked") {
         return { ok: false, error: `Bot #${id} is already booked — restart disabled.` };
       }
+      if (cur?.payPending || cur?.phase === "pay_pending") {
+        return { ok: false, error: `Bot #${id} is pay pending — restart disabled.` };
+      }
       const idx = instances.findIndex((i) => i.id === id);
       if (idx >= 0) {
         const inst = instances[idx]!;
@@ -637,6 +640,8 @@ function spawnBotInstance(instanceId: number, totalInstances: number): ChildProc
         registry.setProcessAlive(id, false);
         if (msg.reason === "already-booked") {
           registry.markAlreadyBooked(id, "already booked");
+        } else if (msg.reason === "pay-pending") {
+          registry.markPayPending(id, "pay pending");
         } else {
           registry.markStopped(id, "retired");
         }

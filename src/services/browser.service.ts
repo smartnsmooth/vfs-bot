@@ -28,6 +28,7 @@ export {
   VfsAlreadyLoggedInError,
   IndDeuAccountRecreateError,
   AlreadyBookedError,
+  PaymentPendingError,
   MissingUrnError,
   isTargetClosedError,
   isFailedToFetchError,

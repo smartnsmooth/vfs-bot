@@ -13,6 +13,7 @@ import type { BrowserService } from "../services/browser.service";
 import {
   VfsRateLimitedError,
   AlreadyBookedError,
+  PaymentPendingError,
   VfsForbiddenError,
   VfsUnauthorizedError,
   IndDeuAccountRecreateError,
@@ -53,6 +54,7 @@ import { reporter } from "../monitoring/statusReporter";
 function isUnrecoverableHere(err: unknown): boolean {
   return (
     err instanceof AlreadyBookedError ||
+    err instanceof PaymentPendingError ||
     err instanceof VfsRateLimitedError ||
     err instanceof VfsUnauthorizedError ||
     err instanceof VfsForbiddenError ||

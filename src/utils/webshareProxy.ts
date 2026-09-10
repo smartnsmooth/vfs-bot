@@ -35,8 +35,6 @@ export function isWebshareConfigured(): { ok: boolean; error?: string } {
 
 const DEFAULT_MAX_STICKY_SESSION = 100;
 
-const DEFAULT_MAX_STICKY_SESSION = 100;
-
 /**
  * Sticky session pool size (IP count). `WEBSHARE_MAX_STICKY_SESSION` in `.env`.
  * Backbone plans typically cap at 100 (101+ → HTTP 407).

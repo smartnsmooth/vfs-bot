@@ -18,6 +18,7 @@ export type BotPhase =
   | "recovering"
   | "stopped"
   | "already_booked"
+  | "pay_pending"
   | "needs_attention"
   | "unresponsive";
 
@@ -109,10 +110,15 @@ export interface InstanceStatus {
   /** Sticky Monitor card background after the last applicants/calendar/timeslot/schedule (or polling) call. */
   cardApiBg: ApiFlashKind | null;
   /**
-   * True when applicants/schedule returned already-booked (1037) or payment pending (1101).
+   * True when applicants/schedule returned already-booked (1037).
    * Monitor shows "already booked" and hides Restart.
    */
   alreadyBooked: boolean;
+  /**
+   * True when save-applicants returned payment pending (1101).
+   * Monitor shows "pay pending" and hides Restart; bot stops without archiving to already-booked/.
+   */
+  payPending: boolean;
   startedAt: number;
   heartbeatAt: number;
   updatedAt: number;
@@ -146,6 +152,7 @@ export function makeInitialStatus(instanceId: number, debugPort: number | null):
     apiFlash: null,
     cardApiBg: null,
     alreadyBooked: false,
+    payPending: false,
     startedAt: now,
     heartbeatAt: now,
     updatedAt: now,

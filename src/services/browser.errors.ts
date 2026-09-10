@@ -66,7 +66,7 @@ export class VfsGatewayTimeoutError extends Error {
 /**
  * Thrown when VFS returns a 429 family rate-limit (HTTP or body code).
  * - kind "account" (4290XX) → stop the bot (User ID / account restricted)
- * - kind "ip" (4292XX / other 429) → rotate IP without relogin first; escalate on repeat
+ * - kind "ip" (4292XX / other 429) → hard relogin (kill Chrome, clear session, rotate IP)
  */
 export class VfsRateLimitedError extends Error {
     readonly kind: Vfs429Kind;
@@ -94,11 +94,18 @@ export class MissingUrnError extends Error {
         this.name = "MissingUrnError";
     }
 }
-/** Thrown when lift-api /appointment/schedule indicates the applicant is already booked. */
+/** Thrown when lift-api applicants/schedule indicates the applicant is already booked (1037). */
 export class AlreadyBookedError extends Error {
     constructor(message: string) {
         super(message);
         this.name = "AlreadyBookedError";
+    }
+}
+/** Thrown when lift-api save-applicants returns payment pending (1101). Terminal — stop bot, no archive file. */
+export class PaymentPendingError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "PaymentPendingError";
     }
 }
 /** Returns true when the error is Playwright's "Target closed" family of errors. */

@@ -63,6 +63,19 @@ class StatusReporter {
     if (detail != null) this.status.detail = detail;
     if (phase === "already_booked") {
       this.status.alreadyBooked = true;
+      this.status.payPending = false;
+      this.status.attention = null;
+      this.status.pollingPaused = false;
+      if (this.status.captcha.last === "waiting") {
+        this.status.captcha.last = "n/a";
+        this.status.captcha.waitingUntil = null;
+      }
+      this.flushNow();
+      return;
+    }
+    if (phase === "pay_pending") {
+      this.status.payPending = true;
+      this.status.alreadyBooked = false;
       this.status.attention = null;
       this.status.pollingPaused = false;
       if (this.status.captcha.last === "waiting") {

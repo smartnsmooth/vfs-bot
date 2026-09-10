@@ -35,9 +35,16 @@ class StatusRegistry {
 
   applyStatus(status: InstanceStatus): void {
     const prev = this.map.get(status.instanceId);
-    // Terminal already-booked: ignore late child heartbeats / status noise.
+    // Terminal already-booked / pay-pending: ignore late child heartbeats / status noise.
     if (prev?.alreadyBooked || prev?.phase === "already_booked") {
       if (status.alreadyBooked || status.phase === "already_booked") {
+        // allow enriching detail only
+      } else {
+        return;
+      }
+    }
+    if (prev?.payPending || prev?.phase === "pay_pending") {
+      if (status.payPending || status.phase === "pay_pending") {
         // allow enriching detail only
       } else {
         return;
@@ -55,11 +62,24 @@ class StatusRegistry {
           status.phase === "already_booked" ||
           prev?.phase === "already_booked"
       ),
+      payPending: Boolean(
+        status.payPending ||
+          prev?.payPending ||
+          status.phase === "pay_pending" ||
+          prev?.phase === "pay_pending"
+      ),
     };
     if (merged.alreadyBooked) {
       merged.phase = "already_booked";
       if (!merged.detail?.trim() || /retired/i.test(merged.detail)) {
         merged.detail = "already booked";
+      }
+      merged.attention = null;
+      merged.payPending = false;
+    } else if (merged.payPending) {
+      merged.phase = "pay_pending";
+      if (!merged.detail?.trim() || /retired/i.test(merged.detail)) {
+        merged.detail = "pay pending";
       }
       merged.attention = null;
     }
@@ -102,8 +122,8 @@ class StatusRegistry {
     }
 
     if (!patch.chromeAlive) {
-      // Keep already-booked terminal state as-is.
-      if (next.alreadyBooked || next.phase === "already_booked") {
+      // Keep already-booked / pay-pending terminal state as-is.
+      if (next.alreadyBooked || next.phase === "already_booked" || next.payPending || next.phase === "pay_pending") {
         if (next.chromeAlive !== false) {
           next.chromeAlive = false;
           changed = true;
@@ -158,8 +178,9 @@ class StatusRegistry {
   markStopped(instanceId: number, detail = "stopped"): void {
     const cur = this.map.get(instanceId);
     if (!cur) return;
-    // Already-booked is terminal — do not overwrite with generic exit/stop noise.
+    // Already-booked / pay-pending are terminal — do not overwrite with generic exit/stop noise.
     if (cur.alreadyBooked || cur.phase === "already_booked") return;
+    if (cur.payPending || cur.phase === "pay_pending") return;
     // If already relaunched (phase launching after Restart), do not overwrite with stopped+old blink state.
     if (cur.phase === "launching" && /restart/i.test(cur.detail)) return;
     const next: InstanceStatus = {
@@ -179,7 +200,7 @@ class StatusRegistry {
     this.notify(next);
   }
 
-  /** Applicants/schedule 1037 / 1101 — terminal; hide Restart on Monitor. */
+  /** Applicants/schedule 1037 — terminal; hide Restart on Monitor; archive to already-booked/. */
   markAlreadyBooked(instanceId: number, detail = "already booked"): void {
     const cur = this.map.get(instanceId);
     if (!cur) return;
@@ -194,6 +215,33 @@ class StatusRegistry {
       detail: detail.trim() || "already booked",
       attention: null,
       alreadyBooked: true,
+      payPending: false,
+      processAlive: false,
+      chromeAlive: false,
+      pollingPaused: false,
+      preferMinimized: false,
+      updatedAt: Date.now(),
+    };
+    this.map.set(instanceId, next);
+    this.notify(next);
+  }
+
+  /** Save-applicants 1101 — terminal; hide Restart on Monitor; do not archive. */
+  markPayPending(instanceId: number, detail = "pay pending"): void {
+    const cur = this.map.get(instanceId);
+    if (!cur) return;
+    const next: InstanceStatus = {
+      ...cur,
+      captcha: {
+        ...cur.captcha,
+        last: cur.captcha.last === "waiting" ? "n/a" : cur.captcha.last,
+        waitingUntil: null,
+      },
+      phase: "pay_pending",
+      detail: detail.trim() || "pay pending",
+      attention: null,
+      alreadyBooked: false,
+      payPending: true,
       processAlive: false,
       chromeAlive: false,
       pollingPaused: false,
@@ -235,8 +283,8 @@ class StatusRegistry {
   private sweep(): void {
     const now = Date.now();
     for (const status of this.map.values()) {
-      if (status.phase === "stopped" || status.phase === "payment" || status.phase === "already_booked") continue;
-      if (status.alreadyBooked) continue;
+      if (status.phase === "stopped" || status.phase === "payment" || status.phase === "already_booked" || status.phase === "pay_pending") continue;
+      if (status.alreadyBooked || status.payPending) continue;
       if (status.phase === "unresponsive") continue;
       if (!status.processAlive) continue;
       if (now - status.heartbeatAt > STALE_MS) {

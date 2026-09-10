@@ -141,7 +141,8 @@ function extractCompact429202(body: string): string | null {
  * Codes that use the compact one-line response (no JSON body):
  * - any kind: 409 (Repeated Delay), 401, 429202
  * - polling: 1035
- * - applicants: 1101, 504
+ * - applicants: 1101, 10673, 1037, 504
+ * - schedule: 1035
  */
 function compactLogCode(
   kind: ApiCallLogKind,
@@ -164,10 +165,16 @@ function compactLogCode(
   if (kind === "applicants") {
     const vfs = extractVfsErrorCode(body);
     if (vfs === 1101) return 1101;
+    if (vfs === 10673) return 10673;
+    if (vfs === 1037) return 1037;
     if (httpStatus === 504) return 504;
     if (problem === 504) return 504;
     const gateway = extractGatewayStatusCode(body);
     if (gateway === 504) return 504;
+  }
+  if (kind === "schedule") {
+    const code = extractVfsErrorCode(body);
+    return code === 1035 ? 1035 : null;
   }
   return null;
 }
@@ -192,6 +199,43 @@ function formatResponseBlock(body: string): string {
   }
 }
 
+/** Slim request payload for calendar / timeslot / schedule logs. */
+function formatPayloadBlock(kind: ApiCallLogKind, requestPayload: string): string {
+  try {
+    const parsed = JSON.parse(requestPayload) as Record<string, unknown>;
+    if (kind === "calendar") {
+      return formatResponseBlock(JSON.stringify({ fromDate: parsed.fromDate ?? "" }));
+    }
+    if (kind === "timeslot") {
+      return formatResponseBlock(JSON.stringify({ urn: parsed.urn ?? "" }));
+    }
+    if (kind === "schedule") {
+      return formatResponseBlock(
+        JSON.stringify({
+          urn: parsed.urn ?? "",
+          allocationId: parsed.allocationId ?? "",
+        })
+      );
+    }
+  } catch {
+    /* fall through to full payload */
+  }
+  return formatResponseBlock(requestPayload);
+}
+
+/** Slim response body for calendar (calendars only). */
+function formatKindResponseBlock(kind: ApiCallLogKind, body: string): string {
+  if (kind === "calendar") {
+    try {
+      const parsed = JSON.parse(body) as { calendars?: unknown };
+      return formatResponseBlock(JSON.stringify(parsed.calendars ?? null));
+    } catch {
+      /* fall through */
+    }
+  }
+  return formatResponseBlock(body);
+}
+
 /** Append one API call entry to `./log.txt`. Always writes a response block. */
 export function logApiCall(
   kind: ApiCallLogKind,
@@ -209,7 +253,7 @@ export function logApiCall(
     (kind === "calendar" || kind === "timeslot" || kind === "schedule") &&
     requestPayload != null
   ) {
-    entry += `   payload:\n${formatResponseBlock(requestPayload)}\n`;
+    entry += `   payload:\n${formatPayloadBlock(kind, requestPayload)}\n`;
   }
 
   if (opts?.error) {
@@ -223,7 +267,7 @@ export function logApiCall(
     entry += `   response:   -> ${compactCode}     -> ${responseTime}\n`;
   } else {
     entry += `   response:   -> ${responseTime}\n`;
-    entry += `${formatResponseBlock(body)}\n`;
+    entry += `${formatKindResponseBlock(kind, body)}\n`;
   }
 
   try {

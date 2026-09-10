@@ -1,7 +1,7 @@
 /**
  * VFS rate-limit codes (429xxx):
  * - 4290XX → account / User ID restricted — stop the bot
- * - 4292XX → IP restricted — rotate proxy without relogin first; escalate on repeat
+ * - 4292XX → IP restricted — hard relogin (kill Chrome, clear session, rotate IP)
  * - other 429* / bare HTTP 429 → treated like 4292XX (IP recovery path)
  */
 

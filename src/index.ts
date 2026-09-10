@@ -10,7 +10,7 @@ import path from "node:path";
 import { config, setCurrentInstanceId, getCurrentInstanceId } from "./config/config";
 import { classifyVfsFirstTabUrl, isVfsDashboardUrl } from "./flows/vfsTabUrl";
 import { PollingService } from "./services/polling.service";
-import { BrowserService, VfsForbiddenError, VfsGatewayTimeoutError, VfsRateLimitedError, VfsUnauthorizedError, VfsAlreadyLoggedInError, IndDeuAccountRecreateError, AlreadyBookedError, MissingUrnError, isFailedToFetchError } from "./services/browser.service";
+import { BrowserService, VfsForbiddenError, VfsGatewayTimeoutError, VfsRateLimitedError, VfsUnauthorizedError, VfsAlreadyLoggedInError, IndDeuAccountRecreateError, AlreadyBookedError, PaymentPendingError, MissingUrnError, isFailedToFetchError } from "./services/browser.service";
 import { TelegramService } from "./services/telegram.service";
 import {
   runApplicantFormWithSubmitHandler,
@@ -79,6 +79,7 @@ import {
   getFleetPollIntervalSec,
   getFleetPollStepMs,
   getFleetWorkerIds,
+  getRepeatedDelayMs,
   isPreparedForFleetPolling,
   normalizeFleetInstanceId,
   resolveApologiesIntervalSec,
@@ -92,6 +93,7 @@ import {
   ensureApplicantsWave,
   isApplicantsUrnUnlocked,
   markApplicantsUrnUnlocked,
+  nextApplicantsAttemptTargetMs,
   resetApplicantsWave,
 } from "./utils/applicantsCoord";
 import {
@@ -282,8 +284,9 @@ async function recoverFromCloudflareChallenge(
 }
 
 /**
- * After a soft (4292XX) IP rotate, the next 429 of any kind triggers full relogin + cache clear.
- * Cleared on successful recovery escalations and on account-block stop.
+ * After a soft IP rotate (e.g. fetch-fail), the next escalation triggers full relogin.
+ * Cleared on hard recovery escalations and on account-block stop.
+ * IP rate-limit (4292xx) always hard-relogins immediately (does not use soft rotate).
  */
 let softIpRotateAwaitingSecond429 = false;
 
@@ -466,34 +469,16 @@ async function rotateIpWithoutRelogin(context: string): Promise<boolean> {
 }
 
 /**
- * Handle 4292XX / IP rate-limit after login via hard relogin
+ * Handle 4292XX / IP rate-limit via hard relogin
  * (kill Chrome, clear cache/cookies, rotate IP, new Chrome, login).
  */
 async function handleIpRateLimitRecovery(
   instanceId: number | undefined,
   context: string,
   code?: string
-): Promise<"soft_rotate" | "full_relogin"> {
+): Promise<"full_relogin"> {
   const label = code ?? "4292xx";
   reporter.setPoll({ code: label });
-
-  // 4292xx restricts the exit IP, not the account. Swap the IP while keeping the logged-in
-  // session (and the URN) first; only escalate when that already failed once.
-  if (!softIpRotateAwaitingSecond429) {
-    reporter.setPhase("recovering", `IP rate-limit ${label} — rotating IP`);
-    await telegram
-      .alert(
-        "error",
-        `Bot ${instanceId ?? "?"} got IP rate-limit ${label} (${context}). Rotating IP, keeping session...`
-      )
-      .catch(() => { });
-    if (await rotateIpWithoutRelogin(`${context}-ip-rate-limit`)) {
-      await telegram
-        .alert("info", `Bot ${instanceId ?? "?"} rotated IP after ${label} — session kept, resuming.`)
-        .catch(() => { });
-      return "soft_rotate";
-    }
-  }
 
   clearSoftIpRotateFlag();
   reporter.setPhase("recovering", `IP rate-limit ${label} — hard relogin`);
@@ -551,6 +536,35 @@ async function retireInstanceForAlreadyBooked(instanceId: number | undefined, re
   if (typeof process.send === "function") {
     try {
       process.send({ type: "instance-retired", reason: "already-booked", instanceId: id });
+    } catch {
+      /* ignore */
+    }
+  }
+
+  await browser.disconnectCdp().catch(() => { });
+  killChromeTreeByCdpPortSync(getRemoteDebuggingPort());
+  process.exit(0);
+}
+
+async function retireInstanceForPaymentPending(instanceId: number | undefined, reason?: string): Promise<never> {
+  instanceStopped = true;
+  const label = "pay pending";
+  reporter.setAttention(null);
+  reporter.setPhase("pay_pending", label);
+
+  const id = typeof instanceId === "number" && Number.isFinite(instanceId) && instanceId >= 1
+    ? Math.floor(instanceId)
+    : parseInt(process.env.BOT_INSTANCE_ID ?? "1", 10) || 1;
+
+  try { retireFromFleet(id); } catch { /* ignore */ }
+
+  await telegram
+    .alert("info", `Bot ${instanceId ?? "?"} ${label} — instance shutting down (not archived).`)
+    .catch(() => { });
+
+  if (typeof process.send === "function") {
+    try {
+      process.send({ type: "instance-retired", reason: "pay-pending", instanceId: id });
     } catch {
       /* ignore */
     }
@@ -1824,42 +1838,56 @@ async function runPollLoop(
 
 
         if (gatewayTimeout) {
+          if (await checkPeerFoundSlotAndJoinBooking(instanceId, slotWatcher.cachedState())) {
+            return true;
+          }
           reporter.setPhase("recovering", "504 Gateway Timeout — continuing");
-          await telegram.alert("error", `Bot ${instanceId ?? "?"} got 504 Gateway Timeout during polling — continuing.`).catch(() => { });
+          void telegram
+            .alert("error", `Bot ${instanceId ?? "?"} got 504 Gateway Timeout during polling — continuing.`)
+            .catch(() => { });
           continue;
         }
 
         if (fetchFailed) {
+          if (await checkPeerFoundSlotAndJoinBooking(instanceId, slotWatcher.cachedState())) {
+            return true;
+          }
           reporter.setRecoveringError("fetch fail", "Failed to fetch — hard relogin (proxy/network)");
-          await telegram
+          void telegram
             .alert(
               "error",
               `Bot ${instanceId ?? "?"} got Failed to fetch during polling (proxy/network). Clearing session + rotating IP + restarting Chrome...`
             )
             .catch(() => { });
           await performHardRelogin(instanceId, "failed-to-fetch-polling");
-          await telegram
+          void telegram
             .alert("info", `Bot ${instanceId ?? "?"} recovered from Failed to fetch — polling resumed.`)
             .catch(() => { });
           continue;
         }
 
         if (cloudflareChallenge) {
+          if (await checkPeerFoundSlotAndJoinBooking(instanceId, slotWatcher.cachedState())) {
+            return true;
+          }
           reporter.setPhase("recovering", "Cloudflare challenge — recovering");
-          await telegram
+          void telegram
             .alert(
               "error",
               `Bot ${instanceId ?? "?"} got Cloudflare challenge on CheckIsSlotAvailable. Clearing cookies/session + rotating IP + restarting Chrome...`
             )
             .catch(() => { });
           await recoverFromCloudflareChallenge(instanceId, "cloudflare-challenge-polling");
-          await telegram
+          void telegram
             .alert("info", `Bot ${instanceId ?? "?"} recovered from Cloudflare challenge — polling resumed.`)
             .catch(() => { });
           continue;
         }
 
         if (forbidden) {
+          if (await checkPeerFoundSlotAndJoinBooking(instanceId, slotWatcher.cachedState())) {
+            return true;
+          }
           if (
             accountRecreate &&
             isIndDeuRoute(config.slotPayload.countryCode, config.slotPayload.missionCode)
@@ -1868,22 +1896,29 @@ async function runPollLoop(
             continue;
           }
           reporter.setPhase("recovering", "403 Forbidden — rotating IP + relogin");
-          await telegram.alert("error", `Bot ${instanceId ?? "?"} got 403 Forbidden during polling. Restarting browser + rotating IP...`).catch(() => { });
+          void telegram
+            .alert("error", `Bot ${instanceId ?? "?"} got 403 Forbidden during polling. Restarting browser + rotating IP...`)
+            .catch(() => { });
           await performHardRelogin(instanceId, "403-forbidden-recovery");
-          await telegram.alert("info", `Bot ${instanceId ?? "?"} recovered from 403 — polling resumed.`).catch(() => { });
+          void telegram
+            .alert("info", `Bot ${instanceId ?? "?"} recovered from 403 — polling resumed.`)
+            .catch(() => { });
           continue;
         }
 
         if (unauthorized) {
+          if (await checkPeerFoundSlotAndJoinBooking(instanceId, slotWatcher.cachedState())) {
+            return true;
+          }
           reporter.setRecoveringError("401", "401 Unauthorized — hard relogin");
-          await telegram
+          void telegram
             .alert(
               "error",
               `Bot ${instanceId ?? "?"} got 401 Unauthorized during polling (VFS session expired). Restarting browser + rotating IP + relogin...`
             )
             .catch(() => { });
           await performHardRelogin(instanceId, "401-unauthorized-recovery");
-          await telegram
+          void telegram
             .alert("info", `Bot ${instanceId ?? "?"} recovered from 401 — polling resumed.`)
             .catch(() => { });
           continue;
@@ -1895,6 +1930,9 @@ async function runPollLoop(
         }
 
         if (rateLimitedIp) {
+          if (await checkPeerFoundSlotAndJoinBooking(instanceId, slotWatcher.cachedState())) {
+            return true;
+          }
           await handleIpRateLimitRecovery(instanceId, "polling", rateLimitCode);
           continue;
         }
@@ -1925,7 +1963,10 @@ async function runPollLoop(
           return true;
         }
 
-        await telegram.alert("no_slot_found", `No slot in Center ${center.centerNumber} (${center.vacCode})`).catch(() => { });
+        // Do not await — Telegram must not delay joining a peer slot → applicants.
+        void telegram
+          .alert("no_slot_found", `No slot in Center ${center.centerNumber} (${center.vacCode})`)
+          .catch(() => { });
       } catch (err) {
         if (isFailedToFetchError(err)) {
           reporter.setRecoveringError("fetch fail", "Failed to fetch — hard relogin (proxy/network)");
@@ -2177,11 +2218,7 @@ async function recoverBookingChainFromIpRateLimit(
   err: VfsRateLimitedError,
   slotStateCache?: SlotFoundState
 ): Promise<boolean> {
-  const mode = await handleIpRateLimitRecovery(instanceId, context, err.code);
-  if (mode === "soft_rotate") {
-    // Session and URN survived the IP swap — resume booking without re-polling.
-    return runBookingChainWithRetry(instanceId, slotStateCache);
-  }
+  await handleIpRateLimitRecovery(instanceId, context, err.code);
   clearSlotCenterOverride();
   clearSlotDate();
   if (!(await runSlotPollUnlessAreLva(instanceId, pollLoopReloginOpts(instanceId)))) {
@@ -2455,8 +2492,23 @@ function isApologies1036SlotState(cache?: SlotFoundState | null): boolean {
 }
 
 /**
- * Wait until this bot's round-robin applicants slot (1036 only), or until a peer
- * unlocks URN (immediate wake), or abort. Real slot hits skip round-robin wait.
+ * Round-robin step for applicants retries: at least apologiesInterval, and large
+ * enough that the same bot's next turn is ≥ 409 delay (repeatedDelaySec, default 35s).
+ */
+function applicantsRetryStepMs(numInstances: number): number {
+  const n = Math.max(1, Math.floor(numInstances));
+  const apologies = getApologiesIntervalMs();
+  const minStepFor409 = Math.ceil(getRepeatedDelayMs() / n);
+  return Math.max(apologies, minStepFor409);
+}
+
+/**
+ * Wait until this bot's round-robin applicants slot, or until a peer unlocks URN
+ * (immediate wake), or abort.
+ *
+ * First try on a real slot hit skips the gate. Retries (10673 / other failures)
+ * and poll-1036 waves always round-robin so the same bot does not re-hit
+ * applicants inside the VFS 409 window (~35s).
  */
 async function waitForApplicantsStaggerGate(opts: {
   instanceId?: number;
@@ -2465,7 +2517,8 @@ async function waitForApplicantsStaggerGate(opts: {
   useApologiesInterval: boolean;
 }): Promise<"ready" | "urn_unlocked" | "abort"> {
   if (isApplicantsUrnUnlocked()) return "urn_unlocked";
-  if (!opts.useApologiesInterval) return "ready";
+  const isRetry = opts.attemptIndex > 0;
+  if (!opts.useApologiesInterval && !isRetry) return "ready";
 
   const id =
     typeof opts.instanceId === "number" && Number.isFinite(opts.instanceId) && opts.instanceId >= 1
@@ -2473,13 +2526,12 @@ async function waitForApplicantsStaggerGate(opts: {
       : 1;
   const workers = getFleetWorkerIds();
   const rank = workers.indexOf(id);
-  const stepMs = getApologiesIntervalMs();
-  const targetAt = applicantsAttemptTargetMs(
-    rank >= 0 ? rank + 1 : id,
-    opts.attemptIndex,
-    stepMs,
-    workers.length
-  );
+  const rankId = rank >= 0 ? rank + 1 : id;
+  const stepMs = isRetry ? applicantsRetryStepMs(workers.length) : getApologiesIntervalMs();
+  // Retries: next future turn under the 409-safe step (not attempt×cycle, which overshoots).
+  const targetAt = isRetry
+    ? nextApplicantsAttemptTargetMs(rankId, 0, stepMs, workers.length)
+    : applicantsAttemptTargetMs(rankId, opts.attemptIndex, stepMs, workers.length);
   const remainingMs = Math.max(0, targetAt - Date.now());
 
   if (remainingMs <= 0) return "ready";
@@ -2504,12 +2556,13 @@ async function waitForApplicantsStaggerGate(opts: {
 }
 
 /**
- * Try save-applicants with fleet round-robin on poll 1036 (apologiesIntervalSec from setup form):
- * bot 1, then bot 2 after interval, … Real slot hits go to applicants immediately.
- * During apologies round-robin, when any bot gets a URN, peers wake and call
- * save-applicants immediately (no join stagger).
+ * Try save-applicants with fleet round-robin:
+ * - Poll 1036: spaced by apologiesIntervalSec from the first try.
+ * - Real slot / are-lva: first try immediate; retries (10673 etc.) round-robin
+ *   with a step that keeps each bot ≥ 409 delay (repeatedDelaySec) apart.
+ * When any bot gets a URN, peers wake and call save-applicants immediately.
  *
- * - **10673**: up to `pollReloginInterval` staggered tries, then hard relogin + slot poll, forever.
+ * - **10673**: up to `pollReloginInterval` round-robin tries, then hard relogin + slot poll, forever.
  * - **Other errors**: up to MAX_SAVE_APPLICANTS_RETRIES (8), then hard relogin + poll.
  */
 /**
@@ -2571,6 +2624,9 @@ async function runSaveApplicantsUntilUrn(opts: {
 
       if (err instanceof AlreadyBookedError) {
         await retireInstanceForAlreadyBooked(instanceId, err.message);
+      }
+      if (err instanceof PaymentPendingError) {
+        await retireInstanceForPaymentPending(instanceId, err.message);
       }
       if (err instanceof VfsRateLimitedError) {
         if (err.isAccountBlock) {
@@ -2683,9 +2739,9 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
 
   const useApologiesInterval = isAreLvaCurrent() ? false : isApologies1036SlotState(slotStateCache);
 
-  // Real slot hits: every bot goes to save-applicants immediately (no join stagger).
-  // Poll 1036: apologies round-robin below spaces applicants instead.
-  // are-lva: no slot poll — all bots call applicants at once after post-login delay.
+  // Real slot / are-lva: first save-applicants is immediate; retries round-robin
+  // (avoids VFS 409 from re-calling applicants within ~35s).
+  // Poll 1036: apologies round-robin from the first try.
 
   for (; ;) {
     const saved = await runSaveApplicantsUntilUrn({
@@ -2722,6 +2778,9 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
       }
       if (err instanceof AlreadyBookedError) {
         await retireInstanceForAlreadyBooked(instanceId, err.message);
+      }
+      if (err instanceof PaymentPendingError) {
+        await retireInstanceForPaymentPending(instanceId, err.message);
       }
       if (err instanceof VfsRateLimitedError) {
         if (err.isAccountBlock) {
@@ -3096,6 +3155,9 @@ async function runOneBotCycleCore(meta: SubmitMeta): Promise<void> {
         instanceBookingActive = false;
         if (err instanceof AlreadyBookedError) {
           await retireInstanceForAlreadyBooked(instanceId, err.message);
+        }
+        if (err instanceof PaymentPendingError) {
+          await retireInstanceForPaymentPending(instanceId, err.message);
         }
         if (isSaveApplicantsFailure(err)) {
           if (!(await recoverFromSaveApplicantsFailure(instanceId, "save-applicants-failure", err))) {
