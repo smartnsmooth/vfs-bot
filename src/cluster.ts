@@ -9,6 +9,7 @@ import { setSessionLoginCredentials, getAllInstanceCredentials } from "./utils/s
 import { setApplicantDetailsOverrides, getAllInstanceApplicantDetails, getApplicantDetailsOverrides } from "./utils/applicantDetails.store";
 import { TelegramService } from "./services/telegram.service";
 import {
+  killChromeTreeAndWaitUntilGone,
   killChromeTreeByCdpPortRangeSync,
   killChromeTreeByCdpPortSync,
 } from "./utils/killChromeByCdpPort";
@@ -126,7 +127,7 @@ function seedRegistry(id: number): void {
 }
 
 /** Send the run-bot-cycle now (spawns Chrome for this instance). */
-function sendStartNow(id: number): void {
+function sendStartNow(id: number, opts?: { forceNewChrome?: boolean }): void {
   const inst = instances.find((i) => i.id === id);
   if (!inst || !inst.process || inst.process.killed) {
         return;
@@ -137,7 +138,12 @@ function sendStartNow(id: number): void {
     registry.applyStatus({ ...cur, phase: "launching", detail: "starting…", heartbeatAt: Date.now(), updatedAt: Date.now() });
   }
   inst.process.send({ type: "config-updated", instanceId: id });
-  inst.process.send({ type: "run-bot-cycle", instanceId: id, pollStartAt: rolloutPollStartAt });
+  inst.process.send({
+    type: "run-bot-cycle",
+    instanceId: id,
+    pollStartAt: rolloutPollStartAt,
+    forceNewChrome: opts?.forceNewChrome === true,
+  });
 }
 
 /** Delay before re-running a cycle that ended without a booking. */
@@ -296,17 +302,15 @@ function buildMonitorHooks(): MonitorHooks {
       if (idx >= 0) {
         const inst = instances[idx]!;
         if (inst.process && !inst.process.killed) inst.process.kill("SIGTERM");
+        // Detach so late status IPC from the dying child cannot restore captcha attention.
+        inst.process = null;
       }
-      // Close this instance's Chrome so we can wipe cookies/session and rotate IP.
-      try {
-        killChromeTreeByCdpPortSync(debugPortForInstance(id));
-      } catch {
-        /* ignore */
-      }
+      cancelCycleRestart(id);
       const profileDir = profileDirForInstance(id);
+      const debugPort = debugPortForInstance(id);
       bumpProxyRotationOnDisk(profileDir);
       registry.applyStatus({
-        ...makeInitialStatus(id, debugPortForInstance(id)),
+        ...makeInitialStatus(id, debugPort),
         phase: "launching",
         detail: "restarting…",
         processAlive: true,
@@ -316,12 +320,23 @@ function buildMonitorHooks(): MonitorHooks {
       });
       const total = Math.max(currentNumInstances, id);
       void (async () => {
+        // Must fully kill Chrome before session wipe — otherwise cookies stay locked
+        // and the new bot can reconnect to the same captcha window via DevTools.
+        try {
+          await killChromeTreeAndWaitUntilGone(debugPort);
+        } catch {
+          try {
+            killChromeTreeByCdpPortSync(debugPort);
+          } catch {
+            /* ignore */
+          }
+        }
         try {
           await clearChromeSessionDataBeforeLaunch(profileDir);
         } catch {
           /* ignore */
         }
-        const child = spawnBotInstance(id, total);
+        const child = spawnBotInstance(id, total, { forceNewChrome: true });
         if (idx >= 0) {
           instances[idx]!.process = child;
           instances[idx]!.profileDir = profileDir;
@@ -329,12 +344,12 @@ function buildMonitorHooks(): MonitorHooks {
           instances.push({
             id,
             process: child,
-            debugPort: debugPortForInstance(id),
+            debugPort,
             profileDir,
             queue: Promise.resolve(),
           });
         }
-        setTimeout(() => sendStartNow(id), 1500);
+        setTimeout(() => sendStartNow(id, { forceNewChrome: true }), 1500);
       })();
       return { ok: true };
     },
@@ -591,11 +606,15 @@ async function startFormServer(): Promise<void> {
   });
 }
 
-function spawnBotInstance(instanceId: number, totalInstances: number): ChildProcess {
+function spawnBotInstance(
+  instanceId: number,
+  totalInstances: number,
+  opts?: { forceNewChrome?: boolean }
+): ChildProcess {
   const debugPort = BASE_DEBUGGING_PORT + instanceId - 1;
   const profileDir = `${BASE_PROFILE_DIR}-${instanceId}`;
 
-  const env = {
+  const env: NodeJS.ProcessEnv = {
     ...process.env,
     BOT_INSTANCE_ID: String(instanceId),
     BOT_TOTAL_INSTANCES: String(totalInstances),
@@ -603,6 +622,9 @@ function spawnBotInstance(instanceId: number, totalInstances: number): ChildProc
     CHROME_USER_DATA_DIR: profileDir,
     BOT_CLUSTER_MODE: "true",
   };
+  if (opts?.forceNewChrome) {
+    env.BOT_FORCE_NEW_CHROME = "1";
+  }
 
   const child = spawn(process.execPath, ["dist/index.js"], {
     env,
@@ -624,6 +646,11 @@ function spawnBotInstance(instanceId: number, totalInstances: number): ChildProc
   });
 
   child.on("message", (msg: any) => {
+    // Ignore IPC from a killed child after Monitor Restart replaced the process.
+    const live = instances.find((i) => i.id === instanceId);
+    if (!live || live.process !== child) {
+      return;
+    }
     if (msg?.type === "bot-cycle-complete") {
       if (!msg.settled) {
         scheduleCycleRestart(instanceId, msg.reason ? String(msg.reason) : "no booking");

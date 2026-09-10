@@ -1,5 +1,6 @@
 import { exec, execSync } from "node:child_process";
 import { promisify } from "node:util";
+import { get as httpGet } from "node:http";
 const execAsync = promisify(exec);
 
 /**
@@ -44,6 +45,41 @@ function buildKillCommand(port: number): { cmd: string; shell?: string } {
   return { cmd };
 }
 
+function isDevToolsReachable(port: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const req = httpGet(
+      {
+        host: "127.0.0.1",
+        port,
+        path: "/json/version",
+        timeout: 800,
+      },
+      (res) => {
+        resolve(res.statusCode != null && res.statusCode >= 200 && res.statusCode < 300);
+        res.destroy();
+      }
+    );
+    req.on("error", () => resolve(false));
+    req.on("timeout", () => {
+      req.destroy();
+      resolve(false);
+    });
+  });
+}
+
+/** Poll until DevTools on this port is gone (Chrome fully dead). */
+export async function waitUntilChromeDevToolsGone(
+  port: number,
+  timeoutMs = 15_000
+): Promise<boolean> {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    if (!(await isDevToolsReachable(port))) return true;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  return !(await isDevToolsReachable(port));
+}
+
 /** Synchronous kill — safe to call from `process.on('exit', ...)`. */
 export function killChromeTreeByCdpPortSync(port: number): void {
   try {
@@ -62,6 +98,31 @@ export async function killChromeTreeByCdpPort(port: number): Promise<void> {
   } catch {
     // Best effort — Chrome may already be gone (killed by another process/instance during shutdown race).
   }
+}
+
+/**
+ * Kill Chrome for this CDP port and wait until DevTools is unreachable.
+ * Retries kill if the port stays alive (zombie / slow shutdown).
+ */
+export async function killChromeTreeAndWaitUntilGone(
+  port: number,
+  opts?: { timeoutMs?: number }
+): Promise<void> {
+  const timeoutMs = opts?.timeoutMs ?? 15_000;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await killChromeTreeByCdpPort(port);
+    killChromeTreeByCdpPortSync(port);
+    if (await waitUntilChromeDevToolsGone(port, Math.min(3_000, Math.max(0, deadline - Date.now())))) {
+      // Brief settle so profile files unlock on Windows.
+      await new Promise((r) => setTimeout(r, 400));
+      if (!(await isDevToolsReachable(port))) return;
+    }
+  }
+  // Last attempt — caller may still proceed; session wipe can fail if locked.
+  await killChromeTreeByCdpPort(port);
+  killChromeTreeByCdpPortSync(port);
+  await waitUntilChromeDevToolsGone(port, 2_000);
 }
 
 /** Kill a contiguous range of CDP ports (used by cluster mode). */

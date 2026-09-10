@@ -66,7 +66,7 @@ export class VfsGatewayTimeoutError extends Error {
 /**
  * Thrown when VFS returns a 429 family rate-limit (HTTP or body code).
  * - kind "account" (4290XX) → stop the bot (User ID / account restricted)
- * - kind "ip" (4292XX / other 429) → hard relogin (kill Chrome, clear session, rotate IP)
+ * - kind "ip" (4292XX / other 429) → soft IP rotate first (keep session); escalate to hard relogin on repeat
  */
 export class VfsRateLimitedError extends Error {
     readonly kind: Vfs429Kind;

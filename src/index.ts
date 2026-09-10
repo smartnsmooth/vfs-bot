@@ -63,7 +63,7 @@ import { getApplicationUrn, clearApplicationUrn } from "./utils/applicationUrn.s
 import { clearApplicantIpCache, getApplicantIpForPayload } from "./utils/applicantIp";
 import { logInstanceIp, type InstanceIpLogReason } from "./utils/apiCallLog";
 import { clearChromeSessionDataBeforeLaunch, resolveChromeProfileFolderName } from "./utils/chromeProfileSessionClean";
-import { killChromeTreeByCdpPortSync } from "./utils/killChromeByCdpPort";
+import { killChromeTreeByCdpPortSync, killChromeTreeAndWaitUntilGone } from "./utils/killChromeByCdpPort";
 import {
   markInstanceReady,
 } from "./utils/pollReadyState";
@@ -266,8 +266,7 @@ async function relaunchChromeAfterCredentialSwapLogout(): Promise<void> {
   const slots = rawList.split(/[\r\n,]+/).map((s) => s.trim()).filter(Boolean).length;
   await closeActiveAnonymizedProxyTunnel();
   await browser.disconnectCdp();
-  await killChromeOnPort(getRemoteDebuggingPort());
-  await ensureChromeWithDevTools();
+  await ensureChromeWithDevTools({ forceNew: true });
 }
 
 /**
@@ -445,8 +444,8 @@ async function rotateIpWithoutRelogin(context: string): Promise<boolean> {
 
   await closeActiveAnonymizedProxyTunnel();
   await browser.disconnectCdp();
-  await killChromeOnPort(getRemoteDebuggingPort());
-  await ensureChromeWithDevTools({ preserveSession: true });
+  await killChromeTreeAndWaitUntilGone(getRemoteDebuggingPort());
+  await ensureChromeWithDevTools({ preserveSession: true, forceNew: true });
 
   try {
     if (snap) {
@@ -469,16 +468,32 @@ async function rotateIpWithoutRelogin(context: string): Promise<boolean> {
 }
 
 /**
- * Handle 4292XX / IP rate-limit via hard relogin
- * (kill Chrome, clear cache/cookies, rotate IP, new Chrome, login).
+ * Handle 4292XX / IP rate-limit: soft IP rotate first (keep session),
+ * escalate to hard relogin only if a second 429 comes before a successful poll clears the flag.
  */
 async function handleIpRateLimitRecovery(
   instanceId: number | undefined,
   context: string,
   code?: string
-): Promise<"full_relogin"> {
+): Promise<"soft_rotate" | "full_relogin"> {
   const label = code ?? "4292xx";
   reporter.setPoll({ code: label });
+
+  if (!softIpRotateAwaitingSecond429) {
+    reporter.setPhase("recovering", `IP rate-limit ${label} — rotating IP`);
+    await telegram
+      .alert(
+        "error",
+        `Bot ${instanceId ?? "?"} got IP rate-limit ${label} (${context}). Rotating IP, keeping session...`
+      )
+      .catch(() => { });
+    if (await rotateIpWithoutRelogin(`${context}-ip-rate-limit`)) {
+      await telegram
+        .alert("info", `Bot ${instanceId ?? "?"} rotated IP after ${label} — session kept, resuming.`)
+        .catch(() => { });
+      return "soft_rotate";
+    }
+  }
 
   clearSoftIpRotateFlag();
   reporter.setPhase("recovering", `IP rate-limit ${label} — hard relogin`);
@@ -1289,25 +1304,33 @@ async function computeChromeGridPosition(instanceIdx: number, totalInstances: nu
   return { width: w, height: h, x, y };
 }
 
-async function ensureChromeWithDevTools(opts?: { preserveSession?: boolean }): Promise<void> {
+async function ensureChromeWithDevTools(opts?: {
+  preserveSession?: boolean;
+  /** Kill any existing Chrome on this port and always spawn a fresh browser (Monitor Restart / hard relogin). */
+  forceNew?: boolean;
+}): Promise<void> {
   const userDataDir = resolveChromeUserDataDir();
   const instanceId = getBotInstanceId(userDataDir);
   const debugPort = getRemoteDebuggingPort();
 
-  // If Chrome DevTools is already reachable on the target port, skip spawning.
-  // Reposition into the tiled grid (not bottom-right).
-  for (const url of getChromeDevToolsCheckUrls()) {
-    if (await checkDevToolsEndpoint(url)) {
-      const numId = parseInt(process.env.BOT_INSTANCE_ID ?? "1", 10) || 1;
-      const total = parseInt(process.env.BOT_TOTAL_INSTANCES ?? "1", 10) || 1;
-      const grid = await computeChromeGridPosition(numId, total);
-      await moveWindowByDebugPort(debugPort, grid);
-      return;
+  if (opts?.forceNew) {
+    await killChromeTreeAndWaitUntilGone(debugPort);
+  } else {
+    // If Chrome DevTools is already reachable on the target port, skip spawning.
+    // Reposition into the tiled grid (not bottom-right).
+    for (const url of getChromeDevToolsCheckUrls()) {
+      if (await checkDevToolsEndpoint(url)) {
+        const numId = parseInt(process.env.BOT_INSTANCE_ID ?? "1", 10) || 1;
+        const total = parseInt(process.env.BOT_TOTAL_INSTANCES ?? "1", 10) || 1;
+        const grid = await computeChromeGridPosition(numId, total);
+        await moveWindowByDebugPort(debugPort, grid);
+        return;
+      }
     }
   }
 
   await clearChromeSessionDataBeforeLaunch(userDataDir, {
-    preserveAuthSession: opts?.preserveSession === true,
+    preserveAuthSession: opts?.preserveSession === true && opts?.forceNew !== true,
   });
 
   // Every real Chrome spawn is an IP rotate: take the next unused entry from the list.
@@ -2211,14 +2234,18 @@ async function recoverBookingChainFromGatewayTimeout(
   return runBookingChainWithRetry(instanceId, slotStateCache);
 }
 
-/** 4292XX on booking APIs: hard relogin, poll for a fresh slot, then restart booking chain. */
+/** 4292XX on booking APIs: soft IP rotate first; if session survived resume booking without re-polling. */
 async function recoverBookingChainFromIpRateLimit(
   instanceId: number | undefined,
   context: string,
   err: VfsRateLimitedError,
   slotStateCache?: SlotFoundState
 ): Promise<boolean> {
-  await handleIpRateLimitRecovery(instanceId, context, err.code);
+  const mode = await handleIpRateLimitRecovery(instanceId, context, err.code);
+  if (mode === "soft_rotate") {
+    // Session and URN survived the IP swap — resume booking without re-polling.
+    return runBookingChainWithRetry(instanceId, slotStateCache);
+  }
   clearSlotCenterOverride();
   clearSlotDate();
   if (!(await runSlotPollUnlessAreLva(instanceId, pollLoopReloginOpts(instanceId)))) {
@@ -2821,7 +2848,14 @@ async function runBookingChainWithRetry(instanceId?: number, slotStateCache?: Sl
   }
 }
 
-type SubmitMeta = { firstSubmit: boolean; instanceId?: number; pollStartAt?: number | null; skipPollGate?: boolean };
+type SubmitMeta = {
+  firstSubmit: boolean;
+  instanceId?: number;
+  pollStartAt?: number | null;
+  skipPollGate?: boolean;
+  /** Monitor Restart / operator: never reuse existing Chrome — kill, wipe session, new IP. */
+  forceNewChrome?: boolean;
+};
 
 async function runOneBotCycle(meta: SubmitMeta): Promise<void> {
   let m = meta;
@@ -2920,7 +2954,14 @@ async function runOneBotCycleCore(meta: SubmitMeta): Promise<void> {
 
   // 1) Drop old Playwright CDP attachment; 2) ensure Chrome + DevTools; 3) reconnect
   await browser.disconnectCdp();
-  await ensureChromeWithDevTools();
+  const forceNewChrome =
+    meta.forceNewChrome === true ||
+    /^true|1|yes$/i.test((process.env.BOT_FORCE_NEW_CHROME ?? "").trim());
+  if (forceNewChrome) {
+    delete process.env.BOT_FORCE_NEW_CHROME;
+    reporter.setPhase("launching", "restarting — new Chrome + session wipe");
+  }
+  await ensureChromeWithDevTools({ forceNew: forceNewChrome });
 
   // Log outbound IP as soon as CDP can attach (Chrome proxy egress). A later call reuses cache; if this fails
   // (no tab yet), the post-login resolve retries.
@@ -3279,7 +3320,12 @@ async function start(): Promise<void> {
           if (msg?.type === "run-bot-cycle") {
             syncInstanceStoresFromDisk();
             try {
-              await runOneBotCycle({ firstSubmit: true, instanceId: myInstanceId, pollStartAt: msg.pollStartAt });
+              await runOneBotCycle({
+                firstSubmit: true,
+                instanceId: myInstanceId,
+                pollStartAt: msg.pollStartAt,
+                forceNewChrome: msg.forceNewChrome === true,
+              });
               // `settled` tells the parent whether this instance is finished for good; anything
               // else means the cycle fell through without a booking and must be restarted.
               process.send?.({
