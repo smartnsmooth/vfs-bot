@@ -1,4 +1,4 @@
-/** In-process only: totalAmount + currency from successful fees response (not persisted to disk). */
+/** In-process only: totalAmount + currency from fees response or setup form (not persisted to disk). */
 
 let cachedTotalAmount: string | null = null;
 let cachedCurrency: string | null = null;

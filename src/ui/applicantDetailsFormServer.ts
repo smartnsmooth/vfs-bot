@@ -7,7 +7,7 @@ import {
   setApplicantDetailsOverrides,
   getAllInstanceApplicantDetails,
 } from "../utils/applicantDetails.store";
-import { isIndDeuRoute, isIndLvaRoute } from "../utils/vfsRoute";
+import { isIndDeuRoute, isIndLvaRoute, isSauPrtRoute } from "../utils/vfsRoute";
 import { preserveIndDeuInternalFields } from "../utils/indDeuAccountState";
 import { applyIndDeuPhoneToInstanceFields } from "../utils/indDeuPhone";
 import { getSessionLoginCredentials, setSessionLoginCredentials, getAllInstanceCredentials } from "../utils/sessionLogin.store";
@@ -29,6 +29,11 @@ import {
   getFleetUrnHolders,
   readCalendarBookingState,
 } from "../utils/calendarBookingCoord";
+import {
+  MANUAL_FEE_CURRENCIES,
+  getRouteManualFeeDefaults,
+  isManualFeeCurrency,
+} from "../utils/manualFees";
 
 const APPLICANT_UI_PORT = 3847;
 
@@ -136,6 +141,14 @@ export function buildApplicantFormSubmitJsonForBot(collectLogin: boolean): Recor
     if (hvRaw.length !== 6 || !jur) {
       return null;
     }
+  }
+  if (isSauPrtRoute(base.countryCode, base.missionCode)) {
+    const dep = typeof base.dateOfDeparture === "string" ? base.dateOfDeparture.trim() : "";
+    const fn = typeof base.firstName === "string" ? base.firstName.trim() : "";
+    const ln = typeof base.lastName === "string" ? base.lastName.trim() : "";
+    const dob = typeof base.dateOfBirth === "string" ? base.dateOfBirth.trim() : "";
+    const pp = typeof base.passportNumber === "string" ? base.passportNumber.trim() : "";
+    if (!dep || !fn || !ln || !dob || !pp) return null;
   }
   if (collectLogin && mission !== "deu") {
     const s = getSessionLoginCredentials();
@@ -254,6 +267,7 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
     "indDeuEmailPrefix",
     "indDeuEmailDomain",
     "indDeuAccountPassword",
+    "dateOfDeparture",
   ] as const;
   for (const k of keys) {
     const v = str(k);
@@ -337,12 +351,75 @@ function parseApplicantFields(j: Record<string, unknown>): Record<string, unknow
     out.calendarRetryNextMonth =
       v === true || v === 1 || (typeof v === "string" && /^(true|on|1)$/i.test(v.trim()));
   }
+  if ("useManualFees" in j) {
+    const v = j.useManualFees;
+    out.useManualFees =
+      v === true || v === 1 || (typeof v === "string" && /^(true|on|1)$/i.test(v.trim()));
+  }
+  if ("manualTotalAmount" in j) {
+    const v = j.manualTotalAmount;
+    if (typeof v === "number" && Number.isFinite(v)) out.manualTotalAmount = String(v);
+    else if (typeof v === "string") out.manualTotalAmount = v.trim();
+  }
+  if ("manualCurrency" in j) {
+    const raw = typeof j.manualCurrency === "string" ? j.manualCurrency.trim().toUpperCase() : "";
+    if (raw && isManualFeeCurrency(raw)) out.manualCurrency = raw;
+  }
+  if (j.manualFeeValues && typeof j.manualFeeValues === "object" && !Array.isArray(j.manualFeeValues)) {
+    const parsed: Record<string, { amount: string; currency: string }> = {};
+    for (const [route, raw] of Object.entries(j.manualFeeValues as Record<string, unknown>)) {
+      if (!raw || typeof raw !== "object") continue;
+      const row = raw as Record<string, unknown>;
+      const amount =
+        typeof row.amount === "number" && Number.isFinite(row.amount)
+          ? String(row.amount)
+          : typeof row.amount === "string"
+            ? row.amount.trim()
+            : "";
+      const currency = typeof row.currency === "string" ? row.currency.trim().toUpperCase() : "";
+      parsed[route] = {
+        amount,
+        currency: isManualFeeCurrency(currency) ? currency : "",
+      };
+    }
+    out.manualFeeValues = parsed;
+  }
   if (typeof out.helloVerifyNumber === "string") {
     const digits = out.helloVerifyNumber.replace(/\D/g, "").slice(0, 6);
     if (digits.length > 0) out.helloVerifyNumber = digits;
     else delete out.helloVerifyNumber;
   }
+  if (typeof out.dateOfDeparture === "string") {
+    const dep = normalizeFormDateOfDeparture(out.dateOfDeparture);
+    if (dep) out.dateOfDeparture = dep;
+    else delete out.dateOfDeparture;
+  }
   return out;
+}
+
+/** YYYY-MM-DD from `<input type="date">` or already DD/MM/YYYY → DD/MM/YYYY. */
+function normalizeFormDateOfDeparture(raw: string): string {
+  const t = raw.trim();
+  const iso = t.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (iso) return `${iso[3]}/${iso[2]}/${iso[1]}`;
+  const dmy = t.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (dmy) return `${dmy[1]}/${dmy[2]}/${dmy[3]}`;
+  return "";
+}
+
+function preserveSauPrtLoginContactFields(
+  instanceFields: Record<string, unknown>,
+  instanceId?: number,
+): void {
+  if (!isSauPrtRoute(instanceFields.countryCode, instanceFields.missionCode)) return;
+  const prev = getApplicantDetailsOverrides(instanceId) ?? {};
+  for (const k of ["emailId", "dialCode", "contactNumber"] as const) {
+    const incoming = instanceFields[k];
+    const empty = incoming == null || (typeof incoming === "string" && incoming.trim() === "");
+    if (empty && prev[k] != null && String(prev[k]).trim() !== "") {
+      instanceFields[k] = prev[k];
+    }
+  }
 }
 
 function applyProxyProviderFromBody(
@@ -371,6 +448,7 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
   </div>`;
 
   const defaultPollIntervalSec = 5;
+  const defaultFee = getRouteManualFeeDefaults("ind", "bgr");
 
   const instanceSelectBlock = `
   <fieldset style="border:1px solid #38444d;border-radius:8px;padding:1rem 1rem 0.25rem;margin:0 0 1.25rem">
@@ -435,6 +513,28 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
     <div class="chk-row">
       <input type="checkbox" id="calendarRetryNextMonth" name="calendarRetryNextMonth" />
       <label for="calendarRetryNextMonth">Retry next month if current month is full</label>
+    </div>
+    <div class="fees-api-row">
+      <div class="fees-api-switch-col">
+        <span class="fees-api-label">Fees API</span>
+        <label class="switch" title="On: call Fees API. Off: use amount and currency">
+          <input type="checkbox" id="useManualFees" name="useManualFees" role="switch" checked />
+          <span class="switch-slider"></span>
+        </label>
+      </div>
+      <div class="fees-field">
+        <label for="manualTotalAmount">Amount</label>
+        <input id="manualTotalAmount" name="manualTotalAmount" type="text" inputmode="decimal" value="${defaultFee.amount}" autocomplete="off" />
+      </div>
+      <div class="fees-field">
+        <label for="manualCurrency">Currency</label>
+        <select id="manualCurrency" name="manualCurrency">
+          ${MANUAL_FEE_CURRENCIES.map((c) => {
+            const selected = c === defaultFee.currency ? " selected" : "";
+            return `<option value="${c}"${selected}>${c}</option>`;
+          }).join("")}
+        </select>
+      </div>
     </div>
     <div class="row2">
       <div>
@@ -606,6 +706,24 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
     .chk-row { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.75rem; }
     .chk-row input[type="checkbox"] { width: auto; margin: 0; padding: 0; flex: none; accent-color: #1d9bf0; }
     .chk-row label { margin: 0; color: #e7e9ea; cursor: pointer; }
+    .fees-api-row { display: flex; align-items: flex-end; gap: 0.65rem; margin-top: 0.75rem; flex-wrap: wrap; }
+    .fees-api-switch-col { display: flex; flex-direction: column; justify-content: flex-end; flex: none; }
+    .fees-api-label { display: block; margin: 0; font-size: 0.85rem; color: #8b98a5; }
+    .fees-api-row .fees-field { flex: 1; min-width: 6.5rem; }
+    .fees-api-row .fees-field label { margin-top: 0; }
+    .fees-api-row:has(#useManualFees:checked) .fees-field input,
+    .fees-api-row:has(#useManualFees:checked) .fees-field select {
+      pointer-events: none;
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    .switch { position: relative; display: inline-block; width: 44px; height: 24px; margin-top: 0.35rem; flex: none; overflow: hidden; }
+    .switch input { position: absolute; inset: 0; z-index: 2; opacity: 0; width: 44px; height: 24px; margin: 0; padding: 0; cursor: pointer; }
+    .switch-slider { position: absolute; inset: 0; z-index: 1; pointer-events: none; background: #38444d; border-radius: 999px; transition: background 0.2s; }
+    .switch-slider:before { content: ""; position: absolute; height: 18px; width: 18px; left: 3px; bottom: 3px; background: #e7e9ea; border-radius: 50%; transition: transform 0.2s; }
+    .switch input:checked + .switch-slider { background: #1d9bf0; }
+    .switch input:checked + .switch-slider:before { transform: translateX(20px); }
+    .switch input:focus-visible + .switch-slider { outline: 2px solid #1d9bf0; outline-offset: 2px; }
     .row3 { display: grid; grid-template-columns: 1fr 1fr 0.5fr; gap: 0.75rem; }
     @media (max-width: 720px) {
       .row3 { grid-template-columns: 1fr; }
@@ -914,6 +1032,10 @@ function buildPageHtml(collectLogin: boolean, hasMonitor: boolean): string {
             </select>
           </div>
         </div>
+        <div id="sauPrtDepartureWrap" style="display:none;margin-top:0.75rem">
+          <label for="dateOfDeparture">Date of departure</label>
+          <input type="date" id="dateOfDeparture" name="dateOfDeparture" />
+        </div>
         <label for="vacCode">Visa Application Centre</label>
         <select id="vacCode" name="vacCode">
           <option value="">-- Select Centre --</option>
@@ -1199,6 +1321,13 @@ export function runApplicantFormWithSubmitHandler(
                 json(res, 200, monitor.setProxyProvider(String(mj.provider ?? "")));
                 return;
               }
+              if (action === "manual-fees") {
+                const useManualFees = mj.useManualFees === true;
+                const amount = typeof mj.amount === "string" ? mj.amount : String(mj.amount ?? "");
+                const currency = typeof mj.currency === "string" ? mj.currency : String(mj.currency ?? "");
+                json(res, 200, monitor.setManualFees({ useManualFees, amount, currency }));
+                return;
+              }
               if (action === "start") {
                 const count = toNum(mj.count);
                 const ms = toNum(mj.intervalMs);
@@ -1249,6 +1378,16 @@ export function runApplicantFormWithSubmitHandler(
               defaults.calendarPollingInterval = globalDet.calendarPollingInterval;
             }
             defaults.calendarRetryNextMonth = globalDet?.calendarRetryNextMonth === true;
+            defaults.useManualFees = globalDet?.useManualFees === true;
+            if (globalDet && globalDet.manualTotalAmount != null) {
+              defaults.manualTotalAmount = String(globalDet.manualTotalAmount);
+            }
+            if (globalDet && typeof globalDet.manualCurrency === "string") {
+              defaults.manualCurrency = globalDet.manualCurrency;
+            }
+            if (globalDet && globalDet.manualFeeValues && typeof globalDet.manualFeeValues === "object") {
+              defaults.manualFeeValues = globalDet.manualFeeValues;
+            }
             if (globalDet && typeof globalDet.apiDelaySec === "number") {
               defaults.apiDelaySec = globalDet.apiDelaySec;
             }
@@ -1350,6 +1489,10 @@ export function runApplicantFormWithSubmitHandler(
             calendarRetryNextMonth: crnm,
             apiDelaySec: ads,
             repeatedDelaySec: rds,
+            useManualFees: umf,
+            manualTotalAmount: mta,
+            manualCurrency: mcur,
+            manualFeeValues: mfvals,
             ...instanceFields
           } = fields;
 
@@ -1375,6 +1518,10 @@ export function runApplicantFormWithSubmitHandler(
             else if ("calendarPollingStartDate" in rest) { delete global0.calendarPollingStartDate; changed = true; }
             if (typeof cpi === "number") { global0.calendarPollingInterval = cpi; changed = true; }
             if (typeof crnm === "boolean") { global0.calendarRetryNextMonth = crnm; changed = true; }
+            if (typeof umf === "boolean") { global0.useManualFees = umf; changed = true; }
+            if (typeof mta === "string") { global0.manualTotalAmount = mta; changed = true; }
+            if (typeof mcur === "string") { global0.manualCurrency = mcur; changed = true; }
+            if (mfvals && typeof mfvals === "object") { global0.manualFeeValues = mfvals; changed = true; }
             if (typeof ads === "number") { global0.apiDelaySec = ads; changed = true; }
             if (typeof rds === "number") { global0.repeatedDelaySec = rds; changed = true; }
             if (typeof instanceFields.countryCode === "string") { global0.countryCode = instanceFields.countryCode; changed = true; }
@@ -1403,10 +1550,15 @@ export function runApplicantFormWithSubmitHandler(
           if (typeof instanceFields.indDeuAccountPassword === "string") {
             delete instanceFields.indDeuAccountPassword;
           }
+          delete instanceFields.useManualFees;
+          delete instanceFields.manualTotalAmount;
+          delete instanceFields.manualCurrency;
+          delete instanceFields.manualFeeValues;
           if (isIndDeuRoute(instanceFields.countryCode, instanceFields.missionCode)) {
             applyIndDeuPhoneToInstanceFields(instanceFields, id);
             preserveIndDeuInternalFields(instanceFields, id);
           }
+          preserveSauPrtLoginContactFields(instanceFields, id);
           setApplicantDetailsOverrides(instanceFields, id);
 
           json(res, 200, { ok: true });
@@ -1480,6 +1632,25 @@ export function runApplicantFormWithSubmitHandler(
                 ? /^(true|on|1)$/i.test(j.calendarRetryNextMonth.trim())
                 : undefined;
 
+          const submittedUseManualFees =
+            typeof j.useManualFees === "boolean"
+              ? j.useManualFees
+              : typeof j.useManualFees === "string"
+                ? /^(true|on|1)$/i.test(j.useManualFees.trim())
+                : undefined;
+
+          const submittedManualTotalAmount =
+            typeof j.manualTotalAmount === "number" && Number.isFinite(j.manualTotalAmount)
+              ? String(j.manualTotalAmount)
+              : typeof j.manualTotalAmount === "string"
+                ? j.manualTotalAmount.trim()
+                : undefined;
+
+          const submittedManualCurrency = (() => {
+            const raw = typeof j.manualCurrency === "string" ? j.manualCurrency.trim().toUpperCase() : "";
+            return isManualFeeCurrency(raw) ? raw : undefined;
+          })();
+
           const submittedApiDelaySec =
             typeof j.apiDelaySec === "number" && j.apiDelaySec >= 0
               ? j.apiDelaySec
@@ -1505,7 +1676,11 @@ export function runApplicantFormWithSubmitHandler(
             submittedApiDelaySec != null ||
             submittedRepeatedDelaySec != null ||
             "calendarPollingStartDate" in j ||
-            "calendarRetryNextMonth" in j
+            "calendarRetryNextMonth" in j ||
+            "useManualFees" in j ||
+            "manualTotalAmount" in j ||
+            "manualCurrency" in j ||
+            "manualFeeValues" in j
           ) {
             const global0 = getApplicantDetailsOverrides(0) ?? {};
             let changed = false;
@@ -1549,6 +1724,25 @@ export function runApplicantFormWithSubmitHandler(
             if ("calendarRetryNextMonth" in j) {
               global0.calendarRetryNextMonth = submittedCalendarRetryNextMonth === true;
               changed = true;
+            }
+            if ("useManualFees" in j) {
+              global0.useManualFees = submittedUseManualFees === true;
+              changed = true;
+            }
+            if (typeof submittedManualTotalAmount === "string") {
+              global0.manualTotalAmount = submittedManualTotalAmount;
+              changed = true;
+            }
+            if (typeof submittedManualCurrency === "string") {
+              global0.manualCurrency = submittedManualCurrency;
+              changed = true;
+            }
+            if ("manualFeeValues" in j) {
+              const parsed = parseApplicantFields({ manualFeeValues: j.manualFeeValues }).manualFeeValues;
+              if (parsed && typeof parsed === "object") {
+                global0.manualFeeValues = parsed;
+                changed = true;
+              }
             }
             if (changed) setApplicantDetailsOverrides(global0, 0);
           }

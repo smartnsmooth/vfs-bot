@@ -19,6 +19,7 @@ import {
 import { getSessionLoginCredentials, reloadSessionCredentialsFromDisk } from "./utils/sessionLogin.store";
 import { isAreLvaRoute, isIndDeuRoute, isSauPrtRoute } from "./utils/vfsRoute";
 import { reloadApplicantDetailsFromDisk, getApplicantDetailsOverrides, setApplicantDetailsOverrides } from "./utils/applicantDetails.store";
+import { applyManualFeesFromSetup, persistManualFeesFromMonitor, readManualFeesControl } from "./utils/manualFees";
 import {
   assertProxyProviderReady,
   getActiveProxyProvider,
@@ -3307,12 +3308,14 @@ async function start(): Promise<void> {
 
         if (msg?.type === "global-settings-updated") {
           syncInstanceStoresFromDisk();
+          try { applyManualFeesFromSetup(); } catch { /* Fees API mode or invalid form values */ }
           return;
         }
 
         // config-updated should also run immediately to abort polling without waiting for the chain.
         if (msg?.type === "config-updated") {
           syncInstanceStoresFromDisk();
+          try { applyManualFeesFromSetup(); } catch { /* Fees API mode or invalid form values */ }
           requestPollingAbort("config-updated", myInstanceId);
           return;
         }
@@ -3465,6 +3468,7 @@ async function start(): Promise<void> {
       if (!id) return { ok: false, error: PROXY_PROVIDER_PARSE_ERROR };
       return commitProxyProvider(id);
     },
+    setManualFees: (opts) => persistManualFeesFromMonitor(opts),
     reloadGlobalSettings: () => {
       syncInstanceStoresFromDisk();
       return { ok: true };
@@ -3488,6 +3492,7 @@ async function start(): Promise<void> {
         proxyProvider: getActiveProxyProvider(),
         proxyListReady: isProxyListConfigured().ok,
         webshareReady: isWebshareConfigured().ok,
+        ...readManualFeesControl(),
       };
     },
   };

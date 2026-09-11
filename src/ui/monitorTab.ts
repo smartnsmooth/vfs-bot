@@ -5,6 +5,8 @@
  * (captcha / OTP / hard stop that still needs the operator) blink their background.
  * Auto-recovery (401/403/CF/IP rotate) uses phase "recovering" and does not blink.
  */
+import { MANUAL_FEE_CURRENCIES } from "../utils/manualFees";
+
 export function buildMonitorTabHtml(): string {
   return `
 <style>
@@ -169,13 +171,41 @@ export function buildMonitorTabHtml(): string {
     .mon-tile.bg-timeslot:not(.attn):not(.dead) { background: #143528; border-color: #2d6a4f; }
     .mon-tile.bg-schedule:not(.attn):not(.dead) { background: #1a4030; border-color: #2f9e6f; }
   }
+  .mon-toolbar { flex-wrap: wrap; }
   .mon-toolbar label { display: inline; margin: 0; }
-  .mon-toolbar input { width: auto; margin: 0; }
+  .mon-toolbar input, .mon-toolbar select { width: auto; margin: 0; }
   .mon-toolbar button { width: auto; padding: 0.15rem 0.4rem; font-size: 0.65rem; min-width: 0; flex: none; }
+  .mon-toolbar .switch {
+    display: inline-block;
+    width: 44px;
+    height: 24px;
+    margin: 0;
+    overflow: hidden;
+    vertical-align: middle;
+    flex: none;
+  }
+  .mon-toolbar .switch input {
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    opacity: 0;
+    width: 44px;
+    height: 24px;
+    margin: 0;
+    padding: 0;
+  }
   .mon-proxy-btn { width: auto; padding: 0.15rem 0.5rem; font-size: 0.65rem; min-width: 0; flex: none; border: 1px solid #38444d; background: #1c2732; color: #c4cdd4; border-radius: 4px; cursor: pointer; }
   .mon-proxy-btn:hover { background: #253341; border-color: #4a5a68; color: #e7e9ea; }
   .mon-proxy-btn.active { background: #1d9bf0; border-color: #1d9bf0; color: #fff; }
   .mon-proxy-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+  .mon-fees-row .fees-api-label { color: #8b98a5; font-size: 0.72rem; }
+  .mon-fees-row .switch { margin: 0; }
+  .mon-fees-row:has(#monFeesApi:checked) #monManualTotalAmount,
+  .mon-fees-row:has(#monFeesApi:checked) #monManualCurrency {
+    pointer-events: none;
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
   .mon-toast { position: fixed; right: 1rem; bottom: 1rem; background: #1c2732; border: 1px solid #38444d; color: #e7e9ea; padding: 0.6rem 0.85rem; border-radius: 8px; font-size: 0.85rem; opacity: 0; transition: opacity 0.2s; pointer-events: none; z-index: 50; max-width: 22rem; }
   .mon-toast.show { opacity: 1; }
   .mon-fleet { background: #15202b; border: 1px solid #38444d; border-radius: 6px; padding: 0.3rem 0.45rem; margin-bottom: 0.5rem; font-size: 0.66rem; color: #c4cdd4; display: flex; flex-wrap: wrap; gap: 0.2rem 0.9rem; align-items: baseline; }
@@ -199,7 +229,7 @@ export function buildMonitorTabHtml(): string {
   }
 </style>
 <div class="mon-wrap">
-  <div class="mon-toolbar" style="margin-bottom:0.5rem;display:flex;gap:0.4rem;align-items:center;justify-content:center;font-size:0.72rem;">
+  <div class="mon-toolbar" style="margin-bottom:0.5rem;display:flex;gap:0.4rem;align-items:center;justify-content:center;font-size:0.72rem;flex-wrap:wrap;">
     <label for="monPollInterval">Poll (s)</label>
     <input type="number" id="monPollInterval" min="1" max="600" value="60" step="1" style="width:3.5rem;padding:0.15rem 0.25rem;border:1px solid #38444d;border-radius:4px;background:#15202b;color:#e7e9ea;font-size:0.72rem;" />
     <button type="button" id="monPollIntervalApply">Apply</button>
@@ -224,12 +254,25 @@ export function buildMonitorTabHtml(): string {
     <input type="number" id="monRepeatedDelay" min="1" max="600" value="35" step="1" style="width:3.5rem;padding:0.15rem 0.25rem;border:1px solid #38444d;border-radius:4px;background:#15202b;color:#e7e9ea;font-size:0.72rem;" />
     <button type="button" id="monRepeatedDelayApply">Apply</button>
   </div>
-  <div class="mon-toolbar" style="margin-bottom:0.5rem;display:flex;gap:0.4rem;align-items:center;justify-content:center;font-size:0.72rem;">
+  <div class="mon-toolbar mon-fees-row" style="margin-bottom:0.5rem;display:flex;gap:0.4rem;align-items:center;justify-content:center;font-size:0.72rem;flex-wrap:wrap;">
     <span style="color:#8b98a5;">Proxy</span>
     <button type="button" class="mon-proxy-btn active" id="monProxyBright" data-provider="brightdata" title="Bright Data (default) — all bots switch on the next API request">Bright Data</button>
     <button type="button" class="mon-proxy-btn" id="monProxyWebshare" data-provider="webshare" title="Webshare rotating residential — sticky session per bot, new IP on rotate">Webshare</button>
     <button type="button" class="mon-proxy-btn" id="monProxyList" data-provider="iplist" title="IP List (proxies.txt) — all bots switch on the next API request">IP List</button>
     <span id="monProxyHint" style="color:#8b98a5;font-size:0.62rem;"></span>
+    <span style="color:#38444d;margin:0 0.15rem;">|</span>
+    <span class="fees-api-label">Fees API</span>
+    <label class="switch" title="On: call Fees API. Off: use amount and currency">
+      <input type="checkbox" id="monFeesApi" role="switch" checked />
+      <span class="switch-slider"></span>
+    </label>
+    <label for="monManualTotalAmount">Amount</label>
+    <input id="monManualTotalAmount" type="text" inputmode="decimal" autocomplete="off" style="width:5.5rem;padding:0.15rem 0.25rem;border:1px solid #38444d;border-radius:4px;background:#15202b;color:#e7e9ea;font-size:0.72rem;" />
+    <label for="monManualCurrency">Currency</label>
+    <select id="monManualCurrency" style="width:5.2rem;padding:0.15rem 0.2rem;border:1px solid #38444d;border-radius:4px;background:#15202b;color:#e7e9ea;font-size:0.72rem;">
+      ${MANUAL_FEE_CURRENCIES.map((c) => `<option value="${c}">${c}</option>`).join("")}
+    </select>
+    <button type="button" id="monManualFeesApply">Apply</button>
   </div>
   <div class="mon-fleet" id="monFleet"></div>
   <div class="mon-grid" id="monGrid"></div>
@@ -771,6 +814,7 @@ export function buildMonitorTabClientScript(): string {
           if (rd) rd.value = String(c.repeatedDelaySec);
         }
         setProxyUi(c.proxyProvider || 'brightdata', !!c.proxyListReady, c.webshareReady !== false);
+        setFeesUi(c.useManualFees === true, c.manualTotalAmount, c.manualCurrency);
       }
     }).catch(function(){});
 
@@ -854,6 +898,81 @@ export function buildMonitorTabClientScript(): string {
     bindProxy('monProxyBright');
     bindProxy('monProxyWebshare');
     bindProxy('monProxyList');
+
+    function setFeesUi(useManualFees, amount, currency) {
+      var tog = document.getElementById('monFeesApi');
+      if (tog) tog.checked = useManualFees !== true;
+      var amt = document.getElementById('monManualTotalAmount');
+      if (amt && amount != null) amt.value = String(amount);
+      var cur = document.getElementById('monManualCurrency');
+      if (cur && currency != null) {
+        var code = String(currency).trim().toUpperCase();
+        if (code) cur.value = code;
+      }
+    }
+    window.__syncMonitorFeesUi = setFeesUi;
+
+    function readMonFees() {
+      var tog = document.getElementById('monFeesApi');
+      var amt = document.getElementById('monManualTotalAmount');
+      var cur = document.getElementById('monManualCurrency');
+      return {
+        useManualFees: !(tog && tog.checked),
+        amount: amt ? String(amt.value || '').trim() : '',
+        currency: cur ? String(cur.value || '').trim() : ''
+      };
+    }
+
+    function applyMonFees(label) {
+      var body = readMonFees();
+      var tog = document.getElementById('monFeesApi');
+      if (body.useManualFees) {
+        if (!body.amount || !Number.isFinite(parseFloat(body.amount.replace(/,/g, '')))) {
+          toast('Amount must be a number');
+          if (tog) tog.checked = true;
+          return;
+        }
+        if (!body.currency) {
+          toast('Currency is required');
+          if (tog) tog.checked = true;
+          return;
+        }
+      }
+      toast(label || 'Applying fees settings\u2026');
+      post('manual-fees', body).then(function(r){
+        if (r.ok) {
+          toast(body.useManualFees
+            ? ('Fees set to ' + body.amount + ' ' + body.currency)
+            : 'Fees API on \u2014 amount from API');
+          if (window.__syncConfigureFeesUi) {
+            window.__syncConfigureFeesUi(body.useManualFees, body.amount, body.currency);
+          }
+        } else {
+          toast(r.error || 'fees apply failed');
+          fetch('/api/monitor/control').then(function(res){ return res.json(); }).then(function(d){
+            if (d && d.ok && d.control) {
+              setFeesUi(d.control.useManualFees === true, d.control.manualTotalAmount, d.control.manualCurrency);
+            }
+          }).catch(function(){});
+        }
+      });
+    }
+
+    var feesApply = document.getElementById('monManualFeesApply');
+    if (feesApply) feesApply.addEventListener('click', function(){ applyMonFees(); });
+    var feesToggle = document.getElementById('monFeesApi');
+    if (feesToggle) {
+      feesToggle.addEventListener('change', function(){
+        applyMonFees(feesToggle.checked ? 'Turning Fees API on\u2026' : 'Using form amount\u2026');
+      });
+    }
+    var feesAmt = document.getElementById('monManualTotalAmount');
+    if (feesAmt) {
+      feesAmt.addEventListener('keydown', function(ev){
+        if (ev.key === 'Enter') applyMonFees();
+      });
+    }
+
     fetch('/api/monitor/snapshot').then(function(r){ return r.json(); }).then(function(d){
       if (d && d.ok && Array.isArray(d.instances)){
         for (var i = 0; i < d.instances.length; i++){

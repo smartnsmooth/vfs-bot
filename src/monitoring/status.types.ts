@@ -203,6 +203,12 @@ export interface MonitorControlState {
   proxyListReady: boolean;
   /** False while Webshare username/password (or WEBSHARE_PROXY_URL) are missing. */
   webshareReady: boolean;
+  /** True when Fees API is skipped and form amount/currency are used. */
+  useManualFees: boolean;
+  /** Amount used when `useManualFees` is true (also stored for the current route). */
+  manualTotalAmount: string;
+  /** Currency used when `useManualFees` is true. */
+  manualCurrency: string;
 }
 
 /**
@@ -245,6 +251,8 @@ export interface MonitorHooks {
   setRepeatedDelaySec(sec: number): { ok: boolean; error?: string };
   /** Switch all bots to Bright Data, Webshare, or the IP list; next API request uses the new source. */
   setProxyProvider(provider: string): { ok: boolean; error?: string };
+  /** Live-update Fees API switch + amount/currency on running bots. */
+  setManualFees(opts: { useManualFees: boolean; amount: string; currency: string }): { ok: boolean; error?: string };
   /** Reload global settings from disk on all running bots (after /api/save). */
   reloadGlobalSettings(): { ok: boolean };
   getControl(): MonitorControlState;
