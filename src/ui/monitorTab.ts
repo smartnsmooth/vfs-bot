@@ -488,7 +488,7 @@ export function buildMonitorTabClientScript(): string {
       ? ''
       : '<button type="button" class="mon-btn restart" data-action="restart" title="Clear session, rotate IP, restart Chrome + bot">Restart</button>';
 
-    var phaseLabel = booked ? 'already booked' : (payPend ? 'pay pending' : (recoverLbl ? recoverLbl : (closed ? 'closed' : (paused ? 'paused' : (bKind || s.phase))));
+    var phaseLabel = booked ? 'already booked' : (payPend ? 'pay pending' : (recoverLbl ? recoverLbl : (closed ? 'closed' : (paused ? 'paused' : (bKind || s.phase)))));
     if (!closed && !terminal && !recoverLbl && !bKind && needsManual(s) && !paused) phaseLabel = s.phase === 'stopped' ? 'stopped' : (s.attention && s.attention.reason) || s.phase;
 
     var apiBgKind = null;
