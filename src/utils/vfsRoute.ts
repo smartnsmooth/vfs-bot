@@ -27,6 +27,12 @@ export function isAreLvaRoute(countryCode?: unknown, missionCode?: unknown): boo
   return cc === "are" && mc === "lva";
 }
 
+/** Saudi→Portugal uses `SAUDI_PROXY_URLS`, not the Monitor proxy radio / `PROXY_URLS`. */
+export function isSauPrtRoute(countryCode?: unknown, missionCode?: unknown): boolean {
+  const { cc, mc } = routeCodes(countryCode, missionCode);
+  return cc === "sau" && mc === "prt";
+}
+
 /** Login emails stay mixed-case on these corridors (not uppercased for lift-api). */
 export function keepApplicantEmailCasing(countryCode?: unknown, missionCode?: unknown): boolean {
   return isIndLvaRoute(countryCode, missionCode) || isAreLvaRoute(countryCode, missionCode);

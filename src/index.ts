@@ -17,7 +17,7 @@ import {
   closeApplicantFormServer,
 } from "./ui/applicantDetailsFormServer";
 import { getSessionLoginCredentials, reloadSessionCredentialsFromDisk } from "./utils/sessionLogin.store";
-import { isAreLvaRoute, isIndDeuRoute } from "./utils/vfsRoute";
+import { isAreLvaRoute, isIndDeuRoute, isSauPrtRoute } from "./utils/vfsRoute";
 import { reloadApplicantDetailsFromDisk, getApplicantDetailsOverrides, setApplicantDetailsOverrides } from "./utils/applicantDetails.store";
 import {
   assertProxyProviderReady,
@@ -28,6 +28,7 @@ import {
   pickProxyUrlFromList,
   PROXY_PROVIDER_PARSE_ERROR,
   proxyProviderLabel,
+  saudiProxyUrls,
   setMemoryProxyProvider,
   type ProxyProviderId,
 } from "./utils/proxyProvider";
@@ -958,6 +959,7 @@ function ensureProxyClaimHeartbeat(): void {
 
 /**
  * Bright Data: hash this instance onto `PROXY_URLS` + rotation offset.
+ * Saudi→Portugal (`sau`/`prt`): always `SAUDI_PROXY_URLS` (ignores Monitor provider switch).
  * Webshare: exclusive sticky sessions 1–N (`WEBSHARE_MAX_STICKY_SESSION`).
  * `takeNew` (Chrome launch / IP rotate) releases the current session into cooldown
  * and takes an idle one — not a session another live bot already holds.
@@ -965,6 +967,16 @@ function ensureProxyClaimHeartbeat(): void {
  * IP list: an exclusive claim from `proxies.txt`, same `takeNew` / cooldown rules.
  */
 function resolveProxyForInstance(instanceId: string, opts?: { takeNew?: boolean }): string | null {
+  const rot = getProxyRotationOffset(instanceId);
+  const session = stableSessionToken(instanceId);
+
+  // Saudi→Portugal: dedicated PT egress pool — same as register-bot.
+  if (isSauPrtRoute(config.slotPayload.countryCode, config.slotPayload.missionCode)) {
+    const saudiList = saudiProxyUrls();
+    if (saudiList.length === 0) return null;
+    return pickProxyUrlFromList(saudiList, instanceId, rot, session);
+  }
+
   const provider = getActiveProxyProvider();
   if (provider === "iplist") {
     const keys = listProxyListEntries().map((entry) => entry.key);
@@ -975,7 +987,6 @@ function resolveProxyForInstance(instanceId: string, opts?: { takeNew?: boolean 
     startProxyListFileWatcher();
     return proxyListUrlForKey(key);
   }
-  const rot = getProxyRotationOffset(instanceId);
   if (provider === "webshare") {
     const claimed = claimProxyForInstance(numericBotInstanceId(), webshareStickySessionKeys(), {
       takeNew: opts?.takeNew === true,
@@ -988,7 +999,6 @@ function resolveProxyForInstance(instanceId: string, opts?: { takeNew?: boolean 
   }
   const list = listProxyUrlsForProvider(provider);
   if (list.length === 0) return null;
-  const session = stableSessionToken(instanceId);
   return pickProxyUrlFromList(list, instanceId, rot, session);
 }
 
@@ -1160,6 +1170,9 @@ async function applyProxyProviderSwitch(provider: ProxyProviderId): Promise<{ ok
   const instanceId = getBotInstanceId(resolveChromeUserDataDir());
   const selected = resolveProxyForInstance(instanceId);
   if (!selected) {
+    if (isSauPrtRoute(config.slotPayload.countryCode, config.slotPayload.missionCode)) {
+      return { ok: false, error: "SAUDI_PROXY_URLS is empty in main-bot/.env (required for Saudi→Portugal)." };
+    }
     return { ok: false, error: `No proxy URL configured for ${proxyProviderLabel(provider)}.` };
   }
   const parsed = parseProxy(selected);
@@ -1335,6 +1348,12 @@ async function ensureChromeWithDevTools(opts?: {
 
   // Every real Chrome spawn is an IP rotate: take the next unused entry from the list.
   const selectedProxy = resolveProxyForInstance(instanceId, { takeNew: true });
+  if (
+    !selectedProxy &&
+    isSauPrtRoute(config.slotPayload.countryCode, config.slotPayload.missionCode)
+  ) {
+    throw new Error("SAUDI_PROXY_URLS is empty in main-bot/.env (required for Saudi→Portugal).");
+  }
   bumpProxyRotationForProfile(instanceId);
   clearApplicantIpCache();
 

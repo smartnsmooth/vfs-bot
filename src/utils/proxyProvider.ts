@@ -58,21 +58,31 @@ export function assertProxyProviderReady(id: ProxyProviderId): { ok: boolean; er
   return { ok: true };
 }
 
+function splitProxyEnvList(raw: string): string[] {
+  return raw
+    .trim()
+    .split(/[\r\n,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/** Saudi→Portugal dedicated Bright Data pool (`SAUDI_PROXY_URLS`). */
+export function saudiProxyUrls(): string[] {
+  return splitProxyEnvList(process.env.SAUDI_PROXY_URLS ?? "");
+}
+
 /**
  * Bright Data: the `PROXY_URLS` lines. IP list: every IP in the file, in file order —
  * which bot gets which one is decided by `proxyClaims.ts`, not by this list.
  * Webshare: a single backbone URL; session targeting is applied in `resolveProxyForInstance`.
+ * Saudi→Portugal does not use this — see {@link saudiProxyUrls}.
  */
 export function listProxyUrlsForProvider(provider: ProxyProviderId): string[] {
   if (provider === "iplist") {
     return listProxyListEntries().map((entry) => buildProxyListUrl(entry));
   }
   if (provider === "webshare") return [];
-  return (process.env.PROXY_URLS ?? "")
-    .trim()
-    .split(/[\r\n,]+/)
-    .map((s) => s.trim())
-    .filter(Boolean);
+  return splitProxyEnvList(process.env.PROXY_URLS ?? "");
 }
 
 export function pickProxyUrlFromList(
