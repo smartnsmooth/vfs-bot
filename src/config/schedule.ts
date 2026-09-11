@@ -27,12 +27,12 @@ export function buildScheduleBody(urn: string, allocationId: string): Record<str
   const loginUser = getEffectiveLiftLoginUser();
   const totalAmountRaw = getTotalAmount();
   if (!totalAmountRaw) {
-    throw new Error("Schedule API requires totalAmount from fees response");
+    throw new Error("Schedule API requires totalAmount from fees response or setup form");
   }
   const normalizedAmount = totalAmountRaw.replace(/,/g, "").trim();
   const totalAmountNum = Number.parseFloat(normalizedAmount);
   if (!Number.isFinite(totalAmountNum)) {
-    throw new Error(`Schedule API requires numeric totalAmount from fees response; got: ${totalAmountRaw}`);
+    throw new Error(`Schedule API requires numeric totalAmount from fees or setup form; got: ${totalAmountRaw}`);
   }
 
   const rc = String(config.slotPayload.countryCode ?? "").trim().toLowerCase();
@@ -45,17 +45,18 @@ export function buildScheduleBody(urn: string, allocationId: string): Record<str
   let paymentmode: string;
 
   if (isIndDeuRoute(rc, rm)) {
-    currency = "INR";
-    paymentmode = "Online";
-  } else if (currencyRaw) {
-    currency = currencyRaw;
+    currency = currencyRaw || "INR";
     paymentmode = "Online";
   } else if (routeDefaults) {
     // Free / VAC-collected service: fees response omits currency; use captured route defaults.
-    currency = routeDefaults.currency;
+    // Manual setup-form currency still keeps this route's paymentmode.
+    currency = currencyRaw || routeDefaults.currency;
     paymentmode = routeDefaults.paymentmode;
+  } else if (currencyRaw) {
+    currency = currencyRaw;
+    paymentmode = "Online";
   } else {
-    throw new Error("Schedule API requires currency from fees response");
+    throw new Error("Schedule API requires currency from fees response or setup form");
   }
 
   const override = getSlotCenterOverride();

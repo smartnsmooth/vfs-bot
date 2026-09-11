@@ -10,7 +10,7 @@ import { VfsForbiddenError, VfsGatewayTimeoutError, VfsRateLimitedError, VfsAlre
 import { isPageNotFoundUrl } from "../flows/pageNotFound";
 import type { BrowserServiceCore } from "./browser.core";
 import { clickTurnstile, waitForManualTurnstile } from "./turnstile.click";
-import { isAreLvaRoute, isIndDeuRoute, isIndLvaRoute } from "../utils/vfsRoute";
+import { isAreLvaRoute, isIndDeuRoute, isIndLvaRoute, isSauPrtRoute } from "../utils/vfsRoute";
 import { extractIndDeu4030xx } from "../utils/vfs4030";
 import { getCurrentInstanceId } from "../config/config";
 import { getStoredHeroSmsActivationId, getStoredHeroSmsLastCode } from "../utils/indDeuAccountState";
@@ -920,11 +920,13 @@ async function runLoginOnFirstTab(core: BrowserServiceCore, username: string, pa
     const submitBtn = await resolveLoginSubmitButton(page);
     const indDeuLogin = isIndDeuRoute(config.slotPayload.countryCode, config.slotPayload.missionCode);
     const areLvaLogin = isAreLvaRoute(config.slotPayload.countryCode, config.slotPayload.missionCode);
+    const sauPrtLogin = isSauPrtRoute(config.slotPayload.countryCode, config.slotPayload.missionCode);
     const wantMailTm = config.mailTmOtpEnabled
         && username.trim().includes("@")
         && password.length > 0
         && !indDeuLogin
-        && !areLvaLogin;
+        && !areLvaLogin
+        && !sauPrtLogin;
     let mailTmReady: {
         token: string;
         baseline: Set<string>;
@@ -975,7 +977,7 @@ async function runLoginOnFirstTab(core: BrowserServiceCore, username: string, pa
     await submitLoginImmediately(page, submitBtn, {
         loginRefill: { username, password, usernameSelectors, passwordSelectors },
     });
-    let passwordLoginSkipsOtp = areLvaLogin;
+    let passwordLoginSkipsOtp = areLvaLogin || sauPrtLogin;
     const pwdLoginRes = await passwordLoginResponsePromise;
     if (pwdLoginRes) {
         const pwdStatus = pwdLoginRes.status();
@@ -1014,8 +1016,9 @@ async function runLoginOnFirstTab(core: BrowserServiceCore, username: string, pa
             const mc = String(config.slotPayload.missionCode ?? "").trim().toLowerCase();
             const mergeApplicantFromPasswordStep = pwdJson.enableOTPAuthentication === false
                 || isAreLvaRoute(cc, mc)
-                || isIndLvaRoute(cc, mc);
-            if (pwdJson.enableOTPAuthentication === false || areLvaLogin) {
+                || isIndLvaRoute(cc, mc)
+                || isSauPrtRoute(cc, mc);
+            if (pwdJson.enableOTPAuthentication === false || areLvaLogin || sauPrtLogin) {
                 passwordLoginSkipsOtp = true;
             }
             let forStore: Record<string, unknown> | null;
@@ -1030,6 +1033,20 @@ async function runLoginOnFirstTab(core: BrowserServiceCore, username: string, pa
             }
             if (forStore)
                 mergeVfsLoginProfile(forStore);
+            if (isSauPrtRoute(cc, mc) && forStore) {
+                const loginPatch: Record<string, unknown> = {};
+                const dial = typeof forStore.dialCode === "string" ? forStore.dialCode.trim() : "";
+                const contact = typeof forStore.contactNumber === "string" ? forStore.contactNumber.trim() : "";
+                const loginUserRaw = typeof forStore.loginUser === "string" ? forStore.loginUser.trim() : "";
+                const emailRaw = typeof forStore.emailId === "string" ? forStore.emailId.trim() : "";
+                if (dial) loginPatch.dialCode = dial;
+                if (contact) loginPatch.contactNumber = contact;
+                if (emailRaw) loginPatch.emailId = emailRaw;
+                else if (loginUserRaw) loginPatch.emailId = loginUserRaw;
+                if (Object.keys(loginPatch).length > 0) {
+                    patchApplicantDetailsOverrides(loginPatch, getCurrentInstanceId());
+                }
+            }
         }
     }
     if (mailTmReady) {

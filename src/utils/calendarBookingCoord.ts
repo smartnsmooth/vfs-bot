@@ -703,6 +703,26 @@ export function publishSharedFees(publisherId: number, fees: SharedFees): boolea
   return alreadyPublished || r.outcome === "applied";
 }
 
+/**
+ * Operator override from the Monitor/Configure form. Replaces shared fees even
+ * after a first-wins publish so amount/currency can change while bots are running.
+ */
+export function replaceSharedFees(fees: SharedFees): boolean {
+  const totalAmount = String(fees.totalAmount).trim();
+  if (!totalAmount) return false;
+  const currency =
+    fees.currency != null && String(fees.currency).trim() !== ""
+      ? String(fees.currency).trim()
+      : null;
+  const r = mutateCalendarBookingState((s) => {
+    s.fees = { totalAmount, currency };
+    s.feesDone = true;
+    s.feesAttemptOwnerId = null;
+    return true;
+  });
+  return r.outcome === "applied";
+}
+
 // ── Available date list: atomic pick + remove ───────────────────────────
 
 /**

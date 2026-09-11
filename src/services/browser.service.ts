@@ -4,6 +4,7 @@ import { isIndDeuRoute } from "../utils/vfsRoute";
 import { ensureApplicantIpResolved } from "../utils/applicantIp";
 import { getAllocationId } from "../utils/allocationId.store";
 import { getApplicationUrn } from "../utils/applicationUrn.store";
+import { applyManualFeesFromSetup, isUseManualFeesEnabled } from "../utils/manualFees";
 import {
   getCapturedClientSource,
   setCapturedClientSource,
@@ -510,6 +511,10 @@ export class BrowserService implements BrowserServiceCore {
   }
 
   async postFeesLiftApi(): Promise<void> {
+    if (isUseManualFeesEnabled()) {
+      applyManualFeesFromSetup();
+      return;
+    }
     const urn = getApplicationUrn();
     if (!urn?.trim()) {
       throw new MissingUrnError("Fees: no urn; save applicants must run again");

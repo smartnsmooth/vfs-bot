@@ -36,6 +36,7 @@ import {
 } from "./utils/proxyProvider";
 import { isProxyListConfigured } from "./utils/proxyList";
 import { isWebshareConfigured } from "./utils/webshareProxy";
+import { persistManualFeesFromMonitor, readManualFeesControl } from "./utils/manualFees";
 
 /** How many bot instances are currently running. Set by ensureInstances(). */
 let currentNumInstances = 0;
@@ -424,6 +425,12 @@ function buildMonitorHooks(): MonitorHooks {
       broadcastToActiveChildren({ type: "proxy-provider", provider: id });
       return { ok: true };
     },
+    setManualFees: (opts) => {
+      const r = persistManualFeesFromMonitor(opts);
+      if (!r.ok) return r;
+      broadcastToActiveChildren({ type: "global-settings-updated" });
+      return { ok: true };
+    },
     reloadGlobalSettings: () => {
       broadcastToActiveChildren({ type: "config-updated" });
       return { ok: true };
@@ -446,6 +453,7 @@ function buildMonitorHooks(): MonitorHooks {
         proxyProvider: getActiveProxyProvider(),
         proxyListReady: isProxyListConfigured().ok,
         webshareReady: isWebshareConfigured().ok,
+        ...readManualFeesControl(),
       };
     },
   };

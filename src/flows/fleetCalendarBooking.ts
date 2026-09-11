@@ -4,7 +4,8 @@
  * Every URN holder runs the same loop — no privileged instance.
  *
  * 1. Fees first: while the fleet has no totalAmount, one instance at a time makes a
- *    single Fees call. Anything other than a totalAmount passes the turn on at once.
+ *    single Fees call (skipped when the setup form switch supplies amount + currency).
+ *    Anything other than a totalAmount passes the turn on at once.
  * 2. Then, with the shared totalAmount in hand:
  *    I.  availableDateList not empty → pick random date → timeslot → add rest to
  *        availableDatetimeList → pick one slot → schedule
@@ -27,6 +28,7 @@ import {
 import { getApplicantDetailsOverrides } from "../utils/applicantDetails.store";
 import { setAllocationId } from "../utils/allocationId.store";
 import { getTotalAmount, setTotalAmount, getCurrency, setCurrency } from "../utils/totalAmount.store";
+import { applyManualFeesFromSetup } from "../utils/manualFees";
 import {
   activeWaiters,
   addToAvailableDatetimeList,
@@ -249,6 +251,7 @@ export async function runFleetCalendarBooking(opts: {
       if (!state.feesDone) {
         // An amount this instance already fetched is as good as a fresh call.
         if (tryPublishLocalFees(instanceId)) continue;
+        if (applyManualFeesFromSetup() && tryPublishLocalFees(instanceId)) continue;
 
         if (claimFeesAttempt(instanceId)) {
           await runFeesAttempt(browser, instanceId);

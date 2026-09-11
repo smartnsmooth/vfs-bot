@@ -5,7 +5,7 @@ import { getEffectiveLiftLoginUser } from "../utils/liftLoginUser";
 import { getSlotCenterOverride } from "../utils/slotCenterOverride.store";
 import { getVfsLoginProfile, getOriginalLoginLastName } from "../utils/vfsLoginProfile.store.js";
 import { looksLikeEmailForVfsLogin } from "../types/vfsUserLogin.type.js";
-import { isAreLvaRoute, isIndDeuRoute, isIndLvaRoute, isUzbLvaRoute, keepApplicantEmailCasing } from "../utils/vfsRoute";
+import { isAreLvaRoute, isIndDeuRoute, isIndLvaRoute, isSauPrtRoute, isUzbLvaRoute, keepApplicantEmailCasing } from "../utils/vfsRoute";
 import { ensureIndDeuInstancePhone } from "../utils/indDeuPhone";
 
 export const SAVE_APPLICANTS_URL = "https://lift-api.vfsglobal.com/appointment/applicants";
@@ -297,7 +297,7 @@ function normalizeSaveApplicantsBody(body: Record<string, unknown>): Record<stri
   }
   const rc = typeof body.countryCode === "string" ? body.countryCode.trim().toLowerCase() : "";
   const rm = typeof body.missionCode === "string" ? body.missionCode.trim().toLowerCase() : "";
-  const applicantOrder = isIndDeuRoute(rc, rm)
+  const applicantOrder = isIndDeuRoute(rc, rm) || isSauPrtRoute(rc, rm)
     ? SAVE_APPLICANTS_IND_DEU_APPLICANT_KEY_ORDER
     : isAreLvaRoute(rc, rm)
       ? SAVE_APPLICANTS_ARE_LVA_APPLICANT_KEY_ORDER
@@ -305,6 +305,17 @@ function normalizeSaveApplicantsBody(body: Record<string, unknown>): Record<stri
   const applicant = orderObjectKeys(list[0] as Record<string, unknown>, applicantOrder);
   const next: Record<string, unknown> = { ...body, applicantList: [applicant] };
   return orderObjectKeys(next, SAVE_APPLICANTS_ROOT_KEY_ORDER);
+}
+
+/** Form `type="date"` is YYYY-MM-DD; lift-api wants DD/MM/YYYY. */
+function normalizeApplicantDateOfDeparture(raw: unknown): string {
+  if (typeof raw !== "string") return "";
+  const t = raw.trim();
+  const iso = t.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (iso) return `${iso[3]}/${iso[2]}/${iso[1]}`;
+  const dmy = t.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (dmy) return `${dmy[1]}/${dmy[2]}/${dmy[3]}`;
+  return t;
 }
 
 function mergeOverridesIntoBody(body: Record<string, unknown>, overrides: Record<string, unknown>): void {
@@ -397,6 +408,67 @@ function finalizeApplicantForLiftApiPost(body: Record<string, unknown>): void {
     } else if (typeof a.emailId === "string" && a.emailId.trim() !== "") {
       a.emailId = a.emailId.trim().toUpperCase();
     }
+
+    const g = a.gender;
+    if (typeof g === "string" && g.trim() !== "") {
+      const n = parseInt(g, 10);
+      if (n === 1 || n === 2) a.gender = n;
+    } else if (typeof g === "number" && g !== 1 && g !== 2) {
+      a.gender = 1;
+    }
+
+    body.juridictionCode = null;
+    return;
+  }
+
+  if (isSauPrtRoute(rc, rm)) {
+    a.centerClassCode = null;
+    a.selectedSubvisaCategory = null;
+    a.Subclasscode = null;
+    a.dateOfApplication = null;
+    a.middleName = null;
+    a.confirmPassportNumber = null;
+    a.visaSubClass = null;
+    a.noOfMinorDependents = "0";
+    a.fathersName = null;
+    a.mothersName = null;
+    a.dateOfTravel = null;
+    a.helloVerifyNumber = "";
+    a.juridictionCode = "";
+    a.AdditionalRefNo = null;
+    a.dateOfDeparture = normalizeApplicantDateOfDeparture(a.dateOfDeparture);
+    delete a.applicantImage;
+    delete a.applicantImageData;
+    delete a.countryCode;
+    delete a.missionCode;
+
+    const fn = typeof a.firstName === "string" ? a.firstName.trim().toUpperCase() : "";
+    const ln = typeof a.lastName === "string" ? a.lastName.trim().toUpperCase() : "";
+    const pp = typeof a.passportNumber === "string" ? a.passportNumber.trim().toUpperCase() : "";
+    a.firstName = fn;
+    a.lastName = ln || fn;
+    a.passportNumber = pp;
+    if (typeof a.dateOfBirth === "string") a.dateOfBirth = a.dateOfBirth.trim();
+    if (typeof a.passportExpirtyDate === "string") a.passportExpirtyDate = a.passportExpirtyDate.trim();
+    if (typeof a.nationalityCode === "string") a.nationalityCode = a.nationalityCode.trim().toUpperCase();
+
+    const lu = getEffectiveLiftLoginUser();
+    if (lu) {
+      body.loginUser = lu;
+      a.loginUser = lu;
+    }
+    const profile = getVfsLoginProfile();
+    const profileEmail = typeof (profile as Record<string, unknown> | null)?.emailId === "string"
+      ? String((profile as Record<string, unknown>).emailId).trim()
+      : "";
+    const profileLogin = typeof profile?.loginUser === "string" ? profile.loginUser.trim() : "";
+    const existingEmail = typeof a.emailId === "string" ? a.emailId.trim() : "";
+    const emailSrc = profileEmail || (profileLogin && looksLikeEmailForVfsLogin(profileLogin) ? profileLogin : "") || existingEmail || lu;
+    if (emailSrc) a.emailId = emailSrc.trim().toUpperCase();
+    const profileDial = typeof profile?.dialCode === "string" ? profile.dialCode.trim() : "";
+    const profileContact = typeof profile?.contactNumber === "string" ? profile.contactNumber.trim() : "";
+    if (profileDial) a.dialCode = profileDial;
+    if (profileContact) a.contactNumber = profileContact;
 
     const g = a.gender;
     if (typeof g === "string" && g.trim() !== "") {
@@ -538,6 +610,7 @@ function mergeVfsLoginProfileIntoSaveApplicantsBody(body: Record<string, unknown
   const isIndLva = isIndLvaRoute(rc, rm);
   const isUzbLva = isUzbLvaRoute(rc, rm);
   const isAreLva = isAreLvaRoute(rc, rm);
+  const isSauPrt = isSauPrtRoute(rc, rm);
   const keepEmail = keepApplicantEmailCasing(rc, rm);
 
   const setApplicant = (key: string, val: unknown): void => {
@@ -550,6 +623,23 @@ function mergeVfsLoginProfileIntoSaveApplicantsBody(body: Record<string, unknown
     }
     a[key] = val;
   };
+
+  if (isSauPrt) {
+    setApplicant("dialCode", p.dialCode);
+    setApplicant("contactNumber", p.contactNumber);
+    const eid = typeof pr.emailId === "string" ? pr.emailId.trim() : "";
+    if (eid) a.emailId = eid.toUpperCase();
+    const luSau = typeof p.loginUser === "string" ? p.loginUser.trim() : "";
+    if (luSau) {
+      body.loginUser = luSau;
+      a.loginUser = luSau;
+      const hasEmail = typeof a.emailId === "string" && a.emailId.trim() !== "";
+      if (!hasEmail && looksLikeEmailForVfsLogin(luSau)) {
+        a.emailId = luSau.toUpperCase();
+      }
+    }
+    return;
+  }
 
   // For uzb-lva, the form supplies firstName / lastName / passportNumber / nationalityCode.
   // Only fall back to the VFS login profile when the form left those fields empty.
@@ -630,7 +720,8 @@ export function buildSaveApplicantsBodyFromEnv(): Record<string, unknown> {
     || (typeof details?.selectedSubvisaCategory === "string" ? details.selectedSubvisaCategory.trim() : "");
 
   const isIndDeu = isIndDeuRoute(countryCode, missionCode);
-  const applicant: Record<string, unknown> = isIndDeu
+  const isSauPrt = isSauPrtRoute(countryCode, missionCode);
+  const applicant: Record<string, unknown> = (isIndDeu || isSauPrt)
     ? {
       urn: "",
       arn: "",

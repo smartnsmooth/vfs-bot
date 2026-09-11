@@ -21,6 +21,7 @@ import {
 } from "../services/browser.service";
 import { setAllocationId } from "../utils/allocationId.store";
 import { getTotalAmount, setTotalAmount, getCurrency, setCurrency } from "../utils/totalAmount.store";
+import { applyManualFeesFromSetup } from "../utils/manualFees";
 import {
   activeWaiters,
   claimCalendarAttempt,
@@ -116,6 +117,7 @@ async function runSchedule(
 
 async function runFeesIfMissing(browser: BrowserService, instanceId: number): Promise<void> {
   if (tryPublishLocalFees(instanceId)) return;
+  if (applyManualFeesFromSetup() && tryPublishLocalFees(instanceId)) return;
   const state = readCalendarBookingState();
   if (state.feesDone) {
     applySharedFeesLocally(state);
@@ -214,6 +216,7 @@ export async function runAreLvaBooking(opts: {
 
       if (!state.feesDone) {
         if (tryPublishLocalFees(instanceId)) continue;
+        if (applyManualFeesFromSetup() && tryPublishLocalFees(instanceId)) continue;
         const localAmount = getTotalAmount();
         if (!localAmount?.trim()) {
           await runFeesIfMissing(browser, instanceId);
